@@ -5,8 +5,19 @@
   "author": "",
   "private": true,
   "license": "UNLICENSED",
+  "packageManager": "npm@11.6.2",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11 <12"
+  },
   "scripts": {
     "build": "nest build",
+    "typeorm": "typeorm-ts-node-commonjs -d src/database/data-source.ts",
+    "db:create": "typeorm-ts-node-commonjs migration:create",
+    "db:generate": "npm run typeorm -- migration:generate",
+    "db:migrate": "npm run typeorm -- migration:run",
+    "db:revert": "npm run typeorm -- migration:revert",
+    "db:show": "npm run typeorm -- migration:show",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
@@ -21,10 +32,15 @@
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
+    "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
+    "@nestjs/typeorm": "^11.0.0",
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",
