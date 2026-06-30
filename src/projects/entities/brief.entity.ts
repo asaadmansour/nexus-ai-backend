@@ -3,10 +3,12 @@ import {
   CreateDateColumn,
   Entity,
   JoinColumn,
+  OneToMany,
   OneToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { BriefEmbedding } from './brief-embedding.entity';
 import { Project } from './project.entity';
 
 @Entity('briefs')
@@ -21,14 +23,14 @@ export class Brief {
   @JoinColumn({ name: 'project_id' })
   project: Project;
 
+  @OneToMany(() => BriefEmbedding, (embedding) => embedding.brief)
+  embeddings?: BriefEmbedding[];
+
   @Column({ name: 'is_complete', type: 'boolean', default: false })
   isComplete: boolean;
 
   @Column({ name: 'completed_at', type: 'timestamptz', nullable: true })
   completedAt: Date | null;
-
-  @Column({ name: 'raw_conversation', type: 'jsonb', nullable: true })
-  rawConversation: Record<string, unknown> | null;
 
   @Column({
     name: 'client_background',
@@ -101,9 +103,6 @@ export class Brief {
 
   @Column({ name: 'brief_text', type: 'text', nullable: true })
   briefText: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  embedding: string | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;

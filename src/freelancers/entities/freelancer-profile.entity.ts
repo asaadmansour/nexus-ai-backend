@@ -5,11 +5,13 @@ import {
   Entity,
   Index,
   JoinColumn,
+  OneToMany,
   OneToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
+import { FreelancerProfileEmbedding } from './freelancer-profile-embedding.entity';
 
 @Entity('freelancer_profiles')
 export class FreelancerProfile {
@@ -24,6 +26,9 @@ export class FreelancerProfile {
   })
   @JoinColumn({ name: 'user_id' })
   user: User;
+
+  @OneToMany(() => FreelancerProfileEmbedding, (embedding) => embedding.profile)
+  embeddings?: FreelancerProfileEmbedding[];
 
   @Column({ name: 'cv_url', type: 'text', nullable: true })
   cvUrl: string | null;
@@ -42,10 +47,6 @@ export class FreelancerProfile {
 
   @Column({ type: 'jsonb', nullable: true })
   summary: Record<string, unknown> | null;
-
-  // pgvector column. Queried via raw SQL / vector operators; TypeORM maps it as a string.
-  @Column({ type: 'vector', nullable: true, select: false })
-  embedding: string | null;
 
   @Column({
     name: 'hourly_rate',
