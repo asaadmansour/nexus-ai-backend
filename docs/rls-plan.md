@@ -29,6 +29,10 @@ For every table, enable and force RLS:
 ALTER TABLE users               ENABLE ROW LEVEL SECURITY;
 ALTER TABLE freelancer_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects            ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE users               FORCE ROW LEVEL SECURITY;
+ALTER TABLE freelancer_profiles FORCE ROW LEVEL SECURITY;
+ALTER TABLE projects            FORCE ROW LEVEL SECURITY;
 ```
 
 > With RLS enabled and **no** policies, the table is deny-all for non-superusers
@@ -44,14 +48,21 @@ separate identity table, adjust the join accordingly.
 - **Select own row:** a user may read their own record.
   ```sql
   CREATE POLICY users_select_self ON users
-    FOR SELECT USING (id = auth.uid());
+    FOR SELECT USING (id = auth.uid() AND deleted_at IS NULL);
   ```
-- **Update own row (non-privileged columns):** allow self-update; block role
-  escalation and verification flags at the app layer or with a `WITH CHECK`
-  that pins `role`.
+- **Update own row (non-privileged columns):** RLS is row-level, not
+  column-level, so pair the policy with column grants (or a trigger) before
+  allowing direct client updates. Do not grant clients write access to `role`,
+  verification flags, or `hashed_password`.
   ```sql
+  REVOKE UPDATE ON users FROM authenticated;
+  GRANT UPDATE (first_name, last_name, phone_number, photo_url)
+    ON users TO authenticated;
+
   CREATE POLICY users_update_self ON users
-    FOR UPDATE USING (id = auth.uid()) WITH CHECK (id = auth.uid());
+    FOR UPDATE
+    USING (id = auth.uid() AND deleted_at IS NULL)
+    WITH CHECK (id = auth.uid() AND deleted_at IS NULL);
   ```
 - **Admins:** full access via a claim check, e.g.
   `USING ((auth.jwt() ->> 'role') = 'admin')`.
@@ -62,7 +73,9 @@ separate identity table, adjust the join accordingly.
 - **Owner read/write:** the owning user (`user_id = auth.uid()`).
   ```sql
   CREATE POLICY fp_owner_all ON freelancer_profiles
-    FOR ALL USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+    FOR ALL
+    USING (user_id = auth.uid() AND deleted_at IS NULL)
+    WITH CHECK (user_id = auth.uid() AND deleted_at IS NULL);
   ```
 - **Public/limited read for matching:** customers need to discover freelancers.
   Prefer exposing a **view** with only public columns (no `embedding`,
@@ -78,7 +91,9 @@ separate identity table, adjust the join accordingly.
 - **Customer owns their projects:**
   ```sql
   CREATE POLICY projects_owner_all ON projects
-    FOR ALL USING (customer_id = auth.uid()) WITH CHECK (customer_id = auth.uid());
+    FOR ALL
+    USING (customer_id = auth.uid() AND deleted_at IS NULL)
+    WITH CHECK (customer_id = auth.uid() AND deleted_at IS NULL);
   ```
 - **Assigned freelancer read:** once assignment tables exist, add a policy that
   lets an assigned freelancer read the project (join through the future
@@ -101,8 +116,8 @@ separate identity table, adjust the join accordingly.
 ## Rollout steps
 1. Ship tables (this migration) first, with RLS **disabled**, so the backend
    works end-to-end.
-2. Add a follow-up migration that `ENABLE ROW LEVEL SECURITY` + creates the
-   policies above.
+2. Add a follow-up migration that runs `ENABLE ROW LEVEL SECURITY`, runs
+   `FORCE ROW LEVEL SECURITY`, and creates the policies above.
 3. Test with a non-service (anon/authenticated) JWT against each table to prove
    deny-by-default and each policy path.
 4. Revisit `projects` freelancer-read + `freelancer_profiles` discovery once the

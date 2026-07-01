@@ -3,7 +3,6 @@ import {
   CreateDateColumn,
   DeleteDateColumn,
   Entity,
-  Index,
   OneToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
@@ -22,7 +21,6 @@ export class User {
   @Column({ name: 'last_name', type: 'varchar', length: 100 })
   lastName: string;
 
-  @Index({ unique: true })
   @Column({ type: 'citext', unique: true })
   email: string;
 

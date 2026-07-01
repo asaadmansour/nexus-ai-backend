@@ -16,7 +16,6 @@ export class FreelancerProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Index('freelancer_profiles_user_id_idx')
   @Column({ name: 'user_id', type: 'uuid', unique: true })
   userId: string;
 
