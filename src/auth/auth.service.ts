@@ -13,7 +13,6 @@ import { JwtService } from '@nestjs/jwt';
 import { LogInUserDto } from './dtos/login-user.dto';
 import { RedisService } from 'src/redis/redis.service';
 import { RefreshToken } from './entities/refresh-token.entity';
-import * as crypto from 'crypto';
 
 @Injectable()
 export class AuthService {
@@ -44,7 +43,10 @@ export class AuthService {
       sub: addedUser.id,
       email: addedUser.email,
     });
-    const r_token = crypto.randomBytes(32).toString('hex');
+    const r_token = this.jwtService.sign(
+      { sub: addedUser.id },
+      { expiresIn: '7d' },
+    );
     const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
     const r_token_object = this.refreshTokenRepository.create({
       token: r_token_hashed,
@@ -79,7 +81,10 @@ export class AuthService {
       email: dbUser.email,
     });
 
-    const r_token = crypto.randomBytes(32).toString('hex');
+    const r_token = this.jwtService.sign(
+      { sub: dbUser.id },
+      { expiresIn: '7d' },
+    );
     const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
     const r_token_object = this.refreshTokenRepository.create({
       token: r_token_hashed,
@@ -96,13 +101,17 @@ export class AuthService {
   }
 
   async logout(token: string) {
-    //await this.redisService.set(token, 'blacklisted', 10800);
+    const decodedToken = this.jwtService.decode(token);
+    const userId = decodedToken.sub;
+    await this.refreshTokenRepository.delete({ userId: userId });
+    await this.redisService.set(token, 'blacklisted', 10800);
     return {
       status: 'logged out',
     };
   }
 
-  async refresh(userId: string, userEmail: string, refresh_token: string) {
+  async refresh(refresh_token: string) {
+    const { sub: userId } = this.jwtService.decode(refresh_token);
     const token_row = await this.refreshTokenRepository.findOne({
       where: { userId: userId },
     });
@@ -114,9 +123,8 @@ export class AuthService {
     await this.refreshTokenRepository.delete({ id: token_row?.id });
     const access_token = this.jwtService.sign({
       sub: userId,
-      email: userEmail,
     });
-    const r_token = crypto.randomBytes(32).toString('hex');
+    const r_token = this.jwtService.sign({ sub: userId }, { expiresIn: '7d' });
     const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
     const r_token_object = this.refreshTokenRepository.create({
       token: r_token_hashed,
