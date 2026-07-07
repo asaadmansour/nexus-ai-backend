@@ -7,6 +7,8 @@ import { DatabaseModule } from './database/database.module';
 import { UsersModule } from './users/users.module';
 import { FreelancersModule } from './freelancers/freelancers.module';
 import { ProjectsModule } from './projects/projects.module';
+import { AuthModule } from './auth/auth.module';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
@@ -18,6 +20,8 @@ import { ProjectsModule } from './projects/projects.module';
     UsersModule,
     FreelancersModule,
     ProjectsModule,
+    AuthModule,
+    RedisModule,
   ],
   controllers: [AppController],
   providers: [AppService],
