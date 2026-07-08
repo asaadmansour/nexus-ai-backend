@@ -4,6 +4,7 @@ import { SignUpUserDto } from './dtos/signup-user.dto';
 import { LogInUserDto } from './dtos/login-user.dto';
 import { RefreshTokenDto } from './dtos/refresh-token.dto';
 import { AuthGuard } from 'src/common/guards/auth.guard';
+import { LogoutUserDto } from './dtos/logout-user.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -21,9 +22,12 @@ export class AuthController {
 
   @UseGuards(AuthGuard)
   @Post('logout')
-  async logout(@Headers('authorization') authHeader: string) {
+  async logout(
+    @Headers('authorization') authHeader: string,
+    @Body() body: LogoutUserDto,
+  ) {
     const [_, token] = authHeader.split(' ');
-    return await this.authService.logout(token);
+    return await this.authService.logout(token, body.refreshToken);
   }
 
   @Post('refresh')

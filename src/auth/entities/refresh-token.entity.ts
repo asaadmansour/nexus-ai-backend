@@ -5,6 +5,7 @@ import {
   PrimaryGeneratedColumn,
   CreateDateColumn,
   ManyToOne,
+  JoinColumn,
 } from 'typeorm';
 
 @Entity('refresh-token')
@@ -16,6 +17,7 @@ export class RefreshToken {
   token!: string;
 
   @ManyToOne(() => User, (user) => user.refreshToken)
+  @JoinColumn({ name: 'user_id' })
   user!: User;
 
   @Column({ name: 'user_id' })

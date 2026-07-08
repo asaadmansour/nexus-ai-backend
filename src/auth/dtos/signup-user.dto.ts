@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call */
 import {
   IsEmail,
   IsEnum,
@@ -15,5 +14,5 @@ export class SignUpUserDto {
   @IsEmail() email!: string;
   @IsStrongPassword() password!: string;
   @IsPhoneNumber('EG') phoneNumber!: string;
-  @IsEnum(['FREELANCER', 'CUSTOMER', 'ADMIN']) role!: UserRole;
+  @IsEnum(UserRole) role!: UserRole;
 }

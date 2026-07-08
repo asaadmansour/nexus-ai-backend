@@ -6,8 +6,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcrypt';
 import { User } from 'src/users/entities/user.entity';
-import { Repository } from 'typeorm';
-
+import { Repository, DataSource, QueryRunner } from 'typeorm';
 import { SignUpUserDto } from './dtos/signup-user.dto';
 import { JwtService } from '@nestjs/jwt';
 import { LogInUserDto } from './dtos/login-user.dto';
@@ -22,121 +21,161 @@ export class AuthService {
     private readonly refreshTokenRepository: Repository<RefreshToken>,
     private readonly jwtService: JwtService,
     private readonly redisService: RedisService,
+    private readonly dataSource: DataSource,
   ) {}
-  saltOrRounds: number = 10;
+
+  private readonly saltOrRounds = 10;
+  private readonly REFRESH_TOKEN_EXPIRY = '7d';
+  private readonly REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+  private async generateTokens(
+    userId: string,
+    queryRunner: QueryRunner,
+    email?: string,
+  ) {
+    const accessToken = this.jwtService.sign({
+      sub: userId,
+      ...(email && { email }),
+    });
+    const refreshToken = this.jwtService.sign(
+      { sub: userId },
+      { expiresIn: this.REFRESH_TOKEN_EXPIRY },
+    );
+    const hashedRefreshToken = await bcrypt.hash(
+      refreshToken,
+      this.saltOrRounds,
+    );
+    const refreshTokenEntity = this.refreshTokenRepository.create({
+      token: hashedRefreshToken,
+      userId,
+      expiresAt: new Date(Date.now() + this.REFRESH_TOKEN_TTL_MS),
+    });
+    await queryRunner.manager.save(refreshTokenEntity);
+    return { accessToken, refreshToken };
+  }
 
   async signup(newUser: SignUpUserDto) {
-    const repeatedEmail = await this.userRepository.findOne({
-      where: { email: newUser.email },
-    });
-    if (repeatedEmail) {
-      throw new BadRequestException('Duplicate Email');
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const existing = await this.userRepository.findOne({
+        where: { email: newUser.email },
+      });
+      if (existing) throw new BadRequestException('Duplicate Email');
+
+      const { password, ...rest } = newUser;
+      const hashedPassword = await bcrypt.hash(password, this.saltOrRounds);
+      const user = this.userRepository.create({ ...rest, hashedPassword });
+      const savedUser = await queryRunner.manager.save(user);
+
+      const { accessToken, refreshToken } = await this.generateTokens(
+        savedUser.id,
+        queryRunner,
+        savedUser.email,
+      );
+      await queryRunner.commitTransaction();
+      return { user: savedUser, accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
     }
-    const { password, ...rest } = newUser;
-    const hashedPassword = await bcrypt.hash(password, this.saltOrRounds);
-    const user = this.userRepository.create({
-      ...rest,
-      hashedPassword: hashedPassword,
-    });
-    const addedUser = await this.userRepository.save(user);
-    const access_token = this.jwtService.sign({
-      sub: addedUser.id,
-      email: addedUser.email,
-    });
-    const r_token = this.jwtService.sign(
-      { sub: addedUser.id },
-      { expiresIn: '7d' },
-    );
-    const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
-    const r_token_object = this.refreshTokenRepository.create({
-      token: r_token_hashed,
-      userId: addedUser.id,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    });
-    const refresh_token =
-      await this.refreshTokenRepository.save(r_token_object);
-    return {
-      newuser: addedUser,
-      access_token: access_token,
-      refresh_token: r_token,
-    };
   }
 
   async login(user: LogInUserDto) {
-    const dbUser = await this.userRepository.findOne({
-      where: { email: user.email },
-      select: { hashedPassword: true, id: true, email: true },
-    });
-    if (!dbUser || !dbUser.hashedPassword)
-      throw new UnauthorizedException('Either email or password wrong');
-    const existingUser = await bcrypt.compare(
-      user.password,
-      dbUser.hashedPassword,
-    );
-    if (!existingUser)
-      throw new UnauthorizedException('Either email or password wrong');
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const dbUser = await this.userRepository.findOne({
+        where: { email: user.email },
+        select: { hashedPassword: true, id: true, email: true },
+      });
+      if (!dbUser || !dbUser.hashedPassword)
+        throw new UnauthorizedException('Either email or password wrong');
 
-    const access_token = this.jwtService.sign({
-      sub: dbUser.id,
-      email: dbUser.email,
-    });
+      const passwordMatch = await bcrypt.compare(
+        user.password,
+        dbUser.hashedPassword,
+      );
+      if (!passwordMatch)
+        throw new UnauthorizedException('Either email or password wrong');
 
-    const r_token = this.jwtService.sign(
-      { sub: dbUser.id },
-      { expiresIn: '7d' },
-    );
-    const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
-    const r_token_object = this.refreshTokenRepository.create({
-      token: r_token_hashed,
-      userId: dbUser.id,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    });
-    const refresh_token =
-      await this.refreshTokenRepository.save(r_token_object);
-    return {
-      status: 'success',
-      access_token: access_token,
-      refresh_token: r_token,
-    };
+      const { accessToken, refreshToken } = await this.generateTokens(
+        dbUser.id,
+        queryRunner,
+        dbUser.email,
+      );
+      await queryRunner.commitTransaction();
+      return { status: 'success', accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
   }
 
-  async logout(token: string) {
-    const decodedToken = this.jwtService.decode(token);
-    const userId = decodedToken.sub;
-    await this.refreshTokenRepository.delete({ userId: userId });
-    await this.redisService.set(token, 'blacklisted', 10800);
-    return {
-      status: 'logged out',
-    };
+  async logout(accessToken: string, refreshToken: string) {
+    try {
+      const decodedAccess = this.jwtService.verify(accessToken);
+      const userId = decodedAccess.sub;
+
+      const storedToken = await this.refreshTokenRepository.findOne({
+        where: { userId },
+      });
+      if (!storedToken) throw new UnauthorizedException('Invalid Token');
+
+      const tokenMatch = await bcrypt.compare(refreshToken, storedToken.token);
+      if (!tokenMatch) throw new UnauthorizedException('Invalid Token');
+
+      await this.refreshTokenRepository.delete({ id: storedToken.id });
+
+      const ttl = decodedAccess.exp - Math.floor(Date.now() / 1000);
+      await this.redisService.set(accessToken, 'blacklisted', ttl);
+
+      return { status: 'logged out' };
+    } catch (error) {
+      throw new UnauthorizedException('Invalid Token');
+    }
   }
 
-  async refresh(refresh_token: string) {
-    const { sub: userId } = this.jwtService.decode(refresh_token);
-    const token_row = await this.refreshTokenRepository.findOne({
-      where: { userId: userId },
-    });
-    if (!token_row) throw new UnauthorizedException('Login again');
-    const correct_token = await bcrypt.compare(refresh_token, token_row.token);
-    if (!correct_token) throw new UnauthorizedException('Login again');
-    if (token_row?.expiresAt < new Date())
-      throw new UnauthorizedException('Login again');
-    await this.refreshTokenRepository.delete({ id: token_row?.id });
-    const access_token = this.jwtService.sign({
-      sub: userId,
-    });
-    const r_token = this.jwtService.sign({ sub: userId }, { expiresIn: '7d' });
-    const r_token_hashed = await bcrypt.hash(r_token, this.saltOrRounds);
-    const r_token_object = this.refreshTokenRepository.create({
-      token: r_token_hashed,
-      userId: userId,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    });
-    const refresh_token_stored =
-      await this.refreshTokenRepository.save(r_token_object);
-    return {
-      status: 'success',
-      access_token: access_token,
-      refresh_token: r_token,
-    };
+  async refresh(oldRefreshToken: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const { sub: userId } = this.jwtService.verify(oldRefreshToken);
+
+      const storedToken = await this.refreshTokenRepository.findOne({
+        where: { userId },
+      });
+      if (!storedToken) throw new UnauthorizedException('Login again');
+
+      const tokenMatch = await bcrypt.compare(
+        oldRefreshToken,
+        storedToken.token,
+      );
+      if (!tokenMatch) throw new UnauthorizedException('Login again');
+
+      if (storedToken.expiresAt < new Date())
+        throw new UnauthorizedException('Login again');
+
+      await queryRunner.manager.delete(RefreshToken, { id: storedToken.id });
+
+      const { accessToken, refreshToken } = await this.generateTokens(
+        userId,
+        queryRunner,
+      );
+      await queryRunner.commitTransaction();
+      return { status: 'success', accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
   }
 }
