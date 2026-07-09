@@ -26,7 +26,7 @@ export class AuthController {
     @Headers('authorization') authHeader: string,
     @Body() body: LogoutUserDto,
   ) {
-    const [_, token] = authHeader.split(' ');
+    const token = authHeader.split(' ')[1];
     return await this.authService.logout(token, body.refreshToken);
   }
 

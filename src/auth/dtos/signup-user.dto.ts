@@ -1,6 +1,6 @@
 import {
   IsEmail,
-  IsEnum,
+  IsIn,
   IsPhoneNumber,
   IsString,
   IsStrongPassword,
@@ -14,5 +14,6 @@ export class SignUpUserDto {
   @IsEmail() email!: string;
   @IsStrongPassword() password!: string;
   @IsPhoneNumber('EG') phoneNumber!: string;
-  @IsEnum(UserRole) role!: UserRole;
+  @IsIn([UserRole.CUSTOMER, UserRole.FREELANCER])
+  role!: UserRole;
 }

@@ -12,6 +12,7 @@ import { JwtService } from '@nestjs/jwt';
 import { LogInUserDto } from './dtos/login-user.dto';
 import { RedisService } from 'src/redis/redis.service';
 import { RefreshToken } from './entities/refresh-token.entity';
+import { UserRole } from 'src/common/enums/user-role.enum';
 
 @Injectable()
 export class AuthService {
@@ -32,10 +33,12 @@ export class AuthService {
     userId: string,
     queryRunner: QueryRunner,
     email?: string,
+    role?: UserRole,
   ) {
     const accessToken = this.jwtService.sign({
       sub: userId,
       ...(email && { email }),
+      ...(role && { role }),
     });
     const refreshToken = this.jwtService.sign(
       { sub: userId },
@@ -50,6 +53,7 @@ export class AuthService {
       userId,
       expiresAt: new Date(Date.now() + this.REFRESH_TOKEN_TTL_MS),
     });
+    await queryRunner.manager.delete(RefreshToken, { userId });
     await queryRunner.manager.save(refreshTokenEntity);
     return { accessToken, refreshToken };
   }
@@ -68,14 +72,16 @@ export class AuthService {
       const hashedPassword = await bcrypt.hash(password, this.saltOrRounds);
       const user = this.userRepository.create({ ...rest, hashedPassword });
       const savedUser = await queryRunner.manager.save(user);
+      const { hashedPassword: _, ...userResponse } = savedUser;
 
       const { accessToken, refreshToken } = await this.generateTokens(
         savedUser.id,
         queryRunner,
         savedUser.email,
+        savedUser.role,
       );
       await queryRunner.commitTransaction();
-      return { user: savedUser, accessToken, refreshToken };
+      return { user: userResponse, accessToken, refreshToken };
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;
@@ -91,7 +97,7 @@ export class AuthService {
     try {
       const dbUser = await this.userRepository.findOne({
         where: { email: user.email },
-        select: { hashedPassword: true, id: true, email: true },
+        select: { hashedPassword: true, id: true, email: true, role: true },
       });
       if (!dbUser || !dbUser.hashedPassword)
         throw new UnauthorizedException('Either email or password wrong');
@@ -107,6 +113,7 @@ export class AuthService {
         dbUser.id,
         queryRunner,
         dbUser.email,
+        dbUser.role,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };
@@ -133,11 +140,15 @@ export class AuthService {
 
       await this.refreshTokenRepository.delete({ id: storedToken.id });
 
-      const ttl = decodedAccess.exp - Math.floor(Date.now() / 1000);
+      const ttl = Math.max(
+        1,
+        decodedAccess.exp - Math.floor(Date.now() / 1000),
+      );
       await this.redisService.set(accessToken, 'blacklisted', ttl);
 
       return { status: 'logged out' };
     } catch (error) {
+      if (error instanceof UnauthorizedException) throw error;
       throw new UnauthorizedException('Invalid Token');
     }
   }
@@ -165,9 +176,18 @@ export class AuthService {
 
       await queryRunner.manager.delete(RefreshToken, { id: storedToken.id });
 
+      // fetch user to get role for new token
+      const user = await this.userRepository.findOne({
+        where: { id: userId },
+        select: { id: true, email: true, role: true },
+      });
+      if (!user) throw new UnauthorizedException('Login again');
+
       const { accessToken, refreshToken } = await this.generateTokens(
         userId,
         queryRunner,
+        user.email,
+        user.role,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };

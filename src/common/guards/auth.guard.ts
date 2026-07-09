@@ -18,13 +18,20 @@ export class AuthGuard implements CanActivate {
     if (!request.headers.authorization)
       throw new UnauthorizedException('Invalid request');
     const [_, token] = request.headers.authorization.split(' ');
+
     try {
       const verifiedToken = this.jwtService.verify(token);
       request.user = verifiedToken;
-      if ((await this.redisService.get(token)) == 'blacklisted')
+    } catch {
+      throw new UnauthorizedException('Invalid request');
+    }
+
+    try {
+      if ((await this.redisService.get(token)) === 'blacklisted')
         throw new UnauthorizedException('Invalid request');
     } catch (error) {
-      throw new UnauthorizedException('Invalid request');
+      if (error instanceof UnauthorizedException) throw error;
+      throw new UnauthorizedException('Service unavailable');
     }
 
     return true;
