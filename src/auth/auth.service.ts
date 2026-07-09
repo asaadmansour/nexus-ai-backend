@@ -63,7 +63,7 @@ export class AuthService {
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
-      const existing = await this.userRepository.findOne({
+      const existing = await queryRunner.manager.findOne(User, {
         where: { email: newUser.email },
       });
       if (existing) throw new BadRequestException('Duplicate Email');
@@ -95,7 +95,7 @@ export class AuthService {
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
-      const dbUser = await this.userRepository.findOne({
+      const dbUser = await queryRunner.manager.findOne(User, {
         where: { email: user.email },
         select: { hashedPassword: true, id: true, email: true, role: true },
       });
@@ -138,13 +138,12 @@ export class AuthService {
       const tokenMatch = await bcrypt.compare(refreshToken, storedToken.token);
       if (!tokenMatch) throw new UnauthorizedException('Invalid Token');
 
-      await this.refreshTokenRepository.delete({ id: storedToken.id });
-
       const ttl = Math.max(
         1,
         decodedAccess.exp - Math.floor(Date.now() / 1000),
       );
       await this.redisService.set(accessToken, 'blacklisted', ttl);
+      await this.refreshTokenRepository.delete({ id: storedToken.id });
 
       return { status: 'logged out' };
     } catch (error) {
@@ -160,7 +159,7 @@ export class AuthService {
     try {
       const { sub: userId } = this.jwtService.verify(oldRefreshToken);
 
-      const storedToken = await this.refreshTokenRepository.findOne({
+      const storedToken = await queryRunner.manager.findOne(RefreshToken, {
         where: { userId },
       });
       if (!storedToken) throw new UnauthorizedException('Login again');
@@ -177,7 +176,7 @@ export class AuthService {
       await queryRunner.manager.delete(RefreshToken, { id: storedToken.id });
 
       // fetch user to get role for new token
-      const user = await this.userRepository.findOne({
+      const user = await queryRunner.manager.findOne(User, {
         where: { id: userId },
         select: { id: true, email: true, role: true },
       });
