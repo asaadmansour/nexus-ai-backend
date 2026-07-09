@@ -13,6 +13,8 @@ import { LogInUserDto } from './dtos/login-user.dto';
 import { RedisService } from 'src/redis/redis.service';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
+import { EmailService } from 'src/email/email.service';
+import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 
 @Injectable()
 export class AuthService {
@@ -23,6 +25,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly redisService: RedisService,
     private readonly dataSource: DataSource,
+    private readonly emailService: EmailService,
   ) {}
 
   private readonly saltOrRounds = 10;
@@ -34,11 +37,13 @@ export class AuthService {
     queryRunner: QueryRunner,
     email?: string,
     role?: UserRole,
+    isEmailVerified?: boolean,
   ) {
     const accessToken = this.jwtService.sign({
       sub: userId,
       ...(email && { email }),
       ...(role && { role }),
+      ...(isEmailVerified !== undefined && { isEmailVerified }),
     });
     const refreshToken = this.jwtService.sign(
       { sub: userId },
@@ -79,6 +84,7 @@ export class AuthService {
         queryRunner,
         savedUser.email,
         savedUser.role,
+        savedUser.isEmailVerified,
       );
       await queryRunner.commitTransaction();
       return { user: userResponse, accessToken, refreshToken };
@@ -97,7 +103,7 @@ export class AuthService {
     try {
       const dbUser = await queryRunner.manager.findOne(User, {
         where: { email: user.email },
-        select: { hashedPassword: true, id: true, email: true, role: true },
+        select: { hashedPassword: true, id: true, email: true, role: true, isEmailVerified: true },
       });
       if (!dbUser || !dbUser.hashedPassword)
         throw new UnauthorizedException('Either email or password wrong');
@@ -114,6 +120,7 @@ export class AuthService {
         queryRunner,
         dbUser.email,
         dbUser.role,
+        dbUser.isEmailVerified,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };
@@ -178,7 +185,7 @@ export class AuthService {
       // fetch user to get role for new token
       const user = await queryRunner.manager.findOne(User, {
         where: { id: userId },
-        select: { id: true, email: true, role: true },
+        select: { id: true, email: true, role: true, isEmailVerified: true },
       });
       if (!user) throw new UnauthorizedException('Login again');
 
@@ -187,6 +194,169 @@ export class AuthService {
         queryRunner,
         user.email,
         user.role,
+        user.isEmailVerified,
+      );
+      await queryRunner.commitTransaction();
+      return { status: 'success', accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async validateGoogleUser(profile: { email: string, firstName: string, lastName: string, photoUrl: string }) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      let user = await queryRunner.manager.findOne(User, {
+        where: { email: profile.email },
+        select: { id: true, email: true, role: true, phoneNumber: true, isEmailVerified: true }
+      });
+
+      if (!user) {
+        user = this.userRepository.create({
+          email: profile.email,
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          photoUrl: profile.photoUrl,
+          hashedPassword: null,
+          isEmailVerified: true, // Google already verified this email
+        });
+        user = await queryRunner.manager.save(user);
+      }
+      
+      await queryRunner.commitTransaction();
+      return user;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async googleLogin(reqUser: { id: string, email: string, role: UserRole, phoneNumber: string | null, isEmailVerified: boolean }) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const { accessToken, refreshToken } = await this.generateTokens(
+        reqUser.id,
+        queryRunner,
+        reqUser.email,
+        reqUser.role,
+        reqUser.isEmailVerified,
+      );
+      await queryRunner.commitTransaction();
+      
+      const isProfileComplete = reqUser.phoneNumber !== null;
+      
+      return { status: 'success', isProfileComplete, user: reqUser, accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async completeSignup(userId: string, payload: { phoneNumber: string; role: UserRole }) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const user = await queryRunner.manager.findOne(User, {
+        where: { id: userId }
+      });
+      if (!user) throw new BadRequestException('User not found');
+
+      if (user.phoneNumber) throw new BadRequestException('Profile already complete');
+
+      user.phoneNumber = payload.phoneNumber;
+      user.role = payload.role;
+
+      await queryRunner.manager.save(user);
+
+      let freelancerProfile: FreelancerProfile | null = null;
+      if (user.role === UserRole.FREELANCER) {
+        freelancerProfile = queryRunner.manager.create(FreelancerProfile, {
+          userId: user.id
+        });
+        await queryRunner.manager.save(freelancerProfile);
+      }
+
+      const { accessToken, refreshToken } = await this.generateTokens(
+        user.id,
+        queryRunner,
+        user.email,
+        user.role,
+        user.isEmailVerified,
+      );
+
+      await queryRunner.commitTransaction();
+      
+      const { hashedPassword, ...safeUser } = user;
+      
+      return {
+        status: 'success',
+        user: {
+          ...safeUser,
+          cvUrl: freelancerProfile?.cvUrl ?? null,
+        },
+        accessToken,
+        refreshToken,
+      };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async sendVerificationEmail(userId: string) {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) throw new BadRequestException('User not found');
+    if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+
+    // Generate a cryptographically sufficient 6-digit OTP
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    
+    // Store in Redis with 15 min (900 seconds) expiration
+    await this.redisService.set(`verifyEmail:${userId}`, code, 900);
+    
+    await this.emailService.sendVerificationEmail(user.email, code);
+
+    return { status: 'success', message: 'Verification email sent' };
+  }
+
+  async verifyEmail(userId: string, code: string) {
+    const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
+    if (!storedCode) throw new BadRequestException('Verification code expired or invalid');
+    if (storedCode !== code) throw new BadRequestException('Invalid verification code');
+
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) throw new BadRequestException('User not found');
+    if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+    
+    user.isEmailVerified = true;
+    await this.userRepository.save(user);
+    await this.redisService.del(`verifyEmail:${userId}`);
+
+    // Issue fresh tokens now that user is verified
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const { accessToken, refreshToken } = await this.generateTokens(
+        user.id,
+        queryRunner,
+        user.email,
+        user.role,
+        user.isEmailVerified,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };

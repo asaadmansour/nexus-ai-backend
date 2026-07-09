@@ -28,6 +28,15 @@ export class Project {
   @Column({ type: 'varchar', length: 255 })
   title: string;
 
+  @Column({ type: 'text' })
+  description: string;
+
+  @Column({ name: 'deadline', type: 'timestamptz', nullable: true })
+  deadline: Date | null;
+
+  @Column({ name: 'is_deadline_flexible', type: 'boolean', default: true })
+  isDeadlineFlexible: boolean;
+
   @Column({ name: 'budget_min', type: 'numeric', precision: 12, scale: 2 })
   budgetMin: string;
 

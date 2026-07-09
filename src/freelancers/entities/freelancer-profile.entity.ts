@@ -26,6 +26,18 @@ export class FreelancerProfile {
   @Column({ name: 'cv_url', type: 'text', nullable: true })
   cvUrl: string | null;
 
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  headline: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  bio: string | null;
+
+  @Column({ type: 'jsonb', nullable: true, default: [] })
+  skills: string[];
+
+  @Column({ name: 'years_experience', type: 'int', nullable: true })
+  yearsExperience: number | null;
+
   @Column({ type: 'jsonb', nullable: true })
   summary: Record<string, unknown> | null;
 

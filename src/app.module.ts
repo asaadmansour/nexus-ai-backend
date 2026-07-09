@@ -9,6 +9,8 @@ import { FreelancersModule } from './freelancers/freelancers.module';
 import { ProjectsModule } from './projects/projects.module';
 import { AuthModule } from './auth/auth.module';
 import { RedisModule } from './redis/redis.module';
+import { EmailModule } from './email/email.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -22,6 +24,8 @@ import { RedisModule } from './redis/redis.module';
     ProjectsModule,
     AuthModule,
     RedisModule,
+    EmailModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],
