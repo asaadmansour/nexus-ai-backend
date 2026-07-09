@@ -3,12 +3,14 @@ import {
   CreateDateColumn,
   DeleteDateColumn,
   Entity,
+  OneToMany,
   OneToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { UserRole } from '../../common/enums/user-role.enum';
 import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile.entity';
+import { RefreshToken } from '../../auth/entities/refresh-token.entity';
 
 @Entity('users')
 export class User {
@@ -24,7 +26,13 @@ export class User {
   @Column({ type: 'citext', unique: true })
   email: string;
 
-  @Column({ name: 'phone_number', type: 'varchar', length: 20, unique: true, nullable: true })
+  @Column({
+    name: 'phone_number',
+    type: 'varchar',
+    length: 20,
+    unique: true,
+    nullable: true,
+  })
   phoneNumber: string | null;
 
   @Column({ name: 'is_email_verified', type: 'boolean', default: false })
@@ -33,13 +41,23 @@ export class User {
   @Column({ name: 'is_id_verified', type: 'boolean', default: false })
   isIdVerified: boolean;
 
-  @Column({ name: 'hashed_password', type: 'text', nullable: true, select: false })
+  @Column({
+    name: 'hashed_password',
+    type: 'text',
+    nullable: true,
+    select: false,
+  })
   hashedPassword: string | null;
 
   @Column({ name: 'photo_url', type: 'text', nullable: true })
   photoUrl: string | null;
 
-  @Column({ type: 'enum', enum: UserRole, enumName: 'user_role', default: UserRole.CUSTOMER })
+  @Column({
+    type: 'enum',
+    enum: UserRole,
+    enumName: 'user_role',
+    default: UserRole.CUSTOMER,
+  })
   role: UserRole;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
@@ -53,4 +71,7 @@ export class User {
 
   @OneToOne(() => FreelancerProfile, (profile) => profile.user)
   freelancerProfile?: FreelancerProfile;
+
+  @OneToMany(() => RefreshToken, (refreshtoken) => refreshtoken.user)
+  refreshToken?: RefreshToken[];
 }
