@@ -28,6 +28,9 @@ export class Project {
   @Column({ type: 'varchar', length: 255 })
   title: string;
 
+  @Column({ type: 'text', nullable: true })
+  description: string | null;
+
   @Column({ name: 'budget_min', type: 'numeric', precision: 12, scale: 2 })
   budgetMin: string;
 
@@ -38,11 +41,29 @@ export class Project {
   currency: string;
 
   // Cache only; source of truth is escrow_transactions.
-  @Column({ name: 'held_amount', type: 'numeric', precision: 12, scale: 2, default: 0 })
+  @Column({
+    name: 'held_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    default: 0,
+  })
   heldAmount: string;
 
-  @Column({ name: 'released_amount', type: 'numeric', precision: 12, scale: 2, default: 0 })
+  @Column({
+    name: 'released_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    default: 0,
+  })
   releasedAmount: string;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  deadline: Date | null;
+
+  @Column({ name: 'is_deadline_flexible', type: 'boolean', default: false })
+  isDeadlineFlexible: boolean;
 
   @Index('projects_status_idx')
   @Column({
