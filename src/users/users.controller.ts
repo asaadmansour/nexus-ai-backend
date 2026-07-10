@@ -5,7 +5,6 @@ import {
   Post,
   UseGuards,
   Body,
-  ForbiddenException,
   BadRequestException,
   UseInterceptors,
   UploadedFile,
@@ -20,6 +19,7 @@ import { UserService } from './users.service';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import { UpdateUserDto } from './dtos/update-user.dto';
 import { UserRole } from 'src/common/enums/user-role.enum';
+import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 
 const MAX_CV_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
 const MAX_PHOTO_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -30,13 +30,13 @@ export class UsersController {
 
   @UseGuards(AuthGuard)
   @Get('me')
-  async getMe(@CurrentUser() user) {
+  async getMe(@CurrentUser() user: JwtPayload) {
     return await this.userService.findMe(user.sub);
   }
 
   @UseGuards(AuthGuard)
   @Patch('me')
-  async updateMe(@CurrentUser() user, @Body() updated: UpdateUserDto) {
+  async updateMe(@CurrentUser() user: JwtPayload, @Body() updated: UpdateUserDto) {
     return await this.userService.updateMe(updated, user.sub);
   }
 }
@@ -64,7 +64,7 @@ export class UploadsController {
     }),
   )
   async uploadCv(
-    @CurrentUser() user,
+    @CurrentUser() user: JwtPayload,
     @UploadedFile() file: Express.Multer.File,
   ) {
     if (!file) {
@@ -94,7 +94,7 @@ export class UploadsController {
     }),
   )
   async uploadPhoto(
-    @CurrentUser() user,
+    @CurrentUser() user: JwtPayload,
     @UploadedFile() file: Express.Multer.File,
   ) {
     if (!file) {

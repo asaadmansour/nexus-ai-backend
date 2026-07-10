@@ -1,18 +1,21 @@
 import { Module } from '@nestjs/common';
 import { MailerModule } from '@nestjs-modules/mailer';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { EmailService } from './email.service';
 
 @Module({
   imports: [
     MailerModule.forRootAsync({
-      useFactory: () => ({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
         transport: {
-          host: process.env.SMTP_HOST || 'smtp.ethereal.email',
-          port: parseInt(process.env.SMTP_PORT || '587', 10),
-          secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
+          host: config.get<string>('SMTP_HOST', 'smtp.ethereal.email'),
+          port: config.get<number>('SMTP_PORT', 587),
+          secure: config.get<string>('SMTP_SECURE') === 'true',
           auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASSWORD,
+            user: config.get<string>('SMTP_USER'),
+            pass: config.get<string>('SMTP_PASSWORD'),
           },
         },
         defaults: {

@@ -324,6 +324,11 @@ export class AuthService {
   }
 
   async sendVerificationEmail(userId: string) {
+    const existingCode = await this.redisService.get(`verifyEmail:${userId}`);
+    if (existingCode) {
+      throw new BadRequestException('Code already sent recently. Please wait before retrying.');
+    }
+
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) throw new BadRequestException('User not found');
     if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
@@ -340,18 +345,31 @@ export class AuthService {
   }
 
   async verifyEmail(userId: string, code: string) {
-    const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
-    if (!storedCode) throw new BadRequestException('Verification code expired or invalid');
-    if (storedCode !== code) throw new BadRequestException('Invalid verification code');
+    let attempts = parseInt(await this.redisService.get(`verifyEmailAttempts:${userId}`) || '0', 10);
+    if (attempts >= 3) {
+      await this.redisService.del(`verifyEmail:${userId}`);
+      await this.redisService.del(`verifyEmailAttempts:${userId}`);
+      throw new BadRequestException('Too many failed attempts. Please request a new code.');
+    }
 
-    const user = await this.userRepository.findOne({ where: { id: userId } });
-    if (!user) throw new BadRequestException('User not found');
-    if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
-    
+    const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
+    if (!storedCode) {
+      throw new BadRequestException('Verification code expired or invalid');
+    }
+
+    if (storedCode !== code) {
+      await this.redisService.set(`verifyEmailAttempts:${userId}`, (attempts + 1).toString(), 900);
+      throw new BadRequestException('Invalid verification code');
+    }
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
+      const user = await queryRunner.manager.findOne(User, { where: { id: userId } });
+      if (!user) throw new BadRequestException('User not found');
+      if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+
       user.isEmailVerified = true;
       await queryRunner.manager.save(user);
 
@@ -365,6 +383,7 @@ export class AuthService {
       
       await queryRunner.commitTransaction();
       await this.redisService.del(`verifyEmail:${userId}`);
+      await this.redisService.del(`verifyEmailAttempts:${userId}`);
       return { status: 'success', accessToken, refreshToken };
     } catch (error) {
       await queryRunner.rollbackTransaction();

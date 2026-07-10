@@ -76,23 +76,24 @@ export class AuthController {
   @Get('google/callback')
   @UseGuards(PassportAuthGuard('google'))
   async googleAuthRedirect(@Req() req: any, @Res() res: Response) {
-    const { accessToken, refreshToken, isProfileComplete } = await this.authService.googleLogin(req.user);
-    
-    // Exchange token avoids leaking access tokens in URL redirects
-    const exchangeCode = crypto.randomBytes(32).toString('hex');
-    await this.redisService.set(`auth:exchange:${exchangeCode}`, JSON.stringify({ accessToken, refreshToken, isProfileComplete }), 300); // 5 min TTL
-
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/auth-callback?code=${exchangeCode}`);
+    try {
+      const { accessToken, refreshToken, isProfileComplete } = await this.authService.googleLogin(req.user);
+      
+      const exchangeCode = crypto.randomBytes(32).toString('hex');
+      await this.redisService.set(`auth:exchange:${exchangeCode}`, JSON.stringify({ accessToken, refreshToken, isProfileComplete }), 300); // 5 min TTL
+  
+      res.redirect(`${frontendUrl}/auth-callback?code=${exchangeCode}`);
+    } catch (error) {
+      res.redirect(`${frontendUrl}/auth-callback?error=login_failed`);
+    }
   }
 
   @Post('exchange')
   async exchangeCode(@Body('code') code: string, @Res({ passthrough: true }) res: Response) {
     if (!code) throw new BadRequestException('Exchange code is required');
-    const dataStr = await this.redisService.get(`auth:exchange:${code}`);
+    const dataStr = await this.redisService.getDel(`auth:exchange:${code}`);
     if (!dataStr) throw new BadRequestException('Invalid or expired exchange code');
-    
-    await this.redisService.del(`auth:exchange:${code}`);
     const { accessToken, refreshToken, isProfileComplete } = JSON.parse(dataStr);
     
     this.setRefreshTokenCookie(res, refreshToken);

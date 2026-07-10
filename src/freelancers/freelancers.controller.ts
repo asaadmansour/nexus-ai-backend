@@ -7,6 +7,7 @@ import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import { UpdateFreelancerDto } from './dtos/update-freelancer.dto';
+import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 
 @Controller('freelancers')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
@@ -15,12 +16,12 @@ export class FreelancersController {
   constructor(private readonly freelancersService: FreelancersService) {}
 
   @Get('me')
-  async getMyProfile(@CurrentUser() user: any) {
+  async getMyProfile(@CurrentUser() user: JwtPayload) {
     return await this.freelancersService.getMyProfile(user.sub);
   }
 
   @Patch('me')
-  async updateMyProfile(@CurrentUser() user: any, @Body() dto: UpdateFreelancerDto) {
+  async updateMyProfile(@CurrentUser() user: JwtPayload, @Body() dto: UpdateFreelancerDto) {
     return await this.freelancersService.updateMyProfile(user.sub, dto);
   }
 }

@@ -8,7 +8,7 @@ import { User } from 'src/users/entities/user.entity';
 import { Repository } from 'typeorm';
 import { UpdateUserDto } from './dtos/update-user.dto';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
-import { v2 as cloudinary } from 'cloudinary';
+import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 
 @Injectable()
 export class UserService {
@@ -66,7 +66,7 @@ export class UserService {
     file: Express.Multer.File,
   ): Promise<{ status: string; cvUrl: string }> {
     // Upload buffer directly to Cloudinary (no temp file on disk)
-    const cvResult = await new Promise<any>((resolve, reject) => {
+    const cvResult = await new Promise<UploadApiResponse>((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
         {
           resource_type: 'raw', // required for non-image types like PDF
@@ -93,7 +93,7 @@ export class UserService {
     try {
       const user = await this.userRepository.findOne({ where: { id: userId }, relations: ['freelancerProfile']});
       if (user?.freelancerProfile?.cvUrl) {
-         const oldUrlMatch = user.freelancerProfile.cvUrl.match(/cvs\/[^\.]+/);
+         const oldUrlMatch = user.freelancerProfile.cvUrl.match(/cvs\/[^/]+$/);
          if (oldUrlMatch) {
             cloudinary.uploader.destroy(oldUrlMatch[0], { resource_type: 'raw' }).catch(console.error);
          }
@@ -114,7 +114,7 @@ export class UserService {
     userId: string,
     file: Express.Multer.File,
   ): Promise<{ status: string; photoUrl: string }> {
-    const photoResult = await new Promise<any>((resolve, reject) => {
+    const photoResult = await new Promise<UploadApiResponse>((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
         {
           resource_type: 'image',
@@ -141,7 +141,7 @@ export class UserService {
     try {
       const user = await this.userRepository.findOne({ where: { id: userId }});
       if (user?.photoUrl) {
-         const oldUrlMatch = user.photoUrl.match(/avatars\/[^\.]+/);
+         const oldUrlMatch = user.photoUrl.match(/avatars\/[^/]+$/);
          if (oldUrlMatch) {
             cloudinary.uploader.destroy(oldUrlMatch[0]).catch(console.error);
          }

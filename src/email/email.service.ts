@@ -7,13 +7,23 @@ export class EmailService {
 
   constructor(private readonly mailerService: MailerService) {}
 
+  private maskEmail(email: string): string {
+    const [local, domain] = email.split('@');
+    if (!domain) return '***@***';
+    const firstChar = local.charAt(0) || '*';
+    const lastChar = local.length > 1 ? local.charAt(local.length - 1) : '';
+    return `${firstChar}***${lastChar}@${domain}`;
+  }
+
   async sendVerificationEmail(email: string, code: string) {
+    const maskedEmail = this.maskEmail(email);
+
     if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
       if (process.env.NODE_ENV !== 'production') {
-        this.logger.warn(`[DEV MODE] Verification code for ${email}: ${code}`);
+        this.logger.warn(`[DEV MODE] Verification code for ${maskedEmail}: ${code}`);
         return;
       }
-      this.logger.error(`[PROD MODE] Mailer credentials missing for ${email}`);
+      this.logger.error(`[PROD MODE] Mailer credentials missing for ${maskedEmail}`);
       throw new InternalServerErrorException('Email service configuration missing');
     }
 
@@ -33,9 +43,9 @@ export class EmailService {
           </div>
         `,
       });
-      this.logger.log(`Verification email sent to ${email}`);
+      this.logger.log(`Verification email sent to ${maskedEmail}`);
     } catch (error) {
-      this.logger.error(`Failed to send verification email to ${email}`, error);
+      this.logger.error(`Failed to send verification email to ${maskedEmail}`, error);
       throw new InternalServerErrorException('Could not dispatch verification email');
     }
   }

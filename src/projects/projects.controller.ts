@@ -8,12 +8,7 @@ import { RolesGuard } from 'src/common/guards/roles.guards';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
-
-interface JwtPayload {
-  sub: string;
-  role: UserRole;
-  isEmailVerified?: boolean;
-}
+import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 
 @Controller('projects')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
@@ -30,12 +25,10 @@ export class ProjectsController {
   @Get()
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
   async getProjects(@CurrentUser() user: JwtPayload) {
-    let data;
-    if (user.role === UserRole.ADMIN) {
-      data = await this.projectsService.findAll();
-    } else {
-      data = await this.projectsService.findAllForCustomer(user.sub);
-    }
+    const data =
+      user.role === UserRole.ADMIN
+        ? await this.projectsService.findAll()
+        : await this.projectsService.findAllForCustomer(user.sub);
     return { status: 'success', data };
   }
 

@@ -25,4 +25,12 @@ export class RedisService implements OnModuleDestroy {
   async del(key: string) {
     await this.client.del(key);
   }
+
+  async getDel(key: string) {
+    const pipe = this.client.multi();
+    pipe.get(key);
+    pipe.del(key);
+    const results = await pipe.exec();
+    return results?.[0]?.[1] as string | null;
+  }
 }

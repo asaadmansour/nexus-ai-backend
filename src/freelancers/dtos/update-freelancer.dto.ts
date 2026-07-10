@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsArray, IsInt, IsNumber, IsBoolean, MaxLength, Min } from 'class-validator';
+import { IsString, IsOptional, IsArray, IsInt, IsNumber, IsBoolean, MaxLength, Min, ArrayMaxSize } from 'class-validator';
 
 export class UpdateFreelancerDto {
   @IsOptional()
@@ -8,11 +8,14 @@ export class UpdateFreelancerDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   bio?: string;
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(10)
   @IsString({ each: true })
+  @MaxLength(50, { each: true })
   skills?: string[];
 
   @IsOptional()

@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Project } from './entities/project.entity';
@@ -41,7 +41,10 @@ export class ProjectsService {
   }
 
   async findOne(id: string, userId: string, isAdmin: boolean) {
-    const project = await this.projectRepository.findOne({ where: { id } });
+    const project = await this.projectRepository.findOne({ 
+      where: { id },
+      relations: ['customer']
+    });
     if (!project) throw new NotFoundException('Project not found');
     
     if (!isAdmin && project.customerId !== userId) {
@@ -58,10 +61,20 @@ export class ProjectsService {
     if (dto.description !== undefined) project.description = dto.description;
     if (dto.budgetMin !== undefined) project.budgetMin = dto.budgetMin.toString();
     if (dto.budgetMax !== undefined) project.budgetMax = dto.budgetMax.toString();
+    
+    // Cross-field bounds check
+    const resultingMin = parseFloat(project.budgetMin);
+    const resultingMax = parseFloat(project.budgetMax);
+    if (resultingMin > resultingMax) {
+      throw new BadRequestException('budgetMin cannot exceed budgetMax');
+    }
+
     if (dto.currency !== undefined) project.currency = dto.currency;
     if (dto.deadline !== undefined) project.deadline = dto.deadline ? new Date(dto.deadline) : null;
     if (dto.isDeadlineFlexible !== undefined) project.isDeadlineFlexible = dto.isDeadlineFlexible;
-    if (dto.status !== undefined) project.status = dto.status;
+    if (dto.status !== undefined && isAdmin) {
+      project.status = dto.status;
+    }
 
     return await this.projectRepository.save(project);
   }
