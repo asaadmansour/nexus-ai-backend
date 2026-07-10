@@ -188,10 +188,23 @@ export class UserService {
     );
 
     try {
-      await this.userRepository.update(
+      const result = await this.userRepository.update(
         { id: userId },
         { photoUrl: photoResult.secure_url },
       );
+
+      if (result.affected === 0) {
+        // User was deleted between auth and upload — clean up orphaned asset
+        cloudinary.uploader
+          .destroy(photoResult.public_id)
+          .catch((err) =>
+            this.logger.error(
+              `Failed to destroy orphaned photo asset ${photoResult.public_id}`,
+              err,
+            ),
+          );
+        throw new NotFoundException('User not found');
+      }
 
       // Clean up old asset only after DB save succeeds (fire-and-forget)
       if (oldPhotoPublicId) {

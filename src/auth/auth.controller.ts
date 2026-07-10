@@ -83,10 +83,13 @@ export class AuthController {
     }
 
     const refreshToken = req.cookies?.['refreshToken'] as string | undefined;
-    // Always revoke the access token (blacklist it)
-    await this.authService.logout(token, refreshToken ?? '');
-    // Always clear the cookie regardless of whether token revocation succeeded
-    res.clearCookie('refreshToken', { path: '/' });
+    try {
+      // Revoke the access token (blacklist it) and optionally the refresh token
+      await this.authService.logout(token, refreshToken ?? '');
+    } finally {
+      // Always clear the cookie — even if revocation fails on a shared device
+      res.clearCookie('refreshToken', { path: '/' });
+    }
     return { status: 'logged out' };
   }
 
