@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsArray, IsInt, IsNumber, IsBoolean, MaxLength } from 'class-validator';
+import { IsString, IsOptional, IsArray, IsInt, IsNumber, IsBoolean, MaxLength, Min } from 'class-validator';
 
 export class UpdateFreelancerDto {
   @IsOptional()
@@ -17,10 +17,12 @@ export class UpdateFreelancerDto {
 
   @IsOptional()
   @IsInt()
+  @Min(0)
   yearsExperience?: number;
 
   @IsOptional()
   @IsNumber()
+  @Min(0)
   hourlyRate?: number;
 
   @IsOptional()

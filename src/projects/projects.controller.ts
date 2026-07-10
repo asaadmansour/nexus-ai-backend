@@ -9,6 +9,12 @@ import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 
+interface JwtPayload {
+  sub: string;
+  role: UserRole;
+  isEmailVerified?: boolean;
+}
+
 @Controller('projects')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
 export class ProjectsController {
@@ -16,35 +22,40 @@ export class ProjectsController {
 
   @Post()
   @Roles(UserRole.CUSTOMER)
-  async createProject(@CurrentUser() user: any, @Body() dto: CreateProjectDto) {
-    return await this.projectsService.create(user.sub, dto);
+  async createProject(@CurrentUser() user: JwtPayload, @Body() dto: CreateProjectDto) {
+    const data = await this.projectsService.create(user.sub, dto);
+    return { status: 'success', data };
   }
 
   @Get()
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
-  async getProjects(@CurrentUser() user: any) {
+  async getProjects(@CurrentUser() user: JwtPayload) {
+    let data;
     if (user.role === UserRole.ADMIN) {
-      return await this.projectsService.findAll();
+      data = await this.projectsService.findAll();
     } else {
-      return await this.projectsService.findAllForCustomer(user.sub);
+      data = await this.projectsService.findAllForCustomer(user.sub);
     }
+    return { status: 'success', data };
   }
 
   @Get(':id')
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
-  async getProject(@Param('id') id: string, @CurrentUser() user: any) {
+  async getProject(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
     const isAdmin = user.role === UserRole.ADMIN;
-    return await this.projectsService.findOne(id, user.sub, isAdmin);
+    const data = await this.projectsService.findOne(id, user.sub, isAdmin);
+    return { status: 'success', data };
   }
 
   @Patch(':id')
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
   async updateProject(
     @Param('id') id: string,
-    @CurrentUser() user: any,
+    @CurrentUser() user: JwtPayload,
     @Body() dto: UpdateProjectDto,
   ) {
     const isAdmin = user.role === UserRole.ADMIN;
-    return await this.projectsService.update(id, user.sub, isAdmin, dto);
+    const data = await this.projectsService.update(id, user.sub, isAdmin, dto);
+    return { status: 'success', data };
   }
 }

@@ -19,7 +19,7 @@ export class FreelancersService {
     if (!profile) throw new NotFoundException('Freelancer profile not found or role mismatch');
     
     // safe nested user stripping
-    const { hashedPassword, ...safeUser } = profile.user || { hashedPassword: null };
+    const { hashedPassword: _hashedPassword, ...safeUser } = profile.user || { hashedPassword: null };
     
     return { 
       status: 'success', 

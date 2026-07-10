@@ -11,8 +11,8 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
     private readonly authService: AuthService,
   ) {
     super({
-      clientID: configService.get<string>('GOOGLE_CLIENT_ID') || 'dummy-client-id',
-      clientSecret: configService.get<string>('GOOGLE_CLIENT_SECRET') || 'dummy-client-secret',
+      clientID: configService.getOrThrow<string>('GOOGLE_CLIENT_ID'),
+      clientSecret: configService.getOrThrow<string>('GOOGLE_CLIENT_SECRET'),
       callbackURL: configService.get<string>('GOOGLE_CALLBACK_URL') || 'http://localhost:3000/auth/google/callback',
       scope: ['email', 'profile'],
     });
@@ -25,11 +25,15 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
     done: VerifyCallback,
   ): Promise<any> {
     const { name, emails, photos } = profile;
+    if (!emails || emails.length === 0) {
+      return done(new Error('Email is required'), false);
+    }
+    
     const userProfile = {
       email: emails[0].value,
-      firstName: name.givenName,
-      lastName: name.familyName || '',
-      photoUrl: photos[0].value,
+      firstName: name?.givenName || '',
+      lastName: name?.familyName || '',
+      photoUrl: photos && photos.length > 0 ? photos[0].value : null,
     };
 
     try {

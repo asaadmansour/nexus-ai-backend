@@ -14,6 +14,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
+import { RolesGuard } from 'src/common/guards/roles.guards';
+import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserService } from './users.service';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import { UpdateUserDto } from './dtos/update-user.dto';
@@ -43,7 +45,8 @@ export class UsersController {
 export class UploadsController {
   constructor(private readonly userService: UserService) {}
 
-  @UseGuards(AuthGuard, VerifiedGuard)
+  @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
+  @Roles(UserRole.FREELANCER)
   @Post('freelancer-cv')
   @UseInterceptors(
     FileInterceptor('file', {
@@ -64,9 +67,6 @@ export class UploadsController {
     @CurrentUser() user,
     @UploadedFile() file: Express.Multer.File,
   ) {
-    if (user.role !== UserRole.FREELANCER) {
-      throw new ForbiddenException('Only freelancers can upload a CV');
-    }
     if (!file) {
       throw new BadRequestException('No file uploaded');
     }

@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
 import { User } from 'src/users/entities/user.entity';
 import { Repository, DataSource, QueryRunner } from 'typeorm';
 import { SignUpUserDto } from './dtos/signup-user.dto';
@@ -223,8 +224,11 @@ export class AuthService {
           lastName: profile.lastName,
           photoUrl: profile.photoUrl,
           hashedPassword: null,
-          isEmailVerified: true, // Google already verified this email
+          isEmailVerified: true, 
         });
+        user = await queryRunner.manager.save(user);
+      } else if (!user.isEmailVerified) {
+        user.isEmailVerified = true;
         user = await queryRunner.manager.save(user);
       }
       
@@ -263,7 +267,7 @@ export class AuthService {
     }
   }
 
-  async completeSignup(userId: string, payload: { phoneNumber: string; role: UserRole }) {
+  async completeSignup(userId: string, payload: { phoneNumber: string; role: UserRole; firstName?: string; lastName?: string }) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -277,6 +281,8 @@ export class AuthService {
 
       user.phoneNumber = payload.phoneNumber;
       user.role = payload.role;
+      if (payload.firstName) user.firstName = payload.firstName;
+      if (payload.lastName) user.lastName = payload.lastName;
 
       await queryRunner.manager.save(user);
 
@@ -323,7 +329,7 @@ export class AuthService {
     if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
 
     // Generate a cryptographically sufficient 6-digit OTP
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = crypto.randomInt(100000, 1000000).toString();
     
     // Store in Redis with 15 min (900 seconds) expiration
     await this.redisService.set(`verifyEmail:${userId}`, code, 900);
@@ -342,15 +348,13 @@ export class AuthService {
     if (!user) throw new BadRequestException('User not found');
     if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
     
-    user.isEmailVerified = true;
-    await this.userRepository.save(user);
-    await this.redisService.del(`verifyEmail:${userId}`);
-
-    // Issue fresh tokens now that user is verified
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
+      user.isEmailVerified = true;
+      await queryRunner.manager.save(user);
+
       const { accessToken, refreshToken } = await this.generateTokens(
         user.id,
         queryRunner,
@@ -358,7 +362,9 @@ export class AuthService {
         user.role,
         user.isEmailVerified,
       );
+      
       await queryRunner.commitTransaction();
+      await this.redisService.del(`verifyEmail:${userId}`);
       return { status: 'success', accessToken, refreshToken };
     } catch (error) {
       await queryRunner.rollbackTransaction();

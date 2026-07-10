@@ -1,4 +1,5 @@
 import { IsString, IsNotEmpty, IsNumber, IsOptional, IsDateString, IsBoolean, Min, MaxLength } from 'class-validator';
+import { IsLesserThanOrEqual } from 'src/common/decorators/is-lesser-than-or-equal.decorator';
 
 export class CreateProjectDto {
   @IsString()
@@ -12,6 +13,7 @@ export class CreateProjectDto {
 
   @IsNumber()
   @Min(0)
+  @IsLesserThanOrEqual('budgetMax')
   budgetMin: number;
 
   @IsNumber()
@@ -20,6 +22,7 @@ export class CreateProjectDto {
 
   @IsString()
   @IsOptional()
+  @MaxLength(3)
   currency?: string;
 
   @IsDateString()

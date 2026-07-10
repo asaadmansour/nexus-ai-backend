@@ -1,38 +1,9 @@
-import { IsEnum, IsString, IsNumber, IsOptional, IsDateString, IsBoolean, Min, MaxLength } from 'class-validator';
+import { PartialType } from '@nestjs/mapped-types';
+import { CreateProjectDto } from './create-project.dto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { IsEnum, IsOptional } from 'class-validator';
 
-export class UpdateProjectDto {
-  @IsString()
-  @IsOptional()
-  @MaxLength(255)
-  title?: string;
-
-  @IsString()
-  @IsOptional()
-  description?: string;
-
-  @IsNumber()
-  @Min(0)
-  @IsOptional()
-  budgetMin?: number;
-
-  @IsNumber()
-  @Min(0)
-  @IsOptional()
-  budgetMax?: number;
-
-  @IsString()
-  @IsOptional()
-  currency?: string;
-
-  @IsDateString()
-  @IsOptional()
-  deadline?: string;
-
-  @IsBoolean()
-  @IsOptional()
-  isDeadlineFlexible?: boolean;
-
+export class UpdateProjectDto extends PartialType(CreateProjectDto) {
   @IsEnum(ProjectStatus)
   @IsOptional()
   status?: ProjectStatus;

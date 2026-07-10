@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
 import { MailerService } from '@nestjs-modules/mailer';
 
 @Injectable()
@@ -8,10 +8,13 @@ export class EmailService {
   constructor(private readonly mailerService: MailerService) {}
 
   async sendVerificationEmail(email: string, code: string) {
-    // Dev fallback: if no SMTP credentials configured, just log the code
     if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
-      this.logger.warn(`[DEV MODE] Verification code for ${email}: ${code}`);
-      return;
+      if (process.env.NODE_ENV !== 'production') {
+        this.logger.warn(`[DEV MODE] Verification code for ${email}: ${code}`);
+        return;
+      }
+      this.logger.error(`[PROD MODE] Mailer credentials missing for ${email}`);
+      throw new InternalServerErrorException('Email service configuration missing');
     }
 
     try {
@@ -33,7 +36,7 @@ export class EmailService {
       this.logger.log(`Verification email sent to ${email}`);
     } catch (error) {
       this.logger.error(`Failed to send verification email to ${email}`, error);
-      throw new Error('Could not dispatch verification email');
+      throw new InternalServerErrorException('Could not dispatch verification email');
     }
   }
 }
