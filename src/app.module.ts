@@ -11,6 +11,8 @@ import { AuthModule } from './auth/auth.module';
 import { RedisModule } from './redis/redis.module';
 import { AgentsModule } from './agents/agents.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { EmailModule } from './email/email.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -24,8 +26,8 @@ import { NotificationsModule } from './notifications/notifications.module';
     ProjectsModule,
     AuthModule,
     RedisModule,
-    AgentsModule,
-    NotificationsModule,
+    EmailModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],
