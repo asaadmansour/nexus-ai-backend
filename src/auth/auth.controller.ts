@@ -8,7 +8,6 @@ import {
   Req,
   Request,
   Res,
-  Query,
   BadRequestException,
   UnauthorizedException,
   Logger,
@@ -83,11 +82,11 @@ export class AuthController {
       );
     }
 
-    const refreshToken = req.cookies['refreshToken'];
-    if (refreshToken) {
-      await this.authService.logout(token, refreshToken);
-      res.clearCookie('refreshToken', { path: '/' });
-    }
+    const refreshToken = req.cookies?.['refreshToken'] as string | undefined;
+    // Always revoke the access token (blacklist it)
+    await this.authService.logout(token, refreshToken ?? '');
+    // Always clear the cookie regardless of whether token revocation succeeded
+    res.clearCookie('refreshToken', { path: '/' });
     return { status: 'logged out' };
   }
 

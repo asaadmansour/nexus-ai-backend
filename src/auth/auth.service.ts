@@ -144,20 +144,28 @@ export class AuthService {
       const decodedAccess = this.jwtService.verify(accessToken);
       const userId = decodedAccess.sub;
 
-      const storedToken = await this.refreshTokenRepository.findOne({
-        where: { userId },
-      });
-      if (!storedToken) throw new UnauthorizedException('Invalid Token');
-
-      const tokenMatch = await bcrypt.compare(refreshToken, storedToken.token);
-      if (!tokenMatch) throw new UnauthorizedException('Invalid Token');
-
       const ttl = Math.max(
         1,
         decodedAccess.exp - Math.floor(Date.now() / 1000),
       );
+      // Always blacklist the access token to prevent reuse
       await this.redisService.set(accessToken, 'blacklisted', ttl);
-      await this.refreshTokenRepository.delete({ id: storedToken.id });
+
+      // Only validate and revoke the refresh token if one was provided
+      if (refreshToken) {
+        const storedToken = await this.refreshTokenRepository.findOne({
+          where: { userId },
+        });
+        if (storedToken) {
+          const tokenMatch = await bcrypt.compare(
+            refreshToken,
+            storedToken.token,
+          );
+          if (tokenMatch) {
+            await this.refreshTokenRepository.delete({ id: storedToken.id });
+          }
+        }
+      }
 
       return { status: 'logged out' };
     } catch (error) {
@@ -342,7 +350,8 @@ export class AuthService {
 
       await queryRunner.commitTransaction();
 
-      const { hashedPassword: _hashedPassword, ...safeUser } = user;
+      const safeUser = Object.assign({}, user) as Partial<typeof user>;
+      delete safeUser.hashedPassword;
 
       return {
         status: 'success',
@@ -362,57 +371,65 @@ export class AuthService {
   }
 
   async sendVerificationEmail(userId: string) {
-    const cooldown = await this.redisService.get(
+    // Atomic SET NX EX: only sets if key does NOT exist. Returns null if cooldown is active.
+    const acquired = await this.redisService.setNx(
       `verifyEmailCooldown:${userId}`,
+      'true',
+      120,
     );
-    if (cooldown) {
+    if (!acquired) {
       throw new BadRequestException(
         'Code already sent recently. Please wait before retrying.',
       );
     }
 
     const user = await this.userRepository.findOne({ where: { id: userId } });
-    if (!user) throw new BadRequestException('User not found');
-    if (user.isEmailVerified)
+    if (!user) {
+      await this.redisService.del(`verifyEmailCooldown:${userId}`);
+      throw new BadRequestException('User not found');
+    }
+    if (user.isEmailVerified) {
+      await this.redisService.del(`verifyEmailCooldown:${userId}`);
       throw new BadRequestException('Email is already verified');
+    }
 
     // Generate a cryptographically sufficient 6-digit OTP
     const code = crypto.randomInt(100000, 1000000).toString();
 
-    await this.emailService.sendVerificationEmail(user.email, code);
+    try {
+      await this.emailService.sendVerificationEmail(user.email, code);
+    } catch (emailError) {
+      // Rollback cooldown lock if email fails so user can retry
+      await this.redisService.del(`verifyEmailCooldown:${userId}`);
+      throw emailError;
+    }
 
-    // Store in Redis with 15 min (900 seconds) expiration, only if email successfully sent!
+    // Only store OTP after successful delivery
     await this.redisService.set(`verifyEmail:${userId}`, code, 900);
-    // Add realistic 2 minute resend cooldown
-    await this.redisService.set(`verifyEmailCooldown:${userId}`, 'true', 120);
 
     return { status: 'success', message: 'Verification email sent' };
   }
 
   async verifyEmail(userId: string, code: string) {
-    const attempts = parseInt(
-      (await this.redisService.get(`verifyEmailAttempts:${userId}`)) || '0',
-      10,
-    );
-    if (attempts >= 3) {
-      await this.redisService.del(`verifyEmail:${userId}`);
-      await this.redisService.del(`verifyEmailAttempts:${userId}`);
-      throw new BadRequestException(
-        'Too many failed attempts. Please request a new code.',
-      );
-    }
-
+    // Atomic INCR: returns new count; first call returns 1
     const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
     if (!storedCode) {
       throw new BadRequestException('Verification code expired or invalid');
     }
 
     if (storedCode !== code) {
-      await this.redisService.set(
+      // Atomically increment and apply TTL only on first increment
+      const attempts = await this.redisService.incr(
         `verifyEmailAttempts:${userId}`,
-        (attempts + 1).toString(),
         900,
       );
+      if (attempts >= 3) {
+        await this.redisService.del(`verifyEmail:${userId}`);
+        await this.redisService.del(`verifyEmailAttempts:${userId}`);
+        throw new BadRequestException(
+          'Too many failed attempts. Please request a new code.',
+        );
+      }
       throw new BadRequestException('Invalid verification code');
     }
 
@@ -439,8 +456,25 @@ export class AuthService {
       );
 
       await queryRunner.commitTransaction();
-      await this.redisService.del(`verifyEmail:${userId}`);
-      await this.redisService.del(`verifyEmailAttempts:${userId}`);
+
+      // Best-effort Redis cleanup — after commit, outside the transaction
+      this.redisService
+        .del(`verifyEmail:${userId}`)
+        .catch((err) =>
+          this.emailService['logger']?.error(
+            `Failed to del verifyEmail key for ${userId}`,
+            err,
+          ),
+        );
+      this.redisService
+        .del(`verifyEmailAttempts:${userId}`)
+        .catch((err) =>
+          this.emailService['logger']?.error(
+            `Failed to del verifyEmailAttempts key for ${userId}`,
+            err,
+          ),
+        );
+
       return { status: 'success', accessToken, refreshToken };
     } catch (error) {
       await queryRunner.rollbackTransaction();

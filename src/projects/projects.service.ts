@@ -86,7 +86,12 @@ export class ProjectsService {
       project.deadline = dto.deadline ? new Date(dto.deadline) : null;
     if (dto.isDeadlineFlexible !== undefined)
       project.isDeadlineFlexible = dto.isDeadlineFlexible;
-    if (dto.status !== undefined && isAdmin) {
+    if (dto.status !== undefined) {
+      if (!isAdmin) {
+        throw new ForbiddenException(
+          'Only admins can change project status',
+        );
+      }
       project.status = dto.status;
     }
 

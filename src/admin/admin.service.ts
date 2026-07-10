@@ -13,7 +13,7 @@ export class AdminService {
 
   async getUsers(pageNum: number, limitNum: number) {
     const [users, total] = await this.userRepository.findAndCount({
-      order: { createdAt: 'DESC' },
+      order: { createdAt: 'DESC', id: 'DESC' },
       skip: (pageNum - 1) * limitNum,
       take: limitNum,
       select: {
@@ -34,7 +34,7 @@ export class AdminService {
 
   async getProjects(pageNum: number, limitNum: number) {
     const [projects, total] = await this.projectRepository.findAndCount({
-      order: { createdAt: 'DESC' },
+      order: { createdAt: 'DESC', id: 'DESC' },
       skip: (pageNum - 1) * limitNum,
       take: limitNum,
       relations: ['customer'],

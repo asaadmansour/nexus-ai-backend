@@ -7,6 +7,7 @@ import {
   IsBoolean,
   Min,
   MaxLength,
+  Matches,
 } from 'class-validator';
 import { IsLesserThanOrEqual } from 'src/common/decorators/is-lesser-than-or-equal.decorator';
 
@@ -18,6 +19,7 @@ export class CreateProjectDto {
 
   @IsString()
   @IsNotEmpty()
+  @MaxLength(2000)
   description: string;
 
   @IsNumber()
@@ -31,7 +33,7 @@ export class CreateProjectDto {
 
   @IsString()
   @IsOptional()
-  @MaxLength(3)
+  @Matches(/^[A-Z]{3}$/, { message: 'currency must be a valid ISO 4217 3-letter uppercase code (e.g. USD, EGP)' })
   currency?: string;
 
   @IsDateString()

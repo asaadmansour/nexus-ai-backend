@@ -6,6 +6,7 @@ import {
   Param,
   Body,
   UseGuards,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { ProjectsService } from './projects.service';
 import { CreateProjectDto } from './dtos/create-project.dto';
@@ -45,7 +46,10 @@ export class ProjectsController {
 
   @Get(':id')
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
-  async getProject(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
+  async getProject(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
     const isAdmin = user.role === UserRole.ADMIN;
     const data = await this.projectsService.findOne(id, user.sub, isAdmin);
     return { status: 'success', data };
@@ -54,7 +58,7 @@ export class ProjectsController {
   @Patch(':id')
   @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
   async updateProject(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: JwtPayload,
     @Body() dto: UpdateProjectDto,
   ) {
