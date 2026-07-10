@@ -12,20 +12,28 @@ export class AdminService {
   ) {}
 
   async getUsers(pageNum: number, limitNum: number) {
-    const [users, total] = await this.userRepository.findAndCount({ 
+    const [users, total] = await this.userRepository.findAndCount({
       order: { createdAt: 'DESC' },
       skip: (pageNum - 1) * limitNum,
       take: limitNum,
       select: {
-        id: true, firstName: true, lastName: true, email: true, phoneNumber: true,
-        isEmailVerified: true, isIdVerified: true, photoUrl: true, role: true, createdAt: true,
-      }
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        phoneNumber: true,
+        isEmailVerified: true,
+        isIdVerified: true,
+        photoUrl: true,
+        role: true,
+        createdAt: true,
+      },
     });
     return { users, total };
   }
 
   async getProjects(pageNum: number, limitNum: number) {
-    const [projects, total] = await this.projectRepository.findAndCount({ 
+    const [projects, total] = await this.projectRepository.findAndCount({
       order: { createdAt: 'DESC' },
       skip: (pageNum - 1) * limitNum,
       take: limitNum,
@@ -46,8 +54,8 @@ export class AdminService {
           lastName: true,
           email: true,
           role: true,
-        }
-      }
+        },
+      },
     });
     return { projects, total };
   }

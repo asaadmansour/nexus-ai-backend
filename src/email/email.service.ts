@@ -1,4 +1,8 @@
-import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { MailerService } from '@nestjs-modules/mailer';
 
 @Injectable()
@@ -20,11 +24,17 @@ export class EmailService {
 
     if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
       if (process.env.NODE_ENV !== 'production') {
-        this.logger.warn(`[DEV MODE] Verification code for ${maskedEmail}: ${code}`);
+        this.logger.warn(
+          `[DEV MODE] Verification code for ${maskedEmail}: ${code}`,
+        );
         return;
       }
-      this.logger.error(`[PROD MODE] Mailer credentials missing for ${maskedEmail}`);
-      throw new InternalServerErrorException('Email service configuration missing');
+      this.logger.error(
+        `[PROD MODE] Mailer credentials missing for ${maskedEmail}`,
+      );
+      throw new InternalServerErrorException(
+        'Email service configuration missing',
+      );
     }
 
     try {
@@ -45,8 +55,13 @@ export class EmailService {
       });
       this.logger.log(`Verification email sent to ${maskedEmail}`);
     } catch (error) {
-      this.logger.error(`Failed to send verification email to ${maskedEmail}`, error);
-      throw new InternalServerErrorException('Could not dispatch verification email');
+      this.logger.error(
+        `Failed to send verification email to ${maskedEmail}`,
+        error,
+      );
+      throw new InternalServerErrorException(
+        'Could not dispatch verification email',
+      );
     }
   }
 }

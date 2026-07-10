@@ -21,7 +21,10 @@ export class FreelancersController {
   }
 
   @Patch('me')
-  async updateMyProfile(@CurrentUser() user: JwtPayload, @Body() dto: UpdateFreelancerDto) {
+  async updateMyProfile(
+    @CurrentUser() user: JwtPayload,
+    @Body() dto: UpdateFreelancerDto,
+  ) {
     return await this.freelancersService.updateMyProfile(user.sub, dto);
   }
 }

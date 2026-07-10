@@ -1,4 +1,13 @@
-import { IsString, IsNotEmpty, IsNumber, IsOptional, IsDateString, IsBoolean, Min, MaxLength } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsDateString,
+  IsBoolean,
+  Min,
+  MaxLength,
+} from 'class-validator';
 import { IsLesserThanOrEqual } from 'src/common/decorators/is-lesser-than-or-equal.decorator';
 
 export class CreateProjectDto {

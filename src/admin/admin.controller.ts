@@ -12,16 +12,30 @@ import { AdminService } from './admin.service';
 export class AdminController {
   constructor(private readonly adminService: AdminService) {}
 
+  private parsePagination(page: string, limit: string) {
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(parseInt(limit, 10) || 50, 100));
+    return { pageNum, limitNum };
+  }
+
   @Get('users')
   async getUsers(
     @Query('page') page: string = '1',
     @Query('limit') limit: string = '50',
   ) {
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = Math.min(parseInt(limit, 10) || 50, 100);
-    
-    const { users, total } = await this.adminService.getUsers(pageNum, limitNum);
-    return { status: 'success', data: users, total, page: pageNum, limit: limitNum };
+    const { pageNum, limitNum } = this.parsePagination(page, limit);
+
+    const { users, total } = await this.adminService.getUsers(
+      pageNum,
+      limitNum,
+    );
+    return {
+      status: 'success',
+      data: users,
+      total,
+      page: pageNum,
+      limit: limitNum,
+    };
   }
 
   @Get('projects')
@@ -29,11 +43,19 @@ export class AdminController {
     @Query('page') page: string = '1',
     @Query('limit') limit: string = '50',
   ) {
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = Math.min(parseInt(limit, 10) || 50, 100);
+    const { pageNum, limitNum } = this.parsePagination(page, limit);
 
-    const { projects, total } = await this.adminService.getProjects(pageNum, limitNum);
-    return { status: 'success', data: projects, total, page: pageNum, limit: limitNum };
+    const { projects, total } = await this.adminService.getProjects(
+      pageNum,
+      limitNum,
+    );
+    return {
+      status: 'success',
+      data: projects,
+      total,
+      page: pageNum,
+      limit: limitNum,
+    };
   }
 
   @Get('stats')

@@ -104,7 +104,13 @@ export class AuthService {
     try {
       const dbUser = await queryRunner.manager.findOne(User, {
         where: { email: user.email },
-        select: { hashedPassword: true, id: true, email: true, role: true, isEmailVerified: true },
+        select: {
+          hashedPassword: true,
+          id: true,
+          email: true,
+          role: true,
+          isEmailVerified: true,
+        },
       });
       if (!dbUser || !dbUser.hashedPassword)
         throw new UnauthorizedException('Either email or password wrong');
@@ -207,14 +213,25 @@ export class AuthService {
     }
   }
 
-  async validateGoogleUser(profile: { email: string, firstName: string, lastName: string, photoUrl: string }) {
+  async validateGoogleUser(profile: {
+    email: string;
+    firstName: string;
+    lastName: string;
+    photoUrl: string | null;
+  }) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
       let user = await queryRunner.manager.findOne(User, {
         where: { email: profile.email },
-        select: { id: true, email: true, role: true, phoneNumber: true, isEmailVerified: true }
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          phoneNumber: true,
+          isEmailVerified: true,
+        },
       });
 
       if (!user) {
@@ -224,14 +241,14 @@ export class AuthService {
           lastName: profile.lastName,
           photoUrl: profile.photoUrl,
           hashedPassword: null,
-          isEmailVerified: true, 
+          isEmailVerified: true,
         });
         user = await queryRunner.manager.save(user);
       } else if (!user.isEmailVerified) {
         user.isEmailVerified = true;
         user = await queryRunner.manager.save(user);
       }
-      
+
       await queryRunner.commitTransaction();
       return user;
     } catch (error) {
@@ -242,7 +259,13 @@ export class AuthService {
     }
   }
 
-  async googleLogin(reqUser: { id: string, email: string, role: UserRole, phoneNumber: string | null, isEmailVerified: boolean }) {
+  async googleLogin(reqUser: {
+    id: string;
+    email: string;
+    role: UserRole;
+    phoneNumber: string | null;
+    isEmailVerified: boolean;
+  }) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -255,10 +278,16 @@ export class AuthService {
         reqUser.isEmailVerified,
       );
       await queryRunner.commitTransaction();
-      
+
       const isProfileComplete = reqUser.phoneNumber !== null;
-      
-      return { status: 'success', isProfileComplete, user: reqUser, accessToken, refreshToken };
+
+      return {
+        status: 'success',
+        isProfileComplete,
+        user: reqUser,
+        accessToken,
+        refreshToken,
+      };
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;
@@ -267,17 +296,26 @@ export class AuthService {
     }
   }
 
-  async completeSignup(userId: string, payload: { phoneNumber: string; role: UserRole; firstName?: string; lastName?: string }) {
+  async completeSignup(
+    userId: string,
+    payload: {
+      phoneNumber: string;
+      role: UserRole;
+      firstName?: string;
+      lastName?: string;
+    },
+  ) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
       const user = await queryRunner.manager.findOne(User, {
-        where: { id: userId }
+        where: { id: userId },
       });
       if (!user) throw new BadRequestException('User not found');
 
-      if (user.phoneNumber) throw new BadRequestException('Profile already complete');
+      if (user.phoneNumber)
+        throw new BadRequestException('Profile already complete');
 
       user.phoneNumber = payload.phoneNumber;
       user.role = payload.role;
@@ -289,7 +327,7 @@ export class AuthService {
       let freelancerProfile: FreelancerProfile | null = null;
       if (user.role === UserRole.FREELANCER) {
         freelancerProfile = queryRunner.manager.create(FreelancerProfile, {
-          userId: user.id
+          userId: user.id,
         });
         await queryRunner.manager.save(freelancerProfile);
       }
@@ -303,9 +341,9 @@ export class AuthService {
       );
 
       await queryRunner.commitTransaction();
-      
-      const { hashedPassword, ...safeUser } = user;
-      
+
+      const { hashedPassword: _hashedPassword, ...safeUser } = user;
+
       return {
         status: 'success',
         user: {
@@ -324,32 +362,44 @@ export class AuthService {
   }
 
   async sendVerificationEmail(userId: string) {
-    const existingCode = await this.redisService.get(`verifyEmail:${userId}`);
-    if (existingCode) {
-      throw new BadRequestException('Code already sent recently. Please wait before retrying.');
+    const cooldown = await this.redisService.get(
+      `verifyEmailCooldown:${userId}`,
+    );
+    if (cooldown) {
+      throw new BadRequestException(
+        'Code already sent recently. Please wait before retrying.',
+      );
     }
 
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) throw new BadRequestException('User not found');
-    if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+    if (user.isEmailVerified)
+      throw new BadRequestException('Email is already verified');
 
     // Generate a cryptographically sufficient 6-digit OTP
     const code = crypto.randomInt(100000, 1000000).toString();
-    
-    // Store in Redis with 15 min (900 seconds) expiration
-    await this.redisService.set(`verifyEmail:${userId}`, code, 900);
-    
+
     await this.emailService.sendVerificationEmail(user.email, code);
+
+    // Store in Redis with 15 min (900 seconds) expiration, only if email successfully sent!
+    await this.redisService.set(`verifyEmail:${userId}`, code, 900);
+    // Add realistic 2 minute resend cooldown
+    await this.redisService.set(`verifyEmailCooldown:${userId}`, 'true', 120);
 
     return { status: 'success', message: 'Verification email sent' };
   }
 
   async verifyEmail(userId: string, code: string) {
-    let attempts = parseInt(await this.redisService.get(`verifyEmailAttempts:${userId}`) || '0', 10);
+    const attempts = parseInt(
+      (await this.redisService.get(`verifyEmailAttempts:${userId}`)) || '0',
+      10,
+    );
     if (attempts >= 3) {
       await this.redisService.del(`verifyEmail:${userId}`);
       await this.redisService.del(`verifyEmailAttempts:${userId}`);
-      throw new BadRequestException('Too many failed attempts. Please request a new code.');
+      throw new BadRequestException(
+        'Too many failed attempts. Please request a new code.',
+      );
     }
 
     const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
@@ -358,7 +408,11 @@ export class AuthService {
     }
 
     if (storedCode !== code) {
-      await this.redisService.set(`verifyEmailAttempts:${userId}`, (attempts + 1).toString(), 900);
+      await this.redisService.set(
+        `verifyEmailAttempts:${userId}`,
+        (attempts + 1).toString(),
+        900,
+      );
       throw new BadRequestException('Invalid verification code');
     }
 
@@ -366,9 +420,12 @@ export class AuthService {
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
-      const user = await queryRunner.manager.findOne(User, { where: { id: userId } });
+      const user = await queryRunner.manager.findOne(User, {
+        where: { id: userId },
+      });
       if (!user) throw new BadRequestException('User not found');
-      if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+      if (user.isEmailVerified)
+        throw new BadRequestException('Email is already verified');
 
       user.isEmailVerified = true;
       await queryRunner.manager.save(user);
@@ -380,7 +437,7 @@ export class AuthService {
         user.role,
         user.isEmailVerified,
       );
-      
+
       await queryRunner.commitTransaction();
       await this.redisService.del(`verifyEmail:${userId}`);
       await this.redisService.del(`verifyEmailAttempts:${userId}`);

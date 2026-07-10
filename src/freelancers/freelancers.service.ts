@@ -14,34 +14,47 @@ export class FreelancersService {
   async getMyProfile(userId: string) {
     const profile = await this.freelancerRepository.findOne({
       where: { userId },
-      relations: ['user'], 
+      relations: ['user'],
     });
-    if (!profile) throw new NotFoundException('Freelancer profile not found or role mismatch');
-    
+    if (!profile)
+      throw new NotFoundException(
+        'Freelancer profile not found or role mismatch',
+      );
+
     // safe nested user stripping
-    const { hashedPassword: _hashedPassword, ...safeUser } = profile.user || { hashedPassword: null };
-    
-    return { 
-      status: 'success', 
+    const { hashedPassword: _hashedPassword, ...safeUser } = profile.user || {
+      hashedPassword: null,
+    };
+
+    return {
+      status: 'success',
       profile: {
         ...profile,
-        user: safeUser
-      } 
+        user: safeUser,
+      },
     };
   }
 
   async updateMyProfile(userId: string, dto: UpdateFreelancerDto) {
-    const profile = await this.freelancerRepository.findOne({ where: { userId } });
+    const profile = await this.freelancerRepository.findOne({
+      where: { userId },
+    });
     if (!profile) throw new NotFoundException('Freelancer profile not found');
 
     if (dto.headline !== undefined) profile.headline = dto.headline;
     if (dto.bio !== undefined) profile.bio = dto.bio;
     if (dto.skills !== undefined) profile.skills = dto.skills;
-    if (dto.yearsExperience !== undefined) profile.yearsExperience = dto.yearsExperience;
-    if (dto.hourlyRate !== undefined) profile.hourlyRate = dto.hourlyRate.toString();
+    if (dto.yearsExperience !== undefined)
+      profile.yearsExperience = dto.yearsExperience;
+    if (dto.hourlyRate !== undefined)
+      profile.hourlyRate = dto.hourlyRate.toString();
     if (dto.isAvailable !== undefined) profile.isAvailable = dto.isAvailable;
 
     await this.freelancerRepository.save(profile);
-    return { status: 'success', message: 'Freelancer profile updated successfully', profile };
+    return {
+      status: 'success',
+      message: 'Freelancer profile updated successfully',
+      profile,
+    };
   }
 }

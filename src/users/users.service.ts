@@ -9,9 +9,12 @@ import { Repository } from 'typeorm';
 import { UpdateUserDto } from './dtos/update-user.dto';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
+import { Logger } from '@nestjs/common';
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+
   constructor(
     @InjectRepository(User) private readonly userRepository: Repository<User>,
     @InjectRepository(FreelancerProfile)
@@ -38,7 +41,7 @@ export class UserService {
       relations: ['freelancerProfile'],
     });
     if (!user) throw new NotFoundException('No User found');
-    
+
     const { hashedPassword: _hashedPassword, ...safeUser } = user;
     return {
       status: 'success',
@@ -91,12 +94,22 @@ export class UserService {
     });
 
     try {
-      const user = await this.userRepository.findOne({ where: { id: userId }, relations: ['freelancerProfile']});
+      const user = await this.userRepository.findOne({
+        where: { id: userId },
+        relations: ['freelancerProfile'],
+      });
       if (user?.freelancerProfile?.cvUrl) {
-         const oldUrlMatch = user.freelancerProfile.cvUrl.match(/cvs\/[^/]+$/);
-         if (oldUrlMatch) {
-            cloudinary.uploader.destroy(oldUrlMatch[0], { resource_type: 'raw' }).catch(console.error);
-         }
+        const oldUrlMatch = user.freelancerProfile.cvUrl.match(/cvs\/[^/]+$/);
+        if (oldUrlMatch) {
+          cloudinary.uploader
+            .destroy(oldUrlMatch[0], { resource_type: 'raw' })
+            .catch((err) =>
+              this.logger.error(
+                `Failed to clean old CV asset ${oldUrlMatch[0]}`,
+                err,
+              ),
+            );
+        }
       }
 
       await this.freelancerProfileRepository.upsert(
@@ -105,7 +118,14 @@ export class UserService {
       );
       return { status: 'success', cvUrl: cvResult.secure_url };
     } catch (dbError) {
-      cloudinary.uploader.destroy(cvResult.public_id, { resource_type: 'raw' }).catch(console.error);
+      cloudinary.uploader
+        .destroy(cvResult.public_id, { resource_type: 'raw' })
+        .catch((err) =>
+          this.logger.error(
+            `Failed to destroy rolled back CV asset ${cvResult.public_id}`,
+            err,
+          ),
+        );
       throw dbError;
     }
   }
@@ -114,42 +134,64 @@ export class UserService {
     userId: string,
     file: Express.Multer.File,
   ): Promise<{ status: string; photoUrl: string }> {
-    const photoResult = await new Promise<UploadApiResponse>((resolve, reject) => {
-      const uploadStream = cloudinary.uploader.upload_stream(
-        {
-          resource_type: 'image',
-          folder: 'avatars',
-          format: 'webp',
-          transformation: [
-            { width: 400, height: 400, crop: 'fill', gravity: 'face' },
-          ],
-        },
-        (error, result) => {
-          if (error || !result) {
-            return reject(
-              new InternalServerErrorException(
-                'Failed to upload photo to cloud storage',
-              ),
-            );
-          }
-          resolve(result);
-        },
-      );
-      uploadStream.end(file.buffer);
-    });
+    const photoResult = await new Promise<UploadApiResponse>(
+      (resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: 'image',
+            folder: 'avatars',
+            format: 'webp',
+            transformation: [
+              { width: 400, height: 400, crop: 'fill', gravity: 'face' },
+            ],
+          },
+          (error, result) => {
+            if (error || !result) {
+              return reject(
+                new InternalServerErrorException(
+                  'Failed to upload photo to cloud storage',
+                ),
+              );
+            }
+            resolve(result);
+          },
+        );
+        uploadStream.end(file.buffer);
+      },
+    );
 
     try {
-      const user = await this.userRepository.findOne({ where: { id: userId }});
+      const user = await this.userRepository.findOne({ where: { id: userId } });
       if (user?.photoUrl) {
-         const oldUrlMatch = user.photoUrl.match(/avatars\/[^/]+$/);
-         if (oldUrlMatch) {
-            cloudinary.uploader.destroy(oldUrlMatch[0]).catch(console.error);
-         }
+        const oldUrlMatch = user.photoUrl.match(/avatars\/[^/]+$/);
+        if (oldUrlMatch) {
+          let publicId = oldUrlMatch[0];
+          const extIdx = publicId.lastIndexOf('.');
+          if (extIdx !== -1) publicId = publicId.substring(0, extIdx);
+          cloudinary.uploader
+            .destroy(publicId)
+            .catch((err) =>
+              this.logger.error(
+                `Failed to clean old photo asset ${publicId}`,
+                err,
+              ),
+            );
+        }
       }
-      await this.userRepository.update({ id: userId }, { photoUrl: photoResult.secure_url });
+      await this.userRepository.update(
+        { id: userId },
+        { photoUrl: photoResult.secure_url },
+      );
       return { status: 'success', photoUrl: photoResult.secure_url };
     } catch (dbError) {
-      cloudinary.uploader.destroy(photoResult.public_id).catch(console.error);
+      cloudinary.uploader
+        .destroy(photoResult.public_id)
+        .catch((err) =>
+          this.logger.error(
+            `Failed to destroy rolled back photo asset ${photoResult.public_id}`,
+            err,
+          ),
+        );
       throw dbError;
     }
   }

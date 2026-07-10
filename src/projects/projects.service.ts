@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  BadRequestException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Project } from './entities/project.entity';
@@ -36,32 +41,39 @@ export class ProjectsService {
   async findAll() {
     return await this.projectRepository.find({
       order: { createdAt: 'DESC' },
-      relations: ['customer']
+      relations: ['customer'],
     });
   }
 
   async findOne(id: string, userId: string, isAdmin: boolean) {
-    const project = await this.projectRepository.findOne({ 
+    const project = await this.projectRepository.findOne({
       where: { id },
-      relations: ['customer']
+      relations: ['customer'],
     });
     if (!project) throw new NotFoundException('Project not found');
-    
+
     if (!isAdmin && project.customerId !== userId) {
       throw new ForbiddenException('You can only access your own projects');
     }
-    
+
     return project;
   }
 
-  async update(id: string, userId: string, isAdmin: boolean, dto: UpdateProjectDto) {
+  async update(
+    id: string,
+    userId: string,
+    isAdmin: boolean,
+    dto: UpdateProjectDto,
+  ) {
     const project = await this.findOne(id, userId, isAdmin);
-    
+
     if (dto.title !== undefined) project.title = dto.title;
     if (dto.description !== undefined) project.description = dto.description;
-    if (dto.budgetMin !== undefined) project.budgetMin = dto.budgetMin.toString();
-    if (dto.budgetMax !== undefined) project.budgetMax = dto.budgetMax.toString();
-    
+    if (dto.budgetMin !== undefined)
+      project.budgetMin = dto.budgetMin.toString();
+    if (dto.budgetMax !== undefined)
+      project.budgetMax = dto.budgetMax.toString();
+
     // Cross-field bounds check
     const resultingMin = parseFloat(project.budgetMin);
     const resultingMax = parseFloat(project.budgetMax);
@@ -70,8 +82,10 @@ export class ProjectsService {
     }
 
     if (dto.currency !== undefined) project.currency = dto.currency;
-    if (dto.deadline !== undefined) project.deadline = dto.deadline ? new Date(dto.deadline) : null;
-    if (dto.isDeadlineFlexible !== undefined) project.isDeadlineFlexible = dto.isDeadlineFlexible;
+    if (dto.deadline !== undefined)
+      project.deadline = dto.deadline ? new Date(dto.deadline) : null;
+    if (dto.isDeadlineFlexible !== undefined)
+      project.isDeadlineFlexible = dto.isDeadlineFlexible;
     if (dto.status !== undefined && isAdmin) {
       project.status = dto.status;
     }

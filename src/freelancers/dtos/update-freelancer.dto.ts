@@ -1,4 +1,14 @@
-import { IsString, IsOptional, IsArray, IsInt, IsNumber, IsBoolean, MaxLength, Min, ArrayMaxSize } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsArray,
+  IsInt,
+  IsNumber,
+  IsBoolean,
+  MaxLength,
+  Min,
+  ArrayMaxSize,
+} from 'class-validator';
 
 export class UpdateFreelancerDto {
   @IsOptional()

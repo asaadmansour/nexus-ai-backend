@@ -8,7 +8,7 @@ export function IsLesserThanOrEqual(
   property: string,
   validationOptions?: ValidationOptions,
 ) {
-  return function (object: Object, propertyName: string) {
+  return function (object: object, propertyName: string) {
     registerDecorator({
       name: 'isLesserThanOrEqual',
       target: object.constructor,
@@ -19,13 +19,17 @@ export function IsLesserThanOrEqual(
         validate(value: any, args: ValidationArguments) {
           const [relatedPropertyName] = args.constraints;
           const relatedValue = (args.object as any)[relatedPropertyName];
-          
+
           if (value === undefined || relatedValue === undefined) return true;
-          return typeof value === 'number' && typeof relatedValue === 'number' && value <= relatedValue;
+          return (
+            typeof value === 'number' &&
+            typeof relatedValue === 'number' &&
+            value <= relatedValue
+          );
         },
         defaultMessage(args: ValidationArguments) {
           return `${args.property} must be less than or equal to ${args.constraints[0]}`;
-        }
+        },
       },
     });
   };
