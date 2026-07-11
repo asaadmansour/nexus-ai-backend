@@ -4,12 +4,22 @@ import { FreelancerAssessmentAnswer } from './entities/freelancer-assessment-ans
 import { FreelancerAssessmentEvent } from './entities/freelancer-assessment-event.entity';
 import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-question.entity';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
+import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedding.entity';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancersController } from './freelancers.controller';
 import { FreelancersService } from './freelancers.service';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([FreelancerProfile])],
+  imports: [
+    TypeOrmModule.forFeature([
+      FreelancerProfile,
+      FreelancerAssessment,
+      FreelancerAssessmentQuestion,
+      FreelancerAssessmentAnswer,
+      FreelancerAssessmentEvent,
+      FreelancerProfileEmbedding,
+    ]),
+  ],
   controllers: [FreelancersController],
   providers: [FreelancersService],
   exports: [TypeOrmModule],

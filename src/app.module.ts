@@ -26,6 +26,8 @@ import { AdminModule } from './admin/admin.module';
     ProjectsModule,
     AuthModule,
     RedisModule,
+    AgentsModule,
+    NotificationsModule,
     EmailModule,
     AdminModule,
   ],

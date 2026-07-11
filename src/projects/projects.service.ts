@@ -9,6 +9,15 @@ import { Repository } from 'typeorm';
 import { Project } from './entities/project.entity';
 import { CreateProjectDto } from './dtos/create-project.dto';
 import { UpdateProjectDto } from './dtos/update-project.dto';
+import { ProjectStatus } from 'src/common/enums/project-status.enum';
+
+const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.ASSIGNED,
+  ProjectStatus.ACTIVE,
+  ProjectStatus.UNDER_REVIEW,
+  ProjectStatus.COMPLETED,
+  ProjectStatus.DISPUTED,
+]);
 
 @Injectable()
 export class ProjectsService {
@@ -74,7 +83,6 @@ export class ProjectsService {
     if (dto.budgetMax !== undefined)
       project.budgetMax = dto.budgetMax.toString();
 
-    // Cross-field bounds check
     const resultingMin = parseFloat(project.budgetMin);
     const resultingMax = parseFloat(project.budgetMax);
     if (resultingMin > resultingMax) {
@@ -88,13 +96,23 @@ export class ProjectsService {
       project.isDeadlineFlexible = dto.isDeadlineFlexible;
     if (dto.status !== undefined) {
       if (!isAdmin) {
-        throw new ForbiddenException(
-          'Only admins can change project status',
-        );
+        throw new ForbiddenException('Only admins can change project status');
       }
       project.status = dto.status;
     }
 
     return await this.projectRepository.save(project);
+  }
+
+  async remove(id: string, userId: string, isAdmin: boolean) {
+    const project = await this.findOne(id, userId, isAdmin);
+
+    if (NON_DELETABLE_PROJECT_STATUSES.has(project.status)) {
+      throw new BadRequestException(
+        'Projects cannot be deleted after they are assigned to freelancers',
+      );
+    }
+
+    await this.projectRepository.softRemove(project);
   }
 }

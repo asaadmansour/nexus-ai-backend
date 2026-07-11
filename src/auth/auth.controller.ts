@@ -6,7 +6,6 @@ import {
   UseGuards,
   Get,
   Req,
-  Request,
   Res,
   BadRequestException,
   UnauthorizedException,
@@ -22,6 +21,16 @@ import { CompleteSignupDto } from './dtos/complete-signup.dto';
 import { VerifyEmailDto } from './dtos/verify-email.dto';
 import { RedisService } from 'src/redis/redis.service';
 import * as crypto from 'crypto';
+import type {
+  AuthenticatedRequest,
+  GoogleAuthenticatedRequest,
+} from 'src/common/interfaces/jwt-payload.interface';
+
+interface AuthExchangePayload {
+  accessToken: string;
+  refreshToken: string;
+  isProfileComplete: boolean;
+}
 
 @Controller('auth')
 export class AuthController {
@@ -31,6 +40,23 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly redisService: RedisService,
   ) {}
+
+  private getCookie(req: ExpressRequest, name: string): string | undefined {
+    const cookies = req.cookies as Record<string, unknown> | undefined;
+    const value = cookies?.[name];
+    return typeof value === 'string' ? value : undefined;
+  }
+
+  private isAuthExchangePayload(value: unknown): value is AuthExchangePayload {
+    if (typeof value !== 'object' || value === null) return false;
+
+    const payload = value as Record<string, unknown>;
+    return (
+      typeof payload.accessToken === 'string' &&
+      typeof payload.refreshToken === 'string' &&
+      typeof payload.isProfileComplete === 'boolean'
+    );
+  }
 
   private setRefreshTokenCookie(res: Response, refreshToken: string) {
     res.cookie('refreshToken', refreshToken, {
@@ -82,12 +108,10 @@ export class AuthController {
       );
     }
 
-    const refreshToken = req.cookies?.['refreshToken'] as string | undefined;
+    const refreshToken = this.getCookie(req, 'refreshToken');
     try {
-      // Revoke the access token (blacklist it) and optionally the refresh token
       await this.authService.logout(token, refreshToken ?? '');
     } finally {
-      // Always clear the cookie — even if revocation fails on a shared device
       res.clearCookie('refreshToken', { path: '/' });
     }
     return { status: 'logged out' };
@@ -98,7 +122,7 @@ export class AuthController {
     @Req() req: ExpressRequest,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const oldRefreshToken = req.cookies['refreshToken'];
+    const oldRefreshToken = this.getCookie(req, 'refreshToken');
     if (!oldRefreshToken)
       throw new UnauthorizedException('No refresh token provided');
 
@@ -110,13 +134,14 @@ export class AuthController {
 
   @Get('google')
   @UseGuards(PassportAuthGuard('google'))
-  async googleAuth(@Req() req: any) {
-    // initiates the Google OAuth2 login flow
-  }
+  async googleAuth() {}
 
   @Get('google/callback')
   @UseGuards(PassportAuthGuard('google'))
-  async googleAuthRedirect(@Req() req: any, @Res() res: Response) {
+  async googleAuthRedirect(
+    @Req() req: GoogleAuthenticatedRequest,
+    @Res() res: Response,
+  ) {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     try {
       const { accessToken, refreshToken, isProfileComplete } =
@@ -127,12 +152,16 @@ export class AuthController {
         `auth:exchange:${exchangeCode}`,
         JSON.stringify({ accessToken, refreshToken, isProfileComplete }),
         300,
-      ); // 5 min TTL
+      );
 
-      res.redirect(`${frontendUrl}/auth-callback#code=${exchangeCode}`);
+      const callbackUrl = new URL('/auth-callback', frontendUrl);
+      callbackUrl.searchParams.set('code', exchangeCode);
+      res.redirect(callbackUrl.toString());
     } catch (error) {
       this.logger.error('Google OAuth callback failed', error);
-      res.redirect(`${frontendUrl}/auth-callback?error=login_failed`);
+      const callbackUrl = new URL('/auth-callback', frontendUrl);
+      callbackUrl.searchParams.set('error', 'login_failed');
+      res.redirect(callbackUrl.toString());
     }
   }
 
@@ -145,10 +174,13 @@ export class AuthController {
     const dataStr = await this.redisService.getDel(`auth:exchange:${code}`);
     if (!dataStr)
       throw new BadRequestException('Invalid or expired exchange code');
-    let parsedData;
+    let parsedData: unknown;
     try {
       parsedData = JSON.parse(dataStr);
     } catch {
+      throw new BadRequestException('Invalid exchange code format');
+    }
+    if (!this.isAuthExchangePayload(parsedData)) {
       throw new BadRequestException('Invalid exchange code format');
     }
     const { accessToken, refreshToken, isProfileComplete } = parsedData;
@@ -160,7 +192,7 @@ export class AuthController {
   @UseGuards(AuthGuard)
   @Post('complete-profile')
   async completeSignup(
-    @Request() req: any,
+    @Req() req: AuthenticatedRequest,
     @Body() body: CompleteSignupDto,
     @Res({ passthrough: true }) res: Response,
   ) {
@@ -175,14 +207,14 @@ export class AuthController {
 
   @UseGuards(AuthGuard)
   @Post('resend-verification')
-  async sendVerificationEmail(@Request() req: any) {
+  async sendVerificationEmail(@Req() req: AuthenticatedRequest) {
     return await this.authService.sendVerificationEmail(req.user.sub);
   }
 
   @UseGuards(AuthGuard)
   @Post('verify-email')
   async verifyEmail(
-    @Request() req: any,
+    @Req() req: AuthenticatedRequest,
     @Body() body: VerifyEmailDto,
     @Res({ passthrough: true }) res: Response,
   ) {

@@ -4,6 +4,7 @@ export function validateEnv(config: Env): Env {
   const requiredKeys = [
     'DATABASE_URL',
     'FRONTEND_URL',
+    'AI_SERVICE_URL',
     'CLOUDINARY_CLOUD_NAME',
     'CLOUDINARY_API_KEY',
     'CLOUDINARY_API_SECRET',

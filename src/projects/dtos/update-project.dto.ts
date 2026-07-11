@@ -8,8 +8,6 @@ export class UpdateProjectDto extends PartialType(CreateProjectDto) {
   @IsOptional()
   status?: ProjectStatus;
 
-  // PartialType allows null to slip past inherited validators.
-  // Explicitly reject null on fields that would break .toString() or DB constraints.
   @IsOptional()
   @IsNotIn([null], { message: 'budgetMin must not be null' })
   declare budgetMin?: number;

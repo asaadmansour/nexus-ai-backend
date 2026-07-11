@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -16,6 +17,11 @@ import { RefreshToken } from './entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { EmailService } from 'src/email/email.service';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
+import type {
+  JwtPayload,
+  RefreshJwtPayload,
+} from 'src/common/interfaces/jwt-payload.interface';
 
 @Injectable()
 export class AuthService {
@@ -32,6 +38,10 @@ export class AuthService {
   private readonly saltOrRounds = 10;
   private readonly REFRESH_TOKEN_EXPIRY = '7d';
   private readonly REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+  private toPublicUser(user: User): Omit<User, 'hashedPassword'> {
+    return sanitizeUser(user) as Omit<User, 'hashedPassword'>;
+  }
 
   private async generateTokens(
     userId: string,
@@ -72,13 +82,22 @@ export class AuthService {
       const existing = await queryRunner.manager.findOne(User, {
         where: { email: newUser.email },
       });
-      if (existing) throw new BadRequestException('Duplicate Email');
+      if (existing) {
+        throw new ConflictException('This email is already registered.');
+      }
+
+      const existingPhone = await queryRunner.manager.findOne(User, {
+        where: { phoneNumber: newUser.phoneNumber },
+      });
+      if (existingPhone) {
+        throw new ConflictException('This phone number is already registered.');
+      }
 
       const { password, ...rest } = newUser;
       const hashedPassword = await bcrypt.hash(password, this.saltOrRounds);
       const user = this.userRepository.create({ ...rest, hashedPassword });
       const savedUser = await queryRunner.manager.save(user);
-      const { hashedPassword: _, ...userResponse } = savedUser;
+      const userResponse = this.toPublicUser(savedUser);
 
       const { accessToken, refreshToken } = await this.generateTokens(
         savedUser.id,
@@ -141,17 +160,13 @@ export class AuthService {
 
   async logout(accessToken: string, refreshToken: string) {
     try {
-      const decodedAccess = this.jwtService.verify(accessToken);
+      const decodedAccess = this.jwtService.verify<JwtPayload>(accessToken);
       const userId = decodedAccess.sub;
+      const expiresAt = decodedAccess.exp ?? Math.floor(Date.now() / 1000) + 1;
 
-      const ttl = Math.max(
-        1,
-        decodedAccess.exp - Math.floor(Date.now() / 1000),
-      );
-      // Always blacklist the access token to prevent reuse
+      const ttl = Math.max(1, expiresAt - Math.floor(Date.now() / 1000));
       await this.redisService.set(accessToken, 'blacklisted', ttl);
 
-      // Only validate and revoke the refresh token if one was provided
       if (refreshToken) {
         const storedToken = await this.refreshTokenRepository.findOne({
           where: { userId },
@@ -179,7 +194,8 @@ export class AuthService {
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
-      const { sub: userId } = this.jwtService.verify(oldRefreshToken);
+      const { sub: userId } =
+        this.jwtService.verify<RefreshJwtPayload>(oldRefreshToken);
 
       const storedToken = await queryRunner.manager.findOne(RefreshToken, {
         where: { userId },
@@ -197,7 +213,6 @@ export class AuthService {
 
       await queryRunner.manager.delete(RefreshToken, { id: storedToken.id });
 
-      // fetch user to get role for new token
       const user = await queryRunner.manager.findOne(User, {
         where: { id: userId },
         select: { id: true, email: true, role: true, isEmailVerified: true },
@@ -325,6 +340,13 @@ export class AuthService {
       if (user.phoneNumber)
         throw new BadRequestException('Profile already complete');
 
+      const existingPhone = await queryRunner.manager.findOne(User, {
+        where: { phoneNumber: payload.phoneNumber },
+      });
+      if (existingPhone && existingPhone.id !== user.id) {
+        throw new ConflictException('This phone number is already registered.');
+      }
+
       user.phoneNumber = payload.phoneNumber;
       user.role = payload.role;
       if (payload.firstName) user.firstName = payload.firstName;
@@ -350,8 +372,7 @@ export class AuthService {
 
       await queryRunner.commitTransaction();
 
-      const safeUser = Object.assign({}, user) as Partial<typeof user>;
-      delete safeUser.hashedPassword;
+      const safeUser = sanitizeUser(user);
 
       return {
         status: 'success',
@@ -371,7 +392,6 @@ export class AuthService {
   }
 
   async sendVerificationEmail(userId: string) {
-    // Atomic SET NX EX: only sets if key does NOT exist. Returns null if cooldown is active.
     const acquired = await this.redisService.setNx(
       `verifyEmailCooldown:${userId}`,
       'true',
@@ -393,32 +413,27 @@ export class AuthService {
       throw new BadRequestException('Email is already verified');
     }
 
-    // Generate a cryptographically sufficient 6-digit OTP
     const code = crypto.randomInt(100000, 1000000).toString();
 
     try {
+      await this.redisService.set(`verifyEmail:${userId}`, code, 900);
       await this.emailService.sendVerificationEmail(user.email, code);
     } catch (emailError) {
-      // Rollback cooldown lock if email fails so user can retry
+      await this.redisService.del(`verifyEmail:${userId}`);
       await this.redisService.del(`verifyEmailCooldown:${userId}`);
       throw emailError;
     }
-
-    // Only store OTP after successful delivery
-    await this.redisService.set(`verifyEmail:${userId}`, code, 900);
 
     return { status: 'success', message: 'Verification email sent' };
   }
 
   async verifyEmail(userId: string, code: string) {
-    // Atomic INCR: returns new count; first call returns 1
     const storedCode = await this.redisService.get(`verifyEmail:${userId}`);
     if (!storedCode) {
       throw new BadRequestException('Verification code expired or invalid');
     }
 
     if (storedCode !== code) {
-      // Atomically increment and apply TTL only on first increment
       const attempts = await this.redisService.incr(
         `verifyEmailAttempts:${userId}`,
         900,
@@ -457,7 +472,6 @@ export class AuthService {
 
       await queryRunner.commitTransaction();
 
-      // Best-effort Redis cleanup — after commit, outside the transaction
       this.redisService
         .del(`verifyEmail:${userId}`)
         .catch((err) =>

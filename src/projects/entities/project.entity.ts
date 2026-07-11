@@ -40,7 +40,6 @@ export class Project {
   @Column({ type: 'char', length: 3, default: 'EGP' })
   currency: string;
 
-  // Cache only; source of truth is escrow_transactions.
   @Column({
     name: 'held_amount',
     type: 'numeric',

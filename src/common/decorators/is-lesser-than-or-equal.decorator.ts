@@ -16,9 +16,11 @@ export function IsLesserThanOrEqual(
       constraints: [property],
       options: validationOptions,
       validator: {
-        validate(value: any, args: ValidationArguments) {
-          const [relatedPropertyName] = args.constraints;
-          const relatedValue = (args.object as any)[relatedPropertyName];
+        validate(value: unknown, args: ValidationArguments) {
+          const [relatedPropertyName] = args.constraints as [string];
+          const relatedValue = (args.object as Record<string, unknown>)[
+            relatedPropertyName
+          ];
 
           if (value === undefined || relatedValue === undefined) return true;
           return (

@@ -21,8 +21,8 @@ import { UpdateUserDto } from './dtos/update-user.dto';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 
-const MAX_CV_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
-const MAX_PHOTO_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB
+const MAX_CV_SIZE_BYTES = 5 * 1024 * 1024;
+const MAX_PHOTO_SIZE_BYTES = 2 * 1024 * 1024;
 
 @Controller('users')
 export class UsersController {
@@ -53,7 +53,7 @@ export class UploadsController {
   @Post('freelancer-cv')
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: memoryStorage(), // keep file in RAM — never written to disk
+      storage: memoryStorage(),
       limits: { fileSize: MAX_CV_SIZE_BYTES },
       fileFilter: (_req, file, cb) => {
         if (file.mimetype !== 'application/pdf') {
