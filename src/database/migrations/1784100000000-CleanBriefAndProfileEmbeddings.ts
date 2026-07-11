@@ -15,6 +15,7 @@ export class CleanBriefAndProfileEmbeddings1784100000000 implements MigrationInt
 
     await this.createEmbeddingTables(queryRunner);
     await this.copyLegacyFreelancerEmbeddings(queryRunner);
+    await this.backupBriefRawConversation(queryRunner);
 
     await queryRunner.query(
       `DROP INDEX IF EXISTS freelancer_profiles_embedding_idx`,
@@ -56,6 +57,7 @@ export class CleanBriefAndProfileEmbeddings1784100000000 implements MigrationInt
         isNullable: true,
       }),
     );
+    await this.restoreBriefRawConversation(queryRunner);
     await this.addColumnIfMissing(
       queryRunner,
       'briefs',
@@ -264,11 +266,63 @@ export class CleanBriefAndProfileEmbeddings1784100000000 implements MigrationInt
           freelancer_profile_id,
           embedding
         FROM freelancer_profile_embeddings
+        WHERE embedding_model = 'legacy'
         ORDER BY freelancer_profile_id, created_at DESC
       ) profile_embedding
       WHERE profile.id = profile_embedding.freelancer_profile_id
         AND profile.embedding IS NULL
     `);
+  }
+
+  private async backupBriefRawConversation(
+    queryRunner: QueryRunner,
+  ): Promise<void> {
+    if (
+      !(await queryRunner.hasTable('briefs')) ||
+      !(await this.hasColumn(queryRunner, 'briefs', 'raw_conversation'))
+    ) {
+      return;
+    }
+
+    await queryRunner.query(`
+      CREATE TABLE IF NOT EXISTS brief_raw_conversation_backup (
+        brief_id uuid PRIMARY KEY,
+        raw_conversation jsonb
+      )
+    `);
+
+    await queryRunner.query(`
+      INSERT INTO brief_raw_conversation_backup (brief_id, raw_conversation)
+      SELECT id, raw_conversation
+      FROM briefs
+      WHERE raw_conversation IS NOT NULL
+      ON CONFLICT (brief_id) DO UPDATE
+      SET raw_conversation = EXCLUDED.raw_conversation
+    `);
+  }
+
+  private async restoreBriefRawConversation(
+    queryRunner: QueryRunner,
+  ): Promise<void> {
+    if (
+      !(await queryRunner.hasTable('briefs')) ||
+      !(await queryRunner.hasTable('brief_raw_conversation_backup')) ||
+      !(await this.hasColumn(queryRunner, 'briefs', 'raw_conversation'))
+    ) {
+      return;
+    }
+
+    await queryRunner.query(`
+      UPDATE briefs brief
+      SET raw_conversation = backup.raw_conversation
+      FROM brief_raw_conversation_backup backup
+      WHERE brief.id = backup.brief_id
+        AND brief.raw_conversation IS NULL
+    `);
+
+    await queryRunner.query(
+      `DROP TABLE IF EXISTS brief_raw_conversation_backup`,
+    );
   }
 
   private uuidPrimaryColumn(): TableColumn {

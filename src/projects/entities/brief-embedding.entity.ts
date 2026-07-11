@@ -11,7 +11,6 @@ import {
 import { Brief } from './brief.entity';
 
 @Entity('brief_embeddings')
-@Index('brief_embeddings_brief_id_idx', ['briefId'])
 @Index('brief_embeddings_brief_id_model_uidx', ['briefId', 'embeddingModel'], {
   unique: true,
 })

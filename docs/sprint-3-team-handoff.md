@@ -112,53 +112,53 @@ Frontend service constants must mirror this table exactly. The owner listed here
 
 Ebrahim owns the assessment vertical routes and their matching frontend assessment service constants.
 
-| Method | Route | Frontend Service | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/freelancer-verification/me` | `src/services/assessments.ts` | Freelancer verification checklist and next action. |
-| `POST` | `/api/freelancer-assessments/start` | `src/services/assessments.ts` | Start or reuse an active generated assessment. |
-| `GET` | `/api/freelancer-assessments/current` | `src/services/assessments.ts` | Load the active/pending assessment for the logged-in freelancer. |
-| `GET` | `/api/freelancer-assessments/:id` | `src/services/assessments.ts` | Load safe assessment detail without rubrics or correct answers. |
-| `POST` | `/api/freelancer-assessments/:id/answers` | `src/services/assessments.ts` | Autosave or upsert freelancer answers. |
-| `POST` | `/api/freelancer-assessments/:id/events` | `src/services/assessments.ts` | Record assessment session events. |
-| `POST` | `/api/freelancer-assessments/:id/submit` | `src/services/assessments.ts` | Submit answers and trigger grading. |
-| `GET` | `/api/admin/assessments` | `src/services/admin.ts` | Admin assessment review queue. |
-| `GET` | `/api/admin/assessments/:id` | `src/services/admin.ts` | Admin safe review detail. |
-| `PATCH` | `/api/admin/assessments/:id/review` | `src/services/admin.ts` | Admin assessment decision. |
+| Method  | Route                                     | Frontend Service              | Purpose                                                          |
+| ------- | ----------------------------------------- | ----------------------------- | ---------------------------------------------------------------- |
+| `GET`   | `/api/freelancer-verification/me`         | `src/services/assessments.ts` | Freelancer verification checklist and next action.               |
+| `POST`  | `/api/freelancer-assessments/start`       | `src/services/assessments.ts` | Start or reuse an active generated assessment.                   |
+| `GET`   | `/api/freelancer-assessments/current`     | `src/services/assessments.ts` | Load the active/pending assessment for the logged-in freelancer. |
+| `GET`   | `/api/freelancer-assessments/:id`         | `src/services/assessments.ts` | Load safe assessment detail without rubrics or correct answers.  |
+| `POST`  | `/api/freelancer-assessments/:id/answers` | `src/services/assessments.ts` | Autosave or upsert freelancer answers.                           |
+| `POST`  | `/api/freelancer-assessments/:id/events`  | `src/services/assessments.ts` | Record assessment session events.                                |
+| `POST`  | `/api/freelancer-assessments/:id/submit`  | `src/services/assessments.ts` | Submit answers and trigger grading.                              |
+| `GET`   | `/api/admin/assessments`                  | `src/services/admin.ts`       | Admin assessment review queue.                                   |
+| `GET`   | `/api/admin/assessments/:id`              | `src/services/admin.ts`       | Admin safe review detail.                                        |
+| `PATCH` | `/api/admin/assessments/:id/review`       | `src/services/admin.ts`       | Admin assessment decision.                                       |
 
 ### Shahd Routes
 
 Shahd owns the admin operations routes and their matching frontend admin service constants.
 
-| Method | Route | Frontend Service | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/admin/stats` | `src/services/admin.ts` | Admin dashboard totals, trends, and pipeline stats. |
-| `GET` | `/api/admin/freelancers` | `src/services/admin.ts` | Admin freelancer queue with filters and pagination. |
-| `GET` | `/api/admin/freelancers/:id` | `src/services/admin.ts` | Admin freelancer detail, CV summary, and assessment summary. |
-| `PATCH` | `/api/admin/freelancers/:id/verification` | `src/services/admin.ts` | Admin freelancer verification status update. |
-| `GET` | `/api/admin/agents/overview` | `src/services/admin.ts` | Agent health overview for dashboard. |
-| `GET` | `/api/admin/agent-jobs` | `src/services/admin.ts` | Agent job list with filters and pagination. |
-| `GET` | `/api/admin/agent-jobs/:id` | `src/services/admin.ts` | Agent job detail and failure payload. |
+| Method  | Route                                     | Frontend Service        | Purpose                                                      |
+| ------- | ----------------------------------------- | ----------------------- | ------------------------------------------------------------ |
+| `GET`   | `/api/admin/stats`                        | `src/services/admin.ts` | Admin dashboard totals, trends, and pipeline stats.          |
+| `GET`   | `/api/admin/freelancers`                  | `src/services/admin.ts` | Admin freelancer queue with filters and pagination.          |
+| `GET`   | `/api/admin/freelancers/:id`              | `src/services/admin.ts` | Admin freelancer detail, CV summary, and assessment summary. |
+| `PATCH` | `/api/admin/freelancers/:id/verification` | `src/services/admin.ts` | Admin freelancer verification status update.                 |
+| `GET`   | `/api/admin/agents/overview`              | `src/services/admin.ts` | Agent health overview for dashboard.                         |
+| `GET`   | `/api/admin/agent-jobs`                   | `src/services/admin.ts` | Agent job list with filters and pagination.                  |
+| `GET`   | `/api/admin/agent-jobs/:id`               | `src/services/admin.ts` | Agent job detail and failure payload.                        |
 
 ### Asaad Routes
 
 Asaad owns queue wiring, notification routes, seeding, and final integration.
 
-| Method | Route | Frontend Service | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/notifications` | `src/services/notifications.ts` | Current user's notification dropdown/list. |
-| `PATCH` | `/api/notifications/:id/read` | `src/services/notifications.ts` | Mark one notification as read. |
-| `PATCH` | `/api/notifications/read-all` | `src/services/notifications.ts` | Mark all current-user notifications as read. |
-| `DELETE` | `/api/notifications/:id` | `src/services/notifications.ts` | Optional notification dismissal if time allows. |
+| Method   | Route                         | Frontend Service                | Purpose                                         |
+| -------- | ----------------------------- | ------------------------------- | ----------------------------------------------- |
+| `GET`    | `/api/notifications`          | `src/services/notifications.ts` | Current user's notification dropdown/list.      |
+| `PATCH`  | `/api/notifications/:id/read` | `src/services/notifications.ts` | Mark one notification as read.                  |
+| `PATCH`  | `/api/notifications/read-all` | `src/services/notifications.ts` | Mark all current-user notifications as read.    |
+| `DELETE` | `/api/notifications/:id`      | `src/services/notifications.ts` | Optional notification dismissal if time allows. |
 
 ### Muhanad AI Routes
 
 Muhanad owns FastAPI agent behavior. Frontend must not call these routes directly. NestJS owns the public `/api/ai/*` gateway and calls FastAPI through `AI_SERVICE_URL`.
 
-| Service | Method | Route | NestJS Gateway |
-| --- | --- | --- | --- |
-| FastAPI | `POST` | `/agents/extract-cv` | `POST /api/ai/extract-cv` |
+| Service | Method | Route                         | NestJS Gateway                     |
+| ------- | ------ | ----------------------------- | ---------------------------------- |
+| FastAPI | `POST` | `/agents/extract-cv`          | `POST /api/ai/extract-cv`          |
 | FastAPI | `POST` | `/agents/generate-assessment` | `POST /api/ai/generate-assessment` |
-| FastAPI | `POST` | `/agents/grade-assessment` | `POST /api/ai/grade-assessment` |
+| FastAPI | `POST` | `/agents/grade-assessment`    | `POST /api/ai/grade-assessment`    |
 
 ## Sprint 3 Dependency Order
 
@@ -839,8 +839,10 @@ Behavior:
 - Return the active assessment if it exists.
 - Return latest submitted assessment if there is no active one.
 - Return `assessment: null` if none exists.
+- Include safe question data for the assessment: `id`, `questionType`, `skill`,
+  `difficulty`, `prompt`, `choices`, and `orderIndex`.
 - Include saved answers for the current freelancer.
-- Never return rubrics.
+- Never return rubrics, correct answers, hidden scoring fields, or internal prompts.
 
 Response:
 
@@ -858,7 +860,17 @@ Response:
       "remainingSeconds": 1200,
       "score": null
     },
-    "questions": [],
+    "questions": [
+      {
+        "id": "uuid",
+        "questionType": "short_answer",
+        "skill": "React",
+        "difficulty": "mid",
+        "prompt": "Question text",
+        "choices": null,
+        "orderIndex": 1
+      }
+    ],
     "answers": [
       {
         "questionId": "uuid",
@@ -888,7 +900,7 @@ Behavior:
 
 - Freelancer can only read their own assessment.
 - Admins should use admin routes instead.
-- Return same shape as `current`.
+- Return same shape as `current`, including the same safe question fields.
 
 ### 7. Save answers
 
@@ -918,8 +930,9 @@ Behavior:
 - Assessment must be `in_progress`.
 - Reject if submitted.
 - Reject if assessment expired, unless frontend is doing final submit.
-- Upsert each answer by `assessmentId` and `questionId`.
-- If possible, add a DB unique constraint on `(assessment_id, question_id)`.
+- A DB unique constraint on `(assessment_id, question_id)` is required.
+- Upsert each answer atomically by `assessmentId` and `questionId` using that
+  constraint.
 - Return saved answer rows.
 
 Response:
@@ -1012,8 +1025,14 @@ Behavior:
 
 - Assessment must belong to current freelancer.
 - If already submitted, return current submitted result.
-- Save final answers if provided.
-- Call `AiService.gradeAssessment`.
+- Use a transaction with row locking or an equivalent conditional update to
+  atomically claim the transition from an unsubmitted `in_progress` state.
+- Only the request that successfully claims the transition may save final
+  answers, call `AiService.gradeAssessment`, persist submission data, and create
+  the notification.
+- Concurrent requests that do not claim the transition must reload and return
+  the existing submitted result without repeating grading, answer writes, profile
+  updates, or notifications.
 - Store assessment `score`, `aiFeedback`, `submittedAt`, and status.
 - Store per-answer score and feedback when returned.
 - Set profile:
@@ -1246,7 +1265,7 @@ Overview response:
   "data": {
     "agents": [
       {
-        "name": "requirements",
+        "name": "validate_brief",
         "status": "healthy",
         "queued": 1,
         "running": 0,
@@ -1256,7 +1275,7 @@ Overview response:
         "lastFailureAt": null
       },
       {
-        "name": "assessment",
+        "name": "assessment_generation",
         "status": "failing",
         "queued": 2,
         "running": 0,
@@ -1264,12 +1283,22 @@ Overview response:
         "failedToday": 2,
         "lastSuccessAt": "2026-07-11T13:20:00.000Z",
         "lastFailureAt": "2026-07-11T15:21:00.000Z"
+      },
+      {
+        "name": "assessment_grading",
+        "status": "healthy",
+        "queued": 0,
+        "running": 0,
+        "completedToday": 4,
+        "failedToday": 0,
+        "lastSuccessAt": "2026-07-11T15:10:00.000Z",
+        "lastFailureAt": null
       }
     ],
     "totals": {
       "queued": 3,
       "running": 0,
-      "completedToday": 11,
+      "completedToday": 15,
       "failedToday": 2
     }
   }
@@ -1553,7 +1582,9 @@ Sprint 3 goal:
 
 ### 2. FastAPI routes to add
 
-Add these routes in `/home/asaad/nexus-ai-service`:
+Add these routes in the AI service repository/project, `nexus-ai-service`.
+The local checkout or deployment location is configurable; NestJS should reach
+it through `AI_SERVICE_URL`.
 
 - `POST /agents/extract-cv`
 - `POST /agents/generate-assessment`
@@ -1804,11 +1835,19 @@ Use `agent_jobs` as the source of truth for admin agent overview.
 Minimum viable queue:
 
 - Create jobs in DB with status `queued`.
-- Worker claims queued jobs.
-- Worker sets status `running`.
+- Worker claims queued jobs by conditionally transitioning one row from
+  `queued` to `running` in a single transaction, using a row lock such as
+  `FOR UPDATE SKIP LOCKED` or an atomic conditional update that returns the
+  claimed row.
+- Worker proceeds only when the claim returns a row; otherwise it must not run
+  the job.
 - Worker calls the proper service.
 - Worker sets status `completed` with output or `failed` with error.
 - Track `attempts`, `startedAt`, `completedAt`, `failedAt`.
+- Treat stale `running` jobs as recoverable when their `startedAt` is older
+  than the configured lease/timeout. Requeue or retry them in a transaction
+  before claiming so abandoned jobs can be safely recovered without duplicate
+  processing.
 
 Recommended job types:
 
@@ -1821,7 +1860,7 @@ Recommended job types:
 
 Recommended agent names:
 
-- `requirements`
+- `validate_brief`
 - `cv_extraction`
 - `assessment_generation`
 - `assessment_grading`
@@ -1832,10 +1871,12 @@ Scripts to add if possible:
 
 ```json
 {
-  "worker:agents": "nest start --entryFile agents-worker",
-  "start:all:dev": "document the three terminals: backend, frontend, ai"
+  "worker:agents": "nest start --entryFile agents-worker"
 }
 ```
+
+Run the backend, frontend, and AI service in separate dev terminals and document
+that workflow outside `package.json` scripts.
 
 If a separate Nest entry file is too much for two days, make a simple worker command and document exactly how to run it. Do not block the demo on perfect worker architecture.
 
@@ -1964,9 +2005,9 @@ Add seed script or documented command for:
 - One submitted assessment.
 - A few notifications.
 - A few agent jobs:
-  - one completed requirements job
-  - one completed assessment job
-  - one failed assessment job
+  - one completed `validate_brief` job
+  - one completed `assessment_generation` job
+  - one failed `assessment_grading` job
 
 Suggested script name:
 

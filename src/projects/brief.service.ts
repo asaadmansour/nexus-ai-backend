@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { CreateBriefMessageDto } from './dtos/create-brief-message.dto';
 import { UpdateBriefDto } from './dtos/update-brief.dto';
 import { BriefMessage } from './entities/brief-message.entity';
@@ -56,6 +56,7 @@ export class BriefService {
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
     private readonly aiService: AiService,
+    private readonly dataSource: DataSource,
   ) {}
 
   async getBrief(projectId: string, userId: string, isAdmin: boolean) {
@@ -123,8 +124,6 @@ export class BriefService {
       currentBrief,
       recentMessages,
     });
-    await this.briefMessageRepo.save(customerMessage);
-
     const extractedFields = this.mergeExtractedFields(
       projectDefaultFields,
       aiResult.extractedFields ?? this.getStoredExtractedFields(brief),
@@ -145,7 +144,6 @@ export class BriefService {
       message: aiResult.suggestedReply,
       metadata: aiResult,
     });
-    await this.briefMessageRepo.save(agentMessage);
 
     const isComplete =
       wasComplete || aiResult.isComplete || visibleMissingFields.length === 0;
@@ -175,21 +173,29 @@ export class BriefService {
     };
     this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
 
-    const updatedBrief = await this.briefRepo.save(brief);
-    if (
-      updatedBrief.isComplete &&
-      project.status !== ProjectStatus.BRIEF_COMPLETE
-    ) {
-      project.status = ProjectStatus.BRIEF_COMPLETE;
-      await this.projectRepo.save(project);
-    }
+    return this.dataSource.transaction(async (manager) => {
+      const savedCustomerMessage = await manager.save(
+        BriefMessage,
+        customerMessage,
+      );
+      const savedAgentMessage = await manager.save(BriefMessage, agentMessage);
+      const updatedBrief = await manager.save(Brief, brief);
 
-    return {
-      brief: updatedBrief,
-      customerMessage,
-      agentMessage,
-      ai: aiResult,
-    };
+      if (
+        updatedBrief.isComplete &&
+        project.status !== ProjectStatus.BRIEF_COMPLETE
+      ) {
+        project.status = ProjectStatus.BRIEF_COMPLETE;
+        await manager.save(Project, project);
+      }
+
+      return {
+        brief: updatedBrief,
+        customerMessage: savedCustomerMessage,
+        agentMessage: savedAgentMessage,
+        ai: aiResult,
+      };
+    });
   }
 
   async updateBrief(
@@ -232,16 +238,19 @@ export class BriefService {
       manuallyEditedAt: new Date().toISOString(),
     };
 
-    const updatedBrief = await this.briefRepo.save(brief);
-    if (
-      updatedBrief.isComplete &&
-      project.status !== ProjectStatus.BRIEF_COMPLETE
-    ) {
-      project.status = ProjectStatus.BRIEF_COMPLETE;
-      await this.projectRepo.save(project);
-    }
+    return this.dataSource.transaction(async (manager) => {
+      const updatedBrief = await manager.save(Brief, brief);
 
-    return updatedBrief;
+      if (
+        updatedBrief.isComplete &&
+        project.status !== ProjectStatus.BRIEF_COMPLETE
+      ) {
+        project.status = ProjectStatus.BRIEF_COMPLETE;
+        await manager.save(Project, project);
+      }
+
+      return updatedBrief;
+    });
   }
 
   async reopenAiHelp(projectId: string, userId: string, isAdmin: boolean) {
@@ -272,22 +281,27 @@ export class BriefService {
       confirmedAt: null,
       reopenedAt: new Date().toISOString(),
     };
-    const updatedBrief = await this.briefRepo.save(brief);
+    const updatedBrief = await this.dataSource.transaction(async (manager) => {
+      const updatedBrief = await manager.save(Brief, brief);
 
-    await this.briefMessageRepo.save(
-      this.briefMessageRepo.create({
-        briefId: brief.id,
-        senderType: 'agent',
-        message:
-          'Sure, tell me what you want to change or clarify. I can help with a few focused revisions, or you can edit the brief fields directly.',
-        metadata: {
-          systemPrompt: true,
-          aiRevisionOpen: true,
-          revisionCount,
-          revisionLimit: MAX_AI_REVISION_MESSAGES,
-        },
-      }),
-    );
+      await manager.save(
+        BriefMessage,
+        manager.create(BriefMessage, {
+          briefId: brief.id,
+          senderType: 'agent',
+          message:
+            'Sure, tell me what you want to change or clarify. I can help with a few focused revisions, or you can edit the brief fields directly.',
+          metadata: {
+            systemPrompt: true,
+            aiRevisionOpen: true,
+            revisionCount,
+            revisionLimit: MAX_AI_REVISION_MESSAGES,
+          },
+        }),
+      );
+
+      return updatedBrief;
+    });
 
     return {
       brief: updatedBrief,
@@ -330,13 +344,16 @@ export class BriefService {
       confirmedBy: userId,
     };
 
-    const updatedBrief = await this.briefRepo.save(brief);
-    if (project.status !== ProjectStatus.BRIEF_COMPLETE) {
-      project.status = ProjectStatus.BRIEF_COMPLETE;
-      await this.projectRepo.save(project);
-    }
+    return this.dataSource.transaction(async (manager) => {
+      const updatedBrief = await manager.save(Brief, brief);
 
-    return updatedBrief;
+      if (project.status !== ProjectStatus.BRIEF_COMPLETE) {
+        project.status = ProjectStatus.BRIEF_COMPLETE;
+        await manager.save(Project, project);
+      }
+
+      return updatedBrief;
+    });
   }
 
   private resolveAgentReply(

@@ -17,6 +17,7 @@ import { RefreshToken } from './entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { EmailService } from 'src/email/email.service';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
 import type {
   JwtPayload,
   RefreshJwtPayload,
@@ -39,9 +40,7 @@ export class AuthService {
   private readonly REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
   private toPublicUser(user: User): Omit<User, 'hashedPassword'> {
-    const safeUser = { ...user };
-    delete (safeUser as Partial<User>).hashedPassword;
-    return safeUser;
+    return sanitizeUser(user) as Omit<User, 'hashedPassword'>;
   }
 
   private async generateTokens(
@@ -373,8 +372,7 @@ export class AuthService {
 
       await queryRunner.commitTransaction();
 
-      const safeUser = Object.assign({}, user) as Partial<typeof user>;
-      delete safeUser.hashedPassword;
+      const safeUser = sanitizeUser(user);
 
       return {
         status: 'success',
@@ -418,13 +416,13 @@ export class AuthService {
     const code = crypto.randomInt(100000, 1000000).toString();
 
     try {
+      await this.redisService.set(`verifyEmail:${userId}`, code, 900);
       await this.emailService.sendVerificationEmail(user.email, code);
     } catch (emailError) {
+      await this.redisService.del(`verifyEmail:${userId}`);
       await this.redisService.del(`verifyEmailCooldown:${userId}`);
       throw emailError;
     }
-
-    await this.redisService.set(`verifyEmail:${userId}`, code, 900);
 
     return { status: 'success', message: 'Verification email sent' };
   }

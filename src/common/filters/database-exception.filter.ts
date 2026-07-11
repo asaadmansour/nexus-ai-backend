@@ -48,17 +48,14 @@ export class DatabaseExceptionFilter implements ExceptionFilter<QueryFailedError
   }
 
   private getUniqueConstraintMessage(error: PostgresDriverError): string {
-    const detail = error.detail?.toLowerCase() ?? '';
     const constraint = error.constraint?.toLowerCase() ?? '';
 
-    if (detail.includes('email') || constraint.includes('email')) {
+    if (['uq_user_email', 'users_email_key'].includes(constraint)) {
       return 'This email is already registered.';
     }
 
     if (
-      detail.includes('phone_number') ||
-      detail.includes('phone number') ||
-      constraint.includes('phone')
+      ['uq_user_phone_number', 'users_phone_number_key'].includes(constraint)
     ) {
       return 'This phone number is already registered.';
     }

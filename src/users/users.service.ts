@@ -11,6 +11,7 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
 
 @Injectable()
 export class UserService {
@@ -46,8 +47,7 @@ export class UserService {
     });
     if (!user) throw new NotFoundException('No User found');
 
-    const safeUser: Partial<User> = { ...user };
-    delete safeUser.hashedPassword;
+    const safeUser = sanitizeUser(user);
     return {
       status: 'success',
       user: {

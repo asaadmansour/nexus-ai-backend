@@ -121,9 +121,13 @@ export class AiService {
     aiServiceUrl: string,
     dto: BriefDto,
   ): Promise<ValidateBriefResult> {
-    const timeoutMs = Number(
-      this.configService.get<string>('AI_SERVICE_TIMEOUT_MS') ?? 5000,
+    const configuredTimeoutMs = Number(
+      this.configService.get<string>('AI_SERVICE_TIMEOUT_MS'),
     );
+    const timeoutMs =
+      Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+        ? configuredTimeoutMs
+        : 5000;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
