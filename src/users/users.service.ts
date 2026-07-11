@@ -46,7 +46,8 @@ export class UserService {
     });
     if (!user) throw new NotFoundException('No User found');
 
-    const { hashedPassword: _hashedPassword, ...safeUser } = user;
+    const safeUser: Partial<User> = { ...user };
+    delete safeUser.hashedPassword;
     return {
       status: 'success',
       user: {
@@ -72,7 +73,6 @@ export class UserService {
     userId: string,
     file: Express.Multer.File,
   ): Promise<{ status: string; cvUrl: string }> {
-    // Capture old asset ID before upload so we can clean it up after a successful save
     const existingUser = await this.userRepository.findOne({
       where: { id: userId },
       relations: ['freelancerProfile'],
@@ -84,11 +84,10 @@ export class UserService {
       return match ? match[0] : null;
     })();
 
-    // Upload buffer directly to Cloudinary (no temp file on disk)
     const cvResult = await new Promise<UploadApiResponse>((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
         {
-          resource_type: 'raw', // required for non-image types like PDF
+          resource_type: 'raw',
           folder: 'cvs',
           format: 'pdf',
           allowed_formats: ['pdf'],
@@ -115,7 +114,6 @@ export class UserService {
         { conflictPaths: ['userId'], skipUpdateIfNoValuesChanged: true },
       );
 
-      // Clean up old asset only after DB save succeeds (fire-and-forget)
       if (oldCvPublicId) {
         cloudinary.uploader
           .destroy(oldCvPublicId, { resource_type: 'raw' })
@@ -129,7 +127,6 @@ export class UserService {
 
       return { status: 'success', cvUrl: cvResult.secure_url };
     } catch (dbError) {
-      // DB failed — rollback the newly uploaded asset
       cloudinary.uploader
         .destroy(cvResult.public_id, { resource_type: 'raw' })
         .catch((err) =>
@@ -146,7 +143,6 @@ export class UserService {
     userId: string,
     file: Express.Multer.File,
   ): Promise<{ status: string; photoUrl: string }> {
-    // Capture old photo public ID before uploading new one
     const existingUser = await this.userRepository.findOne({
       where: { id: userId },
     });
@@ -194,7 +190,6 @@ export class UserService {
       );
 
       if (result.affected === 0) {
-        // User was deleted between auth and upload — clean up orphaned asset
         cloudinary.uploader
           .destroy(photoResult.public_id)
           .catch((err) =>
@@ -206,7 +201,6 @@ export class UserService {
         throw new NotFoundException('User not found');
       }
 
-      // Clean up old asset only after DB save succeeds (fire-and-forget)
       if (oldPhotoPublicId) {
         cloudinary.uploader
           .destroy(oldPhotoPublicId)
@@ -220,7 +214,6 @@ export class UserService {
 
       return { status: 'success', photoUrl: photoResult.secure_url };
     } catch (dbError) {
-      // DB failed — rollback the newly uploaded asset
       cloudinary.uploader
         .destroy(photoResult.public_id)
         .catch((err) =>

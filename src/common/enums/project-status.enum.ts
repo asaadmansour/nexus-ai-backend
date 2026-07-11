@@ -1,4 +1,3 @@
-// Maps to the Postgres enum type `project_status`.
 export enum ProjectStatus {
   DRAFT = 'draft',
   IN_PROGRESS = 'in_progress',

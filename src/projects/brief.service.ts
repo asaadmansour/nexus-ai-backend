@@ -1,15 +1,48 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CreateBriefMessageDto } from './dtos/create-brief-message.dto';
+import { UpdateBriefDto } from './dtos/update-brief.dto';
 import { BriefMessage } from './entities/brief-message.entity';
 import { Brief } from './entities/brief.entity';
 import { Project } from './entities/project.entity';
 import { AiService } from 'src/agents/ai.service';
+import { ProjectStatus } from 'src/common/enums/project-status.enum';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
 const MAX_BRIEF_TEXT_LENGTH = 5000;
+const INITIAL_AGENT_MESSAGE_VERSION = 2;
+const MAX_AI_REVISION_MESSAGES = 3;
+const INITIAL_GREETING_MESSAGE =
+  'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
+const PROJECT_DERIVED_FIELDS = new Set(['projectType', 'budget', 'deadline']);
+const USER_REQUIRED_BRIEF_FIELDS = [
+  'businessDomain',
+  'mainGoal',
+  'targetUsers',
+  'coreFeatures',
+  'platforms',
+  'deliverables',
+  'constraintsPreferences',
+  'clientBackground',
+  'suggestedTeamSize',
+  'experienceLevel',
+  'experienceMinYears',
+];
+const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.ASSIGNED,
+  ProjectStatus.ACTIVE,
+  ProjectStatus.UNDER_REVIEW,
+  ProjectStatus.COMPLETED,
+  ProjectStatus.DISPUTED,
+  ProjectStatus.CANCELLED,
+]);
 
 type ExtractedBriefFields = Record<string, unknown>;
 
@@ -25,7 +58,337 @@ export class BriefService {
     private readonly aiService: AiService,
   ) {}
 
-  async sendCustomerMessage(projectId: string, dto: CreateBriefMessageDto) {
+  async getBrief(projectId: string, userId: string, isAdmin: boolean) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    const brief = await this.getOrCreateBrief(projectId);
+    await this.ensureInitialAgentMessage(brief, project);
+
+    return brief;
+  }
+
+  async getMessages(projectId: string, userId: string, isAdmin: boolean) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    const brief = await this.getOrCreateBrief(projectId);
+    await this.ensureInitialAgentMessage(brief, project);
+
+    return this.briefMessageRepo.find({
+      where: { briefId: brief.id },
+      order: { createdAt: 'ASC' },
+    });
+  }
+
+  async sendCustomerMessage(
+    projectId: string,
+    userId: string,
+    isAdmin: boolean,
+    dto: CreateBriefMessageDto,
+  ) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    const brief = await this.getOrCreateBrief(projectId);
+    await this.ensureInitialAgentMessage(brief, project);
+    const wasComplete = brief.isComplete;
+    this.assertAiChatAllowed(project, brief);
+
+    const projectDefaultFields = this.extractProjectDefaultFields(project);
+    const currentBrief = this.buildCurrentBriefContext(
+      brief,
+      projectDefaultFields,
+      this.buildProjectContext(project),
+    );
+    const recentMessages = await this.getRecentMessages(brief.id);
+
+    const customerMessage = this.briefMessageRepo.create({
+      briefId: brief.id,
+      senderType: 'customer',
+      message: dto.content,
+      metadata: null,
+    });
+
+    const aiResult = await this.aiService.validateBrief({
+      projectId,
+      briefId: brief.id,
+      briefText: dto.content,
+      currentBrief,
+      recentMessages,
+    });
+    await this.briefMessageRepo.save(customerMessage);
+
+    const extractedFields = this.mergeExtractedFields(
+      projectDefaultFields,
+      aiResult.extractedFields ?? this.getStoredExtractedFields(brief),
+    );
+    const visibleMissingFields = this.removeProjectDerivedMissingFields(
+      aiResult.missingFields,
+    );
+    aiResult.suggestedReply = this.resolveAgentReply(
+      aiResult.suggestedReply,
+      aiResult.assistantReply,
+      visibleMissingFields,
+      recentMessages,
+    );
+
+    const agentMessage = this.briefMessageRepo.create({
+      briefId: brief.id,
+      senderType: 'agent',
+      message: aiResult.suggestedReply,
+      metadata: aiResult,
+    });
+    await this.briefMessageRepo.save(agentMessage);
+
+    const isComplete =
+      wasComplete || aiResult.isComplete || visibleMissingFields.length === 0;
+    const nextRevisionCount = wasComplete
+      ? this.getRevisionCount(brief) + 1
+      : this.getRevisionCount(brief);
+    brief.isComplete = isComplete;
+    brief.completedAt = brief.completedAt ?? (isComplete ? new Date() : null);
+    brief.aiDecided = {
+      ...(brief.aiDecided ?? {}),
+      missingFields: visibleMissingFields,
+      completionPercentage: aiResult.completionPercentage,
+      extractedFields: extractedFields ?? null,
+      aiRevisionOpen:
+        wasComplete && nextRevisionCount < MAX_AI_REVISION_MESSAGES,
+      revisionCount: nextRevisionCount,
+      revisionLimit: MAX_AI_REVISION_MESSAGES,
+      confirmedAt: wasComplete
+        ? null
+        : this.asPlainObject(brief.aiDecided)?.confirmedAt,
+      pendingField: aiResult.nextQuestionField ?? null,
+      nextQuestionField: aiResult.nextQuestionField ?? null,
+      fastPathUsed: aiResult.fastPathUsed ?? false,
+      fastPathReason: aiResult.fastPathReason ?? null,
+      extractionSource: aiResult.extractionSource ?? aiResult.source,
+      source: aiResult.source,
+    };
+    this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
+
+    const updatedBrief = await this.briefRepo.save(brief);
+    if (
+      updatedBrief.isComplete &&
+      project.status !== ProjectStatus.BRIEF_COMPLETE
+    ) {
+      project.status = ProjectStatus.BRIEF_COMPLETE;
+      await this.projectRepo.save(project);
+    }
+
+    return {
+      brief: updatedBrief,
+      customerMessage,
+      agentMessage,
+      ai: aiResult,
+    };
+  }
+
+  async updateBrief(
+    projectId: string,
+    userId: string,
+    isAdmin: boolean,
+    dto: UpdateBriefDto,
+  ) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    this.assertBriefCanChange(project);
+
+    const brief = await this.getOrCreateBrief(projectId);
+    const projectDefaultFields = this.extractProjectDefaultFields(project);
+    const extractedFields = this.mergeExtractedFields(
+      projectDefaultFields,
+      this.buildKnownFieldsFromBrief(brief),
+      this.extractManualUpdateFields(dto),
+    );
+    const missingFields =
+      this.getVisibleMissingFieldsFromFields(extractedFields);
+
+    this.applyExtractedFieldsToBrief(brief, extractedFields, '');
+    brief.isComplete = missingFields.length === 0;
+    brief.completedAt =
+      brief.completedAt ?? (brief.isComplete ? new Date() : null);
+    brief.aiDecided = {
+      ...(brief.aiDecided ?? {}),
+      missingFields,
+      completionPercentage:
+        this.getCompletionPercentageFromMissingFields(missingFields),
+      extractedFields,
+      aiRevisionOpen: false,
+      revisionCount: this.getRevisionCount(brief),
+      revisionLimit: MAX_AI_REVISION_MESSAGES,
+      confirmedAt: null,
+      manuallyEditedAt: new Date().toISOString(),
+    };
+
+    const updatedBrief = await this.briefRepo.save(brief);
+    if (
+      updatedBrief.isComplete &&
+      project.status !== ProjectStatus.BRIEF_COMPLETE
+    ) {
+      project.status = ProjectStatus.BRIEF_COMPLETE;
+      await this.projectRepo.save(project);
+    }
+
+    return updatedBrief;
+  }
+
+  async reopenAiHelp(projectId: string, userId: string, isAdmin: boolean) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    this.assertBriefCanChange(project);
+
+    const brief = await this.getOrCreateBrief(projectId);
+    if (!brief.isComplete) {
+      throw new BadRequestException('The requirements chat is already open.');
+    }
+
+    const revisionCount = this.getRevisionCount(brief);
+    if (revisionCount >= MAX_AI_REVISION_MESSAGES) {
+      throw new BadRequestException(
+        'AI revision limit reached. You can still edit the brief fields manually.',
+      );
+    }
+
+    brief.aiDecided = {
+      ...(brief.aiDecided ?? {}),
+      aiRevisionOpen: true,
+      revisionCount,
+      revisionLimit: MAX_AI_REVISION_MESSAGES,
+      confirmedAt: null,
+      reopenedAt: new Date().toISOString(),
+    };
+    const updatedBrief = await this.briefRepo.save(brief);
+
+    await this.briefMessageRepo.save(
+      this.briefMessageRepo.create({
+        briefId: brief.id,
+        senderType: 'agent',
+        message:
+          'Sure, tell me what you want to change or clarify. I can help with a few focused revisions, or you can edit the brief fields directly.',
+        metadata: {
+          systemPrompt: true,
+          aiRevisionOpen: true,
+          revisionCount,
+          revisionLimit: MAX_AI_REVISION_MESSAGES,
+        },
+      }),
+    );
+
+    return {
+      brief: updatedBrief,
+      messages: await this.getMessages(projectId, userId, isAdmin),
+    };
+  }
+
+  async confirmBrief(projectId: string, userId: string, isAdmin: boolean) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    this.assertBriefCanChange(project);
+
+    const brief = await this.getOrCreateBrief(projectId);
+    const missingFields = this.getVisibleMissingFieldsFromFields(
+      this.mergeExtractedFields(
+        this.extractProjectDefaultFields(project),
+        this.buildKnownFieldsFromBrief(brief),
+      ),
+    );
+
+    if (missingFields.length > 0) {
+      throw new BadRequestException(
+        'Please complete the required brief details before confirming.',
+      );
+    }
+
+    brief.isComplete = true;
+    brief.completedAt = brief.completedAt ?? new Date();
+    brief.aiDecided = {
+      ...(brief.aiDecided ?? {}),
+      missingFields: [],
+      completionPercentage: 100,
+      aiRevisionOpen: false,
+      revisionCount: this.getRevisionCount(brief),
+      revisionLimit: MAX_AI_REVISION_MESSAGES,
+      confirmedAt: new Date().toISOString(),
+      confirmedBy: userId,
+    };
+
+    const updatedBrief = await this.briefRepo.save(brief);
+    if (project.status !== ProjectStatus.BRIEF_COMPLETE) {
+      project.status = ProjectStatus.BRIEF_COMPLETE;
+      await this.projectRepo.save(project);
+    }
+
+    return updatedBrief;
+  }
+
+  private resolveAgentReply(
+    suggestedReply: string,
+    assistantReply: string | null | undefined,
+    missingFields: string[],
+    recentMessages: Array<{ senderType: string; content: string }>,
+  ) {
+    if (assistantReply) {
+      return assistantReply;
+    }
+
+    if (missingFields.length === 0) {
+      return 'Thanks, the brief has enough detail to continue.';
+    }
+
+    const fallbackPrompt = this.buildNaturalFollowUpPrompt(missingFields[0]);
+
+    const lastAgentMessage = [...recentMessages]
+      .reverse()
+      .find((message) => message.senderType === 'agent');
+
+    if (
+      suggestedReply &&
+      (!lastAgentMessage ||
+        this.normalizeComparableText(lastAgentMessage.content) !==
+          this.normalizeComparableText(suggestedReply))
+    ) {
+      return suggestedReply;
+    }
+
+    return fallbackPrompt;
+  }
+
+  private normalizeComparableText(value: string) {
+    return value.trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  private humanizeFieldName(value: string) {
+    return value
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/[_-]+/g, ' ')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/^./, (letter) => letter.toUpperCase());
+  }
+
+  private async findAuthorizedProject(
+    projectId: string,
+    userId: string,
+    isAdmin: boolean,
+  ) {
     const project = await this.projectRepo.findOne({
       where: { id: projectId },
     });
@@ -34,6 +397,14 @@ export class BriefService {
       throw new NotFoundException('Project not found');
     }
 
+    if (!isAdmin && project.customerId !== userId) {
+      throw new ForbiddenException('You can only access your own projects');
+    }
+
+    return project;
+  }
+
+  private async getOrCreateBrief(projectId: string) {
     let brief = await this.briefRepo.findOne({
       where: { projectId },
     });
@@ -46,58 +417,96 @@ export class BriefService {
       brief = await this.briefRepo.save(brief);
     }
 
-    const currentBrief = this.buildCurrentBriefContext(brief);
-    const recentMessages = await this.getRecentMessages(brief.id);
+    return brief;
+  }
 
-    const customerMessage = this.briefMessageRepo.create({
-      briefId: brief.id,
-      senderType: 'customer',
-      message: dto.content,
-      metadata: null,
+  private async ensureInitialAgentMessage(brief: Brief, project: Project) {
+    const firstAgentMessage = await this.briefMessageRepo.findOne({
+      where: { briefId: brief.id, senderType: 'agent' },
+      order: { createdAt: 'ASC' },
     });
 
-    await this.briefMessageRepo.save(customerMessage);
-    const aiResult = await this.aiService.validateBrief({
-      projectId,
-      briefId: brief.id,
-      briefText: dto.content,
-      currentBrief,
-      recentMessages,
-    });
-    const agentMessage = this.briefMessageRepo.create({
-      briefId: brief.id,
-      senderType: 'agent',
-      message: aiResult.suggestedReply,
-      metadata: aiResult,
-    });
-    await this.briefMessageRepo.save(agentMessage);
+    if (firstAgentMessage) {
+      if (
+        firstAgentMessage.metadata?.systemPrompt === true &&
+        firstAgentMessage.metadata?.initialAgentMessageVersion !==
+          INITIAL_AGENT_MESSAGE_VERSION
+      ) {
+        firstAgentMessage.message = await this.buildInitialAgentMessage(
+          brief,
+          project,
+        );
+        firstAgentMessage.metadata = {
+          ...(firstAgentMessage.metadata ?? {}),
+          systemPrompt: true,
+          initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
+        };
+        await this.briefMessageRepo.save(firstAgentMessage);
+      }
 
-    const extractedFields =
-      aiResult.extractedFields ?? this.getStoredExtractedFields(brief);
+      return;
+    }
 
-    brief.isComplete = aiResult.isComplete;
-    brief.completedAt = aiResult.isComplete ? new Date() : null;
-    brief.aiDecided = {
-      ...(brief.aiDecided ?? {}),
-      missingFields: aiResult.missingFields,
-      completionPercentage: aiResult.completionPercentage,
-      extractedFields: extractedFields ?? null,
-      pendingField: aiResult.nextQuestionField ?? null,
-      nextQuestionField: aiResult.nextQuestionField ?? null,
-      fastPathUsed: aiResult.fastPathUsed ?? false,
-      fastPathReason: aiResult.fastPathReason ?? null,
-      extractionSource: aiResult.extractionSource ?? aiResult.source,
-      source: aiResult.source,
-    };
-    this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
+    await this.briefMessageRepo.save(
+      this.briefMessageRepo.create({
+        briefId: brief.id,
+        senderType: 'agent',
+        message: await this.buildInitialAgentMessage(brief, project),
+        metadata: {
+          systemPrompt: true,
+          initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
+        },
+      }),
+    );
+  }
 
-    const updatedBrief = await this.briefRepo.save(brief);
-    return {
-      brief: updatedBrief,
-      customerMessage,
-      agentMessage,
-      ai: aiResult,
-    };
+  private async buildInitialAgentMessage(brief: Brief, project: Project) {
+    const projectDefaultFields = this.extractProjectDefaultFields(project);
+    const currentBrief = this.buildCurrentBriefContext(
+      brief,
+      projectDefaultFields,
+      this.buildProjectContext(project),
+      'initialGreeting',
+    );
+
+    try {
+      const aiResult = await this.aiService.validateBrief({
+        projectId: project.id,
+        briefId: brief.id,
+        briefText: INITIAL_GREETING_MESSAGE,
+        currentBrief,
+        recentMessages: [],
+      });
+      const extractedFields = this.mergeExtractedFields(
+        projectDefaultFields,
+        aiResult.extractedFields,
+      );
+      const missingFields = this.removeProjectDerivedMissingFields(
+        aiResult.missingFields,
+      );
+
+      brief.aiDecided = {
+        ...(brief.aiDecided ?? {}),
+        missingFields,
+        completionPercentage: aiResult.completionPercentage,
+        extractedFields: extractedFields ?? null,
+        pendingField: aiResult.nextQuestionField ?? null,
+        nextQuestionField: aiResult.nextQuestionField ?? null,
+        extractionSource: aiResult.extractionSource ?? aiResult.source,
+        source: aiResult.source,
+      };
+      this.applyExtractedFieldsToBrief(brief, extractedFields, '');
+      await this.briefRepo.save(brief);
+
+      return this.resolveAgentReply(
+        aiResult.suggestedReply,
+        aiResult.assistantReply,
+        missingFields,
+        [],
+      );
+    } catch {
+      return this.buildInitialFallbackMessage(project);
+    }
   }
 
   private async getRecentMessages(briefId: string) {
@@ -114,8 +523,108 @@ export class BriefService {
     }));
   }
 
-  private buildCurrentBriefContext(brief: Brief): Record<string, unknown> {
-    const knownFields = this.buildKnownFieldsFromBrief(brief);
+  private assertAiChatAllowed(project: Project, brief: Brief) {
+    if (!brief.isComplete) return;
+
+    this.assertBriefCanChange(project);
+    const aiDecided = this.asPlainObject(brief.aiDecided) ?? {};
+    const aiRevisionOpen = aiDecided.aiRevisionOpen === true;
+
+    if (!aiRevisionOpen) {
+      throw new BadRequestException(
+        'The brief is complete. Reopen AI help or edit the brief fields directly.',
+      );
+    }
+
+    if (this.getRevisionCount(brief) >= MAX_AI_REVISION_MESSAGES) {
+      throw new BadRequestException(
+        'AI revision limit reached. You can still edit the brief fields manually.',
+      );
+    }
+  }
+
+  private assertBriefCanChange(project: Project) {
+    if (BRIEF_CHANGE_LOCKED_PROJECT_STATUSES.has(project.status)) {
+      throw new BadRequestException(
+        'The brief cannot be changed after the project is assigned or closed.',
+      );
+    }
+  }
+
+  private extractProjectDefaultFields(project: Project): ExtractedBriefFields {
+    const fields: ExtractedBriefFields = {};
+    const budget = this.formatProjectBudget(project);
+
+    if (project.title) fields.projectType = project.title;
+    if (project.description) fields.mainGoal = project.description;
+    if (budget) fields.budget = budget;
+    if (project.deadline) {
+      fields.deadline = project.deadline.toISOString().slice(0, 10);
+    }
+
+    return fields;
+  }
+
+  private formatProjectBudget(project: Project): string | null {
+    if (!project.budgetMin && !project.budgetMax) return null;
+
+    const currency = project.currency || 'EGP';
+    if (project.budgetMin === project.budgetMax) {
+      return `${currency} ${project.budgetMin}`;
+    }
+
+    return `${currency} ${project.budgetMin} - ${project.budgetMax}`;
+  }
+
+  private buildProjectContext(project: Project) {
+    return {
+      name: project.title,
+      title: project.title,
+      description: project.description,
+      budget: this.formatProjectBudget(project),
+      deadline: project.deadline?.toISOString().slice(0, 10) ?? null,
+      isDeadlineFlexible: project.isDeadlineFlexible,
+    };
+  }
+
+  private mergeExtractedFields(
+    ...fieldSets: Array<ExtractedBriefFields | null | undefined>
+  ): ExtractedBriefFields {
+    const merged: ExtractedBriefFields = {};
+
+    for (const fieldSet of fieldSets) {
+      if (!fieldSet) continue;
+
+      for (const [field, value] of Object.entries(fieldSet)) {
+        if (this.hasFieldValue(value)) {
+          merged[field] = value;
+        }
+      }
+    }
+
+    return merged;
+  }
+
+  private hasFieldValue(value: unknown): boolean {
+    if (value === null || value === undefined) return false;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (Array.isArray(value)) {
+      return value.some((item) => this.hasFieldValue(item));
+    }
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+  }
+
+  private buildCurrentBriefContext(
+    brief: Brief,
+    extraKnownFields?: ExtractedBriefFields,
+    projectContext?: Record<string, unknown>,
+    conversationMode?: string,
+  ): Record<string, unknown> {
+    const knownFields = this.mergeExtractedFields(
+      this.buildKnownFieldsFromBrief(brief),
+      extraKnownFields,
+    );
     const aiDecided = this.asPlainObject(brief.aiDecided) ?? {};
     const pendingField =
       aiDecided &&
@@ -128,7 +637,9 @@ export class BriefService {
     return {
       id: brief.id,
       projectId: brief.projectId,
-      knownFields,
+      knownFields: Object.keys(knownFields).length > 0 ? knownFields : null,
+      projectContext: projectContext ?? null,
+      conversationMode: conversationMode ?? null,
       pendingField,
       isComplete: brief.isComplete,
       completedAt: brief.completedAt?.toISOString() ?? null,
@@ -437,5 +948,89 @@ export class BriefService {
 
   private truncate(value: string, maxLength: number): string {
     return value.length > maxLength ? value.slice(0, maxLength) : value;
+  }
+
+  private removeProjectDerivedMissingFields(missingFields: string[]) {
+    return missingFields.filter((field) => !PROJECT_DERIVED_FIELDS.has(field));
+  }
+
+  private getVisibleMissingFieldsFromFields(fields: ExtractedBriefFields) {
+    return USER_REQUIRED_BRIEF_FIELDS.filter(
+      (field) => !this.hasFieldValue(fields[field]),
+    );
+  }
+
+  private getCompletionPercentageFromMissingFields(missingFields: string[]) {
+    const completedFields =
+      USER_REQUIRED_BRIEF_FIELDS.length - missingFields.length;
+    return Math.round(
+      (completedFields / USER_REQUIRED_BRIEF_FIELDS.length) * 100,
+    );
+  }
+
+  private getRevisionCount(brief: Brief) {
+    const aiDecided = this.asPlainObject(brief.aiDecided);
+    const revisionCount = aiDecided?.revisionCount;
+
+    return typeof revisionCount === 'number' && Number.isFinite(revisionCount)
+      ? revisionCount
+      : 0;
+  }
+
+  private extractManualUpdateFields(dto: UpdateBriefDto): ExtractedBriefFields {
+    return this.cleanJsonSection({
+      businessDomain: dto.businessDomain,
+      mainGoal: dto.mainGoal,
+      targetUsers: dto.targetUsers,
+      coreFeatures: dto.coreFeatures,
+      platforms: dto.platforms,
+      deliverables: dto.deliverables,
+      constraintsPreferences: dto.constraintsPreferences,
+      clientBackground: dto.clientBackground,
+      suggestedTeamSize: dto.suggestedTeamSize,
+      experienceLevel: dto.experienceLevel,
+      experienceMinYears: dto.experienceMinYears,
+    });
+  }
+
+  private buildInitialFallbackMessage(project: Project) {
+    const projectName = project.title || 'your project';
+    const description = project.description
+      ? ` I saw the short description: ${this.truncate(project.description, 160)}.`
+      : '';
+
+    return `Hi, I’ll help shape ${projectName} into a clear brief.${description} To start, tell me a bit about the business or domain this is for and who you expect to use it.`;
+  }
+
+  private buildNaturalFollowUpPrompt(nextField: string) {
+    const questions: Record<string, string> = {
+      businessDomain:
+        'Nice, that gives me a better starting point. What kind of business or domain is this for?',
+      mainGoal:
+        'That helps. What is the main thing you want this project to achieve for your business?',
+      targetUsers:
+        'Got it. Who do you expect will use this most: customers, staff, admins, or another group?',
+      coreFeatures:
+        'Great. What are the must-have features you want in the first version?',
+      platforms:
+        'Makes sense. Where should this run: website, mobile app, both, or something else?',
+      deliverables:
+        'Good. What final deliverables would feel complete to you, like a working website, mobile app, dashboard, source code, setup help, or simply "not sure"?',
+      constraintsPreferences:
+        'Any preferences or constraints we should respect, like colors, style, integrations, or things you want to avoid?',
+      clientBackground:
+        'To guide the brief properly, what is your background here: business owner, operations, non-technical founder, technical founder, or something else?',
+      suggestedTeamSize:
+        'Do you already have a team size in mind, or should we suggest what fits the project?',
+      experienceLevel:
+        'Do you prefer a junior, mid, senior, or expert freelancer, or should we decide based on the scope?',
+      experienceMinYears:
+        'Do you have a minimum years-of-experience preference, or is there no preference?',
+    };
+
+    return (
+      questions[nextField] ??
+      'That helps. Can you share a little more detail so I can shape the brief properly?'
+    );
   }
 }

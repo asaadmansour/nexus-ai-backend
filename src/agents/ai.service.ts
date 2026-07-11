@@ -12,6 +12,7 @@ type ValidateBriefResult = {
   completionPercentage: number;
   missingFields: string[];
   suggestedReply: string;
+  assistantReply?: string | null;
   extractedFields?: Record<string, unknown>;
   nextQuestionField?: string | null;
   fastPathUsed?: boolean;
@@ -24,6 +25,7 @@ type FastApiValidateBriefResponse = {
   isComplete?: boolean;
   completionPercentage?: number;
   nextQuestion?: string;
+  assistantReply?: string | null;
   nextQuestionField?: string | null;
   extractedFields?: Record<string, unknown>;
   missingFields?: string[];
@@ -94,25 +96,25 @@ export class AiService {
     const isMockMode =
       (this.configService.get<string>('AI_MOCK_MODE') ?? 'false') === 'true';
 
-    if (aiServiceUrl && !isMockMode) {
-      try {
-        return await this.callFastApiValidateBrief(aiServiceUrl, dto);
-      } catch (error) {
-        this.logger.error(
-          `AI service validate-brief failed: ${this.getErrorMessage(error)}`,
-        );
-
-        throw new BadGatewayException(
-          'AI service is unavailable or returned an invalid response',
-        );
-      }
+    if (isMockMode) {
+      return this.getMockValidateBriefResult(dto);
     }
 
-    if (!isMockMode) {
+    if (!aiServiceUrl) {
       throw new BadGatewayException('AI_SERVICE_URL is not configured');
     }
 
-    return this.getMockValidateBriefResult(dto);
+    try {
+      return await this.callFastApiValidateBrief(aiServiceUrl, dto);
+    } catch (error) {
+      this.logger.error(
+        `AI service validate-brief failed: ${this.getErrorMessage(error)}`,
+      );
+
+      throw new BadGatewayException(
+        'AI service is unavailable or returned an invalid response',
+      );
+    }
   }
 
   private async callFastApiValidateBrief(
@@ -154,6 +156,7 @@ export class AiService {
       const extractedFields = this.sanitizeExtractedFields(
         result.extractedFields,
       );
+      const assistantReply = this.cleanAssistantReply(result.assistantReply);
 
       return {
         projectId: dto.projectId ?? null,
@@ -164,7 +167,10 @@ export class AiService {
           Math.max(40, 100 - missingFields.length * 20),
         missingFields,
         suggestedReply:
-          result.nextQuestion ?? 'The brief has enough detail to continue.',
+          assistantReply ??
+          result.nextQuestion ??
+          'The brief has enough detail to continue.',
+        assistantReply,
         extractedFields,
         nextQuestionField: result.nextQuestionField ?? null,
         fastPathUsed: result.fastPathUsed ?? false,
@@ -178,31 +184,216 @@ export class AiService {
   }
 
   private getMockValidateBriefResult(dto: BriefDto): ValidateBriefResult {
-    const briefText = dto.briefText.toLowerCase();
+    const extractedFields = {
+      ...this.getKnownBriefFields(dto),
+      ...this.extractFieldsFromText(dto.briefText),
+    };
     const missingFields: string[] = [];
 
-    if (!briefText.includes('budget')) missingFields.push('budget');
+    if (!this.hasFieldValue(extractedFields.mainGoal)) {
+      missingFields.push('mainGoal');
+    }
 
-    if (!briefText.includes('deadline') && !briefText.includes('timeline')) {
+    if (!this.hasFieldValue(extractedFields.targetUsers)) {
+      missingFields.push('targetUsers');
+    }
+
+    if (!this.hasFieldValue(extractedFields.coreFeatures)) {
+      missingFields.push('coreFeatures');
+    }
+
+    if (
+      !this.hasFieldValue(extractedFields.platforms) &&
+      !this.hasFieldValue(extractedFields.constraintsPreferences)
+    ) {
+      missingFields.push('platforms');
+    }
+
+    if (!this.hasFieldValue(extractedFields.deadline)) {
       missingFields.push('deadline');
     }
 
-    if (!briefText.includes('deliverable')) {
-      missingFields.push('deliverables');
+    if (!this.hasFieldValue(extractedFields.budget)) {
+      missingFields.push('budget');
     }
+
+    const requiredCount = 6;
+    const completedCount = requiredCount - missingFields.length;
 
     return {
       projectId: dto.projectId ?? null,
       briefId: dto.briefId ?? null,
       isComplete: missingFields.length === 0,
-      completionPercentage: Math.max(40, 100 - missingFields.length * 20),
+      completionPercentage: Math.round((completedCount / requiredCount) * 100),
       missingFields,
       suggestedReply:
         missingFields.length > 0
-          ? `Please add: ${missingFields.join(', ')}.`
+          ? this.getNextMockBriefQuestion(missingFields[0])
           : 'The brief has enough detail to continue.',
+      extractedFields,
+      nextQuestionField: missingFields[0] ?? null,
       source: 'local_mock',
     };
+  }
+
+  private cleanAssistantReply(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+
+    const cleaned = value.trim().replace(/\s+/g, ' ');
+    return cleaned.length > 0 ? this.truncate(cleaned, 700) : null;
+  }
+
+  private getKnownBriefFields(dto: BriefDto): Record<string, unknown> {
+    const currentBrief = this.asPlainObject(dto.currentBrief) ?? {};
+    const knownFields = this.asPlainObject(currentBrief.knownFields) ?? {};
+
+    return { ...knownFields };
+  }
+
+  private extractFieldsFromText(text: string): Record<string, unknown> {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const lowered = normalized.toLowerCase();
+    const fields: Record<string, unknown> = {};
+
+    const mainGoal =
+      this.extractAfterMarker(normalized, [
+        'main goal is',
+        'goal is',
+        'i want to build',
+        'we want to build',
+        'i need',
+        'we need',
+      ]) ?? (normalized.split(/\s+/).length >= 6 ? normalized : null);
+    if (mainGoal) fields.mainGoal = mainGoal;
+
+    const targetUsers = this.extractListAfterMarker(normalized, [
+      'target users are',
+      'target users',
+      'users are',
+      'for users',
+      'for customers',
+      'for clients',
+      'for patients',
+      'for admins',
+      'for freelancers',
+    ]);
+    if (targetUsers.length > 0) fields.targetUsers = targetUsers;
+
+    const coreFeatures = this.extractListAfterMarker(normalized, [
+      'core features are',
+      'features are',
+      'features include',
+      'must have',
+      'must-have',
+    ]);
+    if (coreFeatures.length > 0) fields.coreFeatures = coreFeatures;
+
+    const platforms = this.extractListAfterMarker(normalized, [
+      'preferred tech is',
+      'tech stack is',
+      'tech is',
+      'using',
+      'built with',
+    ]);
+    if (platforms.length > 0) fields.platforms = platforms;
+
+    const budget =
+      this.extractAfterMarker(normalized, ['budget is', 'budget']) ??
+      this.extractCurrencyValue(normalized);
+    if (budget) fields.budget = budget;
+
+    const deadline = this.extractAfterMarker(normalized, [
+      'timeline is',
+      'timeline',
+      'deadline is',
+      'deadline',
+      'due',
+    ]);
+    if (deadline) fields.deadline = deadline;
+
+    if (lowered.includes('no preference')) {
+      fields.constraintsPreferences = ['No tech preference'];
+    }
+
+    return fields;
+  }
+
+  private extractAfterMarker(text: string, markers: string[]): string | null {
+    const lowered = text.toLowerCase();
+
+    for (const marker of markers) {
+      const index = lowered.indexOf(marker);
+      if (index < 0) continue;
+
+      const start = index + marker.length;
+      const value = text
+        .slice(start)
+        .split(/[.;\n]/)[0]
+        .replace(/^[:\s-]+/, '')
+        .trim();
+
+      if (value) return this.truncate(value, 240);
+    }
+
+    return null;
+  }
+
+  private extractListAfterMarker(text: string, markers: string[]): string[] {
+    const value = this.extractAfterMarker(text, markers);
+    if (!value) return [];
+
+    return value
+      .split(/,|;|\band\b/gi)
+      .map((item) => this.truncate(item.trim(), 120))
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+
+  private extractCurrencyValue(text: string): string | null {
+    const match = text.match(
+      /(?:\$|egp|usd|eur|gbp)\s?\d[\d,]*(?:\.\d+)?|\d[\d,]*(?:\.\d+)?\s?(?:egp|usd|eur|gbp|dollars?)/i,
+    );
+
+    return match ? match[0] : null;
+  }
+
+  private hasFieldValue(value: unknown): boolean {
+    if (value === null || value === undefined) return false;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (Array.isArray(value)) {
+      return value.some((item) => this.hasFieldValue(item));
+    }
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+  }
+
+  private asPlainObject(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+
+    return value as Record<string, unknown>;
+  }
+
+  private truncate(value: string, maxLength: number): string {
+    return value.length > maxLength ? value.slice(0, maxLength) : value;
+  }
+
+  private getNextMockBriefQuestion(field: string) {
+    const questions: Record<string, string> = {
+      mainGoal:
+        'What is the main goal of the project? Include the business problem it should solve.',
+      targetUsers:
+        'Who are the target users? Tell me who will use it and what they need to do.',
+      coreFeatures:
+        'What are the core features? List the must-have workflows or screens.',
+      platforms:
+        'Any tech preferences or platform requirements? If not, say no preference.',
+      deadline: 'What timeline or deadline should we plan around?',
+      budget: 'What budget or budget range should we use for planning?',
+    };
+
+    return questions[field] ?? 'Please add more detail for the project brief.';
   }
 
   generateAssessment(dto: GenerateAssessmentDto) {

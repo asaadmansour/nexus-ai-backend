@@ -2,6 +2,7 @@ import {
   Controller,
   Post,
   Get,
+  Delete,
   Patch,
   Param,
   Body,
@@ -65,5 +66,16 @@ export class ProjectsController {
     const isAdmin = user.role === UserRole.ADMIN;
     const data = await this.projectsService.update(id, user.sub, isAdmin, dto);
     return { status: 'success', data };
+  }
+
+  @Delete(':id')
+  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  async deleteProject(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const isAdmin = user.role === UserRole.ADMIN;
+    await this.projectsService.remove(id, user.sub, isAdmin);
+    return { status: 'success' };
   }
 }

@@ -39,7 +39,6 @@ export class FreelancerProfileEmbedding {
   @Column({ name: 'dimensions', type: 'int', default: 1024 })
   dimensions: number;
 
-  // pgvector column. Queried via raw SQL / vector operators; TypeORM maps it as a string.
   @Column({ type: 'vector', length: 1024, select: false })
   embedding: string;
 

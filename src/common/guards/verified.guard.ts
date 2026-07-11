@@ -12,7 +12,6 @@ export class VerifiedGuard implements CanActivate {
     const request = context.switchToHttp().getRequest<{ user?: JwtPayload }>();
     const user = request.user;
 
-    // We assume AuthGuard has already run and populated request.user
     if (!user || user.isEmailVerified !== true) {
       throw new ForbiddenException(
         'You must verify your email address to perform this action',

@@ -5,6 +5,10 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import type {
+  JwtPayload,
+  OptionalAuthenticatedRequest,
+} from 'src/common/interfaces/jwt-payload.interface';
 import { RedisService } from 'src/redis/redis.service';
 
 @Injectable()
@@ -14,13 +18,20 @@ export class AuthGuard implements CanActivate {
     private readonly redisService: RedisService,
   ) {}
   async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest();
-    if (!request.headers.authorization)
+    const request = context
+      .switchToHttp()
+      .getRequest<OptionalAuthenticatedRequest>();
+    const authHeader = request.headers.authorization;
+    if (!authHeader) {
       throw new UnauthorizedException('Invalid request');
-    const [_, token] = request.headers.authorization.split(' ');
+    }
+    const [, token] = authHeader.split(' ');
+    if (!token) {
+      throw new UnauthorizedException('Invalid request');
+    }
 
     try {
-      const verifiedToken = this.jwtService.verify(token);
+      const verifiedToken = this.jwtService.verify<JwtPayload>(token);
       request.user = verifiedToken;
     } catch {
       throw new UnauthorizedException('Invalid request');

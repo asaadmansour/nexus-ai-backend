@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { UpdateFreelancerDto } from './dtos/update-freelancer.dto';
+import { User } from 'src/users/entities/user.entity';
 
 @Injectable()
 export class FreelancersService {
@@ -21,10 +22,10 @@ export class FreelancersService {
         'Freelancer profile not found or role mismatch',
       );
 
-    // safe nested user stripping
-    const { hashedPassword: _hashedPassword, ...safeUser } = profile.user || {
-      hashedPassword: null,
-    };
+    const safeUser: Partial<User> | null = profile.user
+      ? { ...profile.user }
+      : null;
+    if (safeUser) delete safeUser.hashedPassword;
 
     return {
       status: 'success',

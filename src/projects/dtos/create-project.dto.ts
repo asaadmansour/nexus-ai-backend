@@ -33,7 +33,10 @@ export class CreateProjectDto {
 
   @IsString()
   @IsOptional()
-  @Matches(/^[A-Z]{3}$/, { message: 'currency must be a valid ISO 4217 3-letter uppercase code (e.g. USD, EGP)' })
+  @Matches(/^[A-Z]{3}$/, {
+    message:
+      'currency must be a valid ISO 4217 3-letter uppercase code (e.g. USD, EGP)',
+  })
   currency?: string;
 
   @IsDateString()
