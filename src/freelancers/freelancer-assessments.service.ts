@@ -624,8 +624,7 @@ export class FreelancerAssessmentsService {
     cvUploaded: boolean;
     emailVerified: boolean;
   }): { verificationStatus: string; nextAction: string } {
-    const { profile, latest, profileComplete, cvUploaded, emailVerified } =
-      input;
+    const { profile, latest, cvUploaded, emailVerified } = input;
     const stored = profile.verificationStatus;
 
     if (stored === 'approved') {
@@ -647,19 +646,16 @@ export class FreelancerAssessmentsService {
         nextAction: 'verify_email',
       };
     }
-    if (!profileComplete && !cvUploaded) {
-      return {
-        verificationStatus: 'profile_incomplete',
-        nextAction: 'complete_profile',
-      };
-    }
     if (!cvUploaded) {
       return { verificationStatus: 'cv_pending', nextAction: 'upload_cv' };
     }
-    if (!profileComplete) {
+    // Profile fields (headline/bio/rate/years) no longer block the assessment —
+    // it only needs a CV plus extracted skills, so the freelancer can take it first.
+    const hasSkills = (profile.skills?.length ?? 0) > 0;
+    if (!hasSkills) {
       return {
-        verificationStatus: 'profile_incomplete',
-        nextAction: 'complete_profile',
+        verificationStatus: 'cv_processing',
+        nextAction: 'wait_for_cv_extraction',
       };
     }
 
