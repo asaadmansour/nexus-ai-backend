@@ -6,18 +6,20 @@ import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
-import { FreelancerVerificationService } from './freelancer-verification.service';
+import { FreelancerAssessmentsService } from './freelancer-assessments.service';
 
 @Controller('freelancer-verification')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
 @Roles(UserRole.FREELANCER)
 export class FreelancerVerificationController {
-  constructor(
-    private readonly verificationService: FreelancerVerificationService,
-  ) {}
+  constructor(private readonly assessments: FreelancerAssessmentsService) {}
 
   @Get('me')
   async getMyVerification(@CurrentUser() user: JwtPayload) {
-    return await this.verificationService.getMyVerification(user.sub);
+    const data = await this.assessments.getVerification(
+      user.sub,
+      user.isEmailVerified === true,
+    );
+    return { status: 'success', data };
   }
 }

@@ -2,6 +2,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   JoinColumn,
   ManyToOne,
   PrimaryGeneratedColumn,
@@ -11,6 +12,11 @@ import { FreelancerAssessment } from './freelancer-assessment.entity';
 import { FreelancerAssessmentQuestion } from './freelancer-assessment-question.entity';
 
 @Entity('freelancer_assessment_answers')
+@Index(
+  'freelancer_assessment_answers_assessment_question_uidx',
+  ['assessmentId', 'questionId'],
+  { unique: true },
+)
 export class FreelancerAssessmentAnswer {
   @PrimaryGeneratedColumn('uuid')
   id: string;
