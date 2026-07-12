@@ -15,16 +15,16 @@ import { RefreshToken } from '../../auth/entities/refresh-token.entity';
 @Entity('users')
 export class User {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ name: 'first_name', type: 'varchar', length: 100 })
-  firstName: string;
+  firstName!: string;
 
   @Column({ name: 'last_name', type: 'varchar', length: 100 })
-  lastName: string;
+  lastName!: string;
 
   @Column({ type: 'citext', unique: true })
-  email: string;
+  email!: string;
 
   @Column({
     name: 'phone_number',
@@ -33,13 +33,13 @@ export class User {
     unique: true,
     nullable: true,
   })
-  phoneNumber: string | null;
+  phoneNumber!: string | null;
 
   @Column({ name: 'is_email_verified', type: 'boolean', default: false })
-  isEmailVerified: boolean;
+  isEmailVerified!: boolean;
 
   @Column({ name: 'is_id_verified', type: 'boolean', default: false })
-  isIdVerified: boolean;
+  isIdVerified!: boolean;
 
   @Column({
     name: 'hashed_password',
@@ -47,10 +47,10 @@ export class User {
     nullable: true,
     select: false,
   })
-  hashedPassword: string | null;
+  hashedPassword!: string | null;
 
   @Column({ name: 'photo_url', type: 'text', nullable: true })
-  photoUrl: string | null;
+  photoUrl!: string | null;
 
   @Column({
     type: 'enum',
@@ -58,16 +58,16 @@ export class User {
     enumName: 'user_role',
     default: UserRole.CUSTOMER,
   })
-  role: UserRole;
+  role!: UserRole;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
-  createdAt: Date;
+  createdAt!: Date;
 
   @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
-  updatedAt: Date;
+  updatedAt!: Date;
 
   @DeleteDateColumn({ name: 'deleted_at', type: 'timestamptz', nullable: true })
-  deletedAt: Date | null;
+  deletedAt!: Date | null;
 
   @OneToOne(() => FreelancerProfile, (profile) => profile.user)
   freelancerProfile?: FreelancerProfile;
