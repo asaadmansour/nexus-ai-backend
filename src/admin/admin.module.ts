@@ -8,6 +8,7 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
 import { FreelancerAssessmentQuestion } from 'src/freelancers/entities/freelancer-assessment-question.entity';
 import { FreelancerAssessmentAnswer } from 'src/freelancers/entities/freelancer-assessment-answer.entity';
+import { FreelancerAssessmentEvent } from 'src/freelancers/entities/freelancer-assessment-event.entity';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 
 @Module({
@@ -19,6 +20,7 @@ import { AgentJob } from 'src/agents/entities/agent-job.entity';
       FreelancerAssessment,
       FreelancerAssessmentQuestion,
       FreelancerAssessmentAnswer,
+      FreelancerAssessmentEvent, 
       AgentJob,
     ]),
   ],
