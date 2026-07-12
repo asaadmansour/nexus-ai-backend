@@ -8,6 +8,8 @@ import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedd
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancersController } from './freelancers.controller';
 import { FreelancersService } from './freelancers.service';
+import { FreelancerVerificationController } from './freelancer-verification.controller';
+import { FreelancerVerificationService } from './freelancer-verification.service';
 
 @Module({
   imports: [
@@ -20,8 +22,8 @@ import { FreelancersService } from './freelancers.service';
       FreelancerProfileEmbedding,
     ]),
   ],
-  controllers: [FreelancersController],
-  providers: [FreelancersService],
+  controllers: [FreelancersController, FreelancerVerificationController],
+  providers: [FreelancersService, FreelancerVerificationService],
   exports: [TypeOrmModule],
 })
 export class FreelancersModule {}
