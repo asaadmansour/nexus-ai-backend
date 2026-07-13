@@ -24,6 +24,15 @@ export class AgentJob {
   @Column({ name: 'project_id', type: 'uuid', nullable: true })
   projectId!: string | null;
 
+  @Column({ name: 'user_id', type: 'uuid', nullable: true })
+  userId!: string | null;
+
+  @Column({ name: 'freelancer_profile_id', type: 'uuid', nullable: true })
+  freelancerProfileId!: string | null;
+
+  @Column({ name: 'assessment_id', type: 'uuid', nullable: true })
+  assessmentId!: string | null;
+
   @ManyToOne(() => Project, { nullable: true, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'project_id' })
   project!: Project | null;

@@ -14,10 +14,12 @@ export const ASSESSMENT_EVENT_TYPES = [
   'autosave_failed',
 ] as const;
 
+export type AssessmentEventType = (typeof ASSESSMENT_EVENT_TYPES)[number];
+
 export class TrackAssessmentEventDto {
   @IsString()
   @IsIn(ASSESSMENT_EVENT_TYPES)
-  eventType!: string;
+  eventType!: AssessmentEventType;
 
   @IsOptional()
   @IsObject()

@@ -7,9 +7,12 @@ export class AddAssessmentAnswerUniqueConstraint1784200000000 implements Migrati
     await queryRunner.query(
       `DELETE FROM "freelancer_assessment_answers" a
        USING "freelancer_assessment_answers" b
-       WHERE a."id" < b."id"
-         AND a."assessment_id" = b."assessment_id"
-         AND a."question_id" = b."question_id"`,
+       WHERE a."assessment_id" = b."assessment_id"
+         AND a."question_id" = b."question_id"
+         AND (
+           a."updated_at" < b."updated_at"
+           OR (a."updated_at" = b."updated_at" AND a."id" < b."id")
+         )`,
     );
     await queryRunner.query(
       `CREATE UNIQUE INDEX IF NOT EXISTS "freelancer_assessment_answers_assessment_question_uidx"

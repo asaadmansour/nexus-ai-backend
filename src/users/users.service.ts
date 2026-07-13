@@ -5,13 +5,16 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { User } from 'src/users/entities/user.entity';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { UpdateUserDto } from './dtos/update-user.dto';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
 import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
+import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
+import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 
 @Injectable()
 export class UserService {
@@ -21,7 +24,12 @@ export class UserService {
     @InjectRepository(User) private readonly userRepository: Repository<User>,
     @InjectRepository(FreelancerProfile)
     private readonly freelancerProfileRepository: Repository<FreelancerProfile>,
+    @InjectRepository(FreelancerAssessment)
+    private readonly freelancerAssessmentRepository: Repository<FreelancerAssessment>,
+    @InjectRepository(FreelancerVerificationEvent)
+    private readonly verificationEventRepository: Repository<FreelancerVerificationEvent>,
     private readonly configService: ConfigService,
+    private readonly aiJobsProducer: AiJobsProducer,
   ) {
     const cloudName = this.configService.get<string>('CLOUDINARY_CLOUD_NAME');
     const apiKey = this.configService.get<string>('CLOUDINARY_API_KEY');
@@ -77,6 +85,8 @@ export class UserService {
       where: { id: userId },
       relations: ['freelancerProfile'],
     });
+    if (!existingUser) throw new NotFoundException('User not found');
+
     const oldCvPublicId = (() => {
       const oldUrl = existingUser?.freelancerProfile?.cvUrl;
       if (!oldUrl) return null;
@@ -109,10 +119,73 @@ export class UserService {
     });
 
     try {
-      await this.freelancerProfileRepository.upsert(
-        { userId, cvUrl: cvResult.secure_url },
-        { conflictPaths: ['userId'], skipUpdateIfNoValuesChanged: true },
-      );
+      const profile =
+        existingUser.freelancerProfile ??
+        this.freelancerProfileRepository.create({ userId });
+      const previousStatus = profile.verificationStatus ?? null;
+
+      profile.cvUrl = cvResult.secure_url;
+      profile.cvExtractionStatus = 'queued';
+      profile.cvExtractionError = null;
+      profile.cvExtractedAt = null;
+      profile.assessmentGenerationStatus = 'pending';
+      profile.assessmentGenerationQueuedAt = null;
+      profile.assessmentGenerationStartedAt = null;
+      profile.assessmentGeneratedAt = null;
+      profile.assessmentGenerationError = null;
+      profile.assessmentGenerationJobId = null;
+      profile.verificationStatus = 'cv_processing';
+
+      const savedProfile = await this.freelancerProfileRepository.save(profile);
+      await this.cancelOpenAssessmentsForNewCv(userId);
+      await this.recordVerificationEvent({
+        profile: savedProfile,
+        eventType: 'cv_uploaded',
+        fromStatus: previousStatus,
+        toStatus: savedProfile.verificationStatus,
+        actorType: 'freelancer',
+        actorUserId: userId,
+        metadata: {
+          cvUrl: cvResult.secure_url,
+        },
+      });
+
+      try {
+        const extractionJob = await this.aiJobsProducer.emitCvUploaded({
+          userId,
+          profileId: savedProfile.id,
+          cvUrl: cvResult.secure_url,
+        });
+
+        await this.recordVerificationEvent({
+          profile: savedProfile,
+          eventType: 'cv_extraction_queued',
+          fromStatus: savedProfile.verificationStatus,
+          toStatus: savedProfile.verificationStatus,
+          actorType: 'system',
+          metadata: {
+            agentJobId: extractionJob.id,
+            queueName: extractionJob.queueName,
+          },
+        });
+      } catch (queueError) {
+        savedProfile.cvExtractionStatus = 'failed';
+        savedProfile.cvExtractionError = this.getErrorMessage(queueError);
+        savedProfile.verificationStatus = 'cv_pending';
+        const failedProfile =
+          await this.freelancerProfileRepository.save(savedProfile);
+        await this.recordVerificationEvent({
+          profile: failedProfile,
+          eventType: 'cv_extraction_queue_failed',
+          fromStatus: 'cv_processing',
+          toStatus: failedProfile.verificationStatus,
+          actorType: 'system',
+          metadata: {
+            error: failedProfile.cvExtractionError,
+          },
+        });
+        throw queueError;
+      }
 
       if (oldCvPublicId) {
         cloudinary.uploader
@@ -224,5 +297,48 @@ export class UserService {
         );
       throw dbError;
     }
+  }
+
+  private async cancelOpenAssessmentsForNewCv(userId: string) {
+    await this.freelancerAssessmentRepository.update(
+      {
+        userId,
+        status: In(['pending', 'generating', 'ready', 'in_progress']),
+      },
+      {
+        status: 'cancelled',
+        aiFeedback: {
+          systemReason: 'cancelled_after_new_cv_upload',
+        },
+      },
+    );
+  }
+
+  private async recordVerificationEvent(input: {
+    profile: FreelancerProfile;
+    eventType: string;
+    fromStatus: string | null;
+    toStatus: string | null;
+    actorType: string;
+    actorUserId?: string | null;
+    metadata?: Record<string, unknown> | null;
+  }) {
+    await this.verificationEventRepository.save(
+      this.verificationEventRepository.create({
+        freelancerProfileId: input.profile.id,
+        userId: input.profile.userId,
+        eventType: input.eventType,
+        fromStatus: input.fromStatus,
+        toStatus: input.toStatus,
+        actorType: input.actorType,
+        actorUserId: input.actorUserId ?? null,
+        metadata: input.metadata ?? null,
+      }),
+    );
+  }
+
+  private getErrorMessage(error: unknown) {
+    if (error instanceof Error) return error.message.slice(0, 1000);
+    return 'Queue operation failed';
   }
 }

@@ -9,10 +9,14 @@ import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assess
 import { FreelancerAssessmentQuestion } from 'src/freelancers/entities/freelancer-assessment-question.entity';
 import { FreelancerAssessmentAnswer } from 'src/freelancers/entities/freelancer-assessment-answer.entity';
 import { FreelancerAssessmentEvent } from 'src/freelancers/entities/freelancer-assessment-event.entity';
+import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
+import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
+import { NotificationsModule } from 'src/notifications/notifications.module';
 
 @Module({
   imports: [
+    NotificationsModule,
     TypeOrmModule.forFeature([
       User,
       Project,
@@ -20,8 +24,10 @@ import { AgentJob } from 'src/agents/entities/agent-job.entity';
       FreelancerAssessment,
       FreelancerAssessmentQuestion,
       FreelancerAssessmentAnswer,
-      FreelancerAssessmentEvent, 
+      FreelancerAssessmentEvent,
+      FreelancerSkillScore,
       AgentJob,
+      RefreshToken,
     ]),
   ],
   controllers: [AdminController],

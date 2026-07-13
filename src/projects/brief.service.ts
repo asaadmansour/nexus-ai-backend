@@ -152,8 +152,7 @@ export class BriefService {
       : this.getRevisionCount(brief);
     brief.isComplete = isComplete;
     brief.completedAt = brief.completedAt ?? (isComplete ? new Date() : null);
-    brief.aiDecided = {
-      ...(brief.aiDecided ?? {}),
+    this.setBriefWorkflowState(brief, {
       missingFields: visibleMissingFields,
       completionPercentage: aiResult.completionPercentage,
       extractedFields: extractedFields ?? null,
@@ -161,16 +160,13 @@ export class BriefService {
         wasComplete && nextRevisionCount < MAX_AI_REVISION_MESSAGES,
       revisionCount: nextRevisionCount,
       revisionLimit: MAX_AI_REVISION_MESSAGES,
-      confirmedAt: wasComplete
-        ? null
-        : this.asPlainObject(brief.aiDecided)?.confirmedAt,
+      confirmedAt: wasComplete ? null : brief.confirmedAt,
       pendingField: aiResult.nextQuestionField ?? null,
       nextQuestionField: aiResult.nextQuestionField ?? null,
-      fastPathUsed: aiResult.fastPathUsed ?? false,
-      fastPathReason: aiResult.fastPathReason ?? null,
       extractionSource: aiResult.extractionSource ?? aiResult.source,
-      source: aiResult.source,
-    };
+      aiSource: aiResult.source,
+    });
+    brief.aiDecided = this.buildAiDiagnostics(brief.aiDecided, aiResult);
     this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
 
     return this.dataSource.transaction(async (manager) => {
@@ -225,8 +221,7 @@ export class BriefService {
     brief.isComplete = missingFields.length === 0;
     brief.completedAt =
       brief.completedAt ?? (brief.isComplete ? new Date() : null);
-    brief.aiDecided = {
-      ...(brief.aiDecided ?? {}),
+    this.setBriefWorkflowState(brief, {
       missingFields,
       completionPercentage:
         this.getCompletionPercentageFromMissingFields(missingFields),
@@ -235,8 +230,14 @@ export class BriefService {
       revisionCount: this.getRevisionCount(brief),
       revisionLimit: MAX_AI_REVISION_MESSAGES,
       confirmedAt: null,
+      pendingField: null,
+      nextQuestionField: null,
+      manuallyEditedAt: new Date(),
+    });
+    brief.aiDecided = this.stripWorkflowStateFromAiDecided({
+      ...(brief.aiDecided ?? {}),
       manuallyEditedAt: new Date().toISOString(),
-    };
+    });
 
     return this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
@@ -273,14 +274,14 @@ export class BriefService {
       );
     }
 
-    brief.aiDecided = {
-      ...(brief.aiDecided ?? {}),
+    this.setBriefWorkflowState(brief, {
       aiRevisionOpen: true,
       revisionCount,
       revisionLimit: MAX_AI_REVISION_MESSAGES,
       confirmedAt: null,
-      reopenedAt: new Date().toISOString(),
-    };
+      reopenedAt: new Date(),
+    });
+    brief.aiDecided = this.stripWorkflowStateFromAiDecided(brief.aiDecided);
     const updatedBrief = await this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
 
@@ -333,16 +334,18 @@ export class BriefService {
 
     brief.isComplete = true;
     brief.completedAt = brief.completedAt ?? new Date();
-    brief.aiDecided = {
-      ...(brief.aiDecided ?? {}),
+    this.setBriefWorkflowState(brief, {
       missingFields: [],
       completionPercentage: 100,
       aiRevisionOpen: false,
       revisionCount: this.getRevisionCount(brief),
       revisionLimit: MAX_AI_REVISION_MESSAGES,
-      confirmedAt: new Date().toISOString(),
+      confirmedAt: new Date(),
       confirmedBy: userId,
-    };
+      pendingField: null,
+      nextQuestionField: null,
+    });
+    brief.aiDecided = this.stripWorkflowStateFromAiDecided(brief.aiDecided);
 
     return this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
@@ -502,16 +505,16 @@ export class BriefService {
         aiResult.missingFields,
       );
 
-      brief.aiDecided = {
-        ...(brief.aiDecided ?? {}),
+      this.setBriefWorkflowState(brief, {
         missingFields,
         completionPercentage: aiResult.completionPercentage,
         extractedFields: extractedFields ?? null,
         pendingField: aiResult.nextQuestionField ?? null,
         nextQuestionField: aiResult.nextQuestionField ?? null,
         extractionSource: aiResult.extractionSource ?? aiResult.source,
-        source: aiResult.source,
-      };
+        aiSource: aiResult.source,
+      });
+      brief.aiDecided = this.buildAiDiagnostics(brief.aiDecided, aiResult);
       this.applyExtractedFieldsToBrief(brief, extractedFields, '');
       await this.briefRepo.save(brief);
 
@@ -544,8 +547,7 @@ export class BriefService {
     if (!brief.isComplete) return;
 
     this.assertBriefCanChange(project);
-    const aiDecided = this.asPlainObject(brief.aiDecided) ?? {};
-    const aiRevisionOpen = aiDecided.aiRevisionOpen === true;
+    const aiRevisionOpen = this.getAiRevisionOpen(brief);
 
     if (!aiRevisionOpen) {
       throw new BadRequestException(
@@ -642,14 +644,7 @@ export class BriefService {
       this.buildKnownFieldsFromBrief(brief),
       extraKnownFields,
     );
-    const aiDecided = this.asPlainObject(brief.aiDecided) ?? {};
-    const pendingField =
-      aiDecided &&
-      typeof aiDecided === 'object' &&
-      !Array.isArray(aiDecided) &&
-      'pendingField' in aiDecided
-        ? (aiDecided.pendingField as string | null)
-        : null;
+    const pendingField = this.getPendingField(brief);
 
     return {
       id: brief.id,
@@ -658,11 +653,26 @@ export class BriefService {
       projectContext: projectContext ?? null,
       conversationMode: conversationMode ?? null,
       pendingField,
+      missingFields: this.getMissingFields(brief),
+      completionPercentage: this.getCompletionPercentage(brief),
+      aiRevisionOpen: this.getAiRevisionOpen(brief),
+      revisionCount: this.getRevisionCount(brief),
+      revisionLimit: this.getRevisionLimit(brief),
+      confirmedAt: brief.confirmedAt?.toISOString() ?? null,
+      confirmedBy: brief.confirmedBy,
       isComplete: brief.isComplete,
       completedAt: brief.completedAt?.toISOString() ?? null,
       summary: brief.summary,
       projectType: brief.projectType,
       domain: brief.domain,
+      mainGoal: brief.mainGoal,
+      targetUsers: brief.targetUsers,
+      coreFeatures: brief.coreFeatures,
+      platforms: brief.platforms,
+      budget: brief.budget,
+      deadline: brief.deadlineText,
+      deliverablesText: brief.deliverablesText,
+      constraintsPreferences: brief.constraintsPreferences,
       technical: brief.technical,
       nonFunctional: brief.nonFunctional,
       deliverables: brief.deliverables,
@@ -692,6 +702,39 @@ export class BriefService {
 
     const domain = this.toSingleLineText(fields.businessDomain, 100);
     if (domain) brief.domain = domain;
+
+    const mainGoal = this.toTextValue(fields.mainGoal);
+    if (mainGoal) brief.mainGoal = this.truncate(mainGoal, 1000);
+
+    const targetUsers = this.toStringList(fields.targetUsers).join(', ');
+    if (targetUsers) brief.targetUsers = this.truncate(targetUsers, 1000);
+
+    const coreFeatures = this.toStringList(fields.coreFeatures).join(', ');
+    if (coreFeatures) brief.coreFeatures = this.truncate(coreFeatures, 1500);
+
+    const platforms = this.toStringList(fields.platforms).join(', ');
+    if (platforms) brief.platforms = this.truncate(platforms, 500);
+
+    const budget = this.toTextValue(fields.budget);
+    if (budget) brief.budget = this.truncate(budget, 500);
+
+    const deadline = this.toTextValue(fields.deadline);
+    if (deadline) brief.deadlineText = this.truncate(deadline, 500);
+
+    const deliverablesText = this.toStringList(fields.deliverables).join(', ');
+    if (deliverablesText) {
+      brief.deliverablesText = this.truncate(deliverablesText, 1000);
+    }
+
+    const constraintsPreferences = this.toStringList(
+      fields.constraintsPreferences,
+    ).join(', ');
+    if (constraintsPreferences) {
+      brief.constraintsPreferences = this.truncate(
+        constraintsPreferences,
+        1000,
+      );
+    }
 
     const clientBackground = this.toSingleLineText(fields.clientBackground, 40);
     if (clientBackground) brief.clientBackground = clientBackground;
@@ -754,14 +797,15 @@ export class BriefService {
       suggestedTeamSize: brief.suggestedTeamSize,
       experienceLevel: brief.experienceLevel,
       experienceMinYears: brief.experienceMinYears,
-      mainGoal: technical.mainGoal,
-      targetUsers: technical.targetUsers,
-      coreFeatures: technical.coreFeatures,
-      platforms: technical.platforms,
-      budget: nonFunctional.budget,
-      deadline: nonFunctional.deadline,
-      constraintsPreferences: nonFunctional.constraintsPreferences,
-      deliverables: deliverables.items,
+      mainGoal: brief.mainGoal ?? technical.mainGoal,
+      targetUsers: brief.targetUsers ?? technical.targetUsers,
+      coreFeatures: brief.coreFeatures ?? technical.coreFeatures,
+      platforms: brief.platforms ?? technical.platforms,
+      budget: brief.budget ?? nonFunctional.budget,
+      deadline: brief.deadlineText ?? nonFunctional.deadline,
+      constraintsPreferences:
+        brief.constraintsPreferences ?? nonFunctional.constraintsPreferences,
+      deliverables: brief.deliverablesText ?? deliverables.items,
     });
 
     return Object.keys(knownFields).length > 0 ? knownFields : null;
@@ -770,6 +814,9 @@ export class BriefService {
   private getStoredExtractedFields(
     brief: Brief,
   ): ExtractedBriefFields | undefined {
+    const stored = this.asPlainObject(brief.extractedFields);
+    if (stored && Object.keys(stored).length > 0) return stored;
+
     const aiDecided = this.asPlainObject(brief.aiDecided);
     const extractedFields = this.asPlainObject(aiDecided?.extractedFields);
 
@@ -963,6 +1010,116 @@ export class BriefService {
     return value as Record<string, unknown>;
   }
 
+  private setBriefWorkflowState(
+    brief: Brief,
+    state: {
+      missingFields?: string[];
+      completionPercentage?: number;
+      extractedFields?: ExtractedBriefFields | null;
+      aiRevisionOpen?: boolean;
+      revisionCount?: number;
+      revisionLimit?: number;
+      confirmedAt?: Date | null;
+      confirmedBy?: string | null;
+      manuallyEditedAt?: Date | null;
+      reopenedAt?: Date | null;
+      pendingField?: string | null;
+      nextQuestionField?: string | null;
+      extractionSource?: string | null;
+      aiSource?: string | null;
+    },
+  ) {
+    if (state.missingFields !== undefined) {
+      brief.missingFields = state.missingFields;
+    }
+    if (state.completionPercentage !== undefined) {
+      brief.completionPercentage = Math.min(
+        100,
+        Math.max(0, Math.round(state.completionPercentage)),
+      );
+    }
+    if (state.extractedFields !== undefined) {
+      brief.extractedFields = state.extractedFields;
+    }
+    if (state.aiRevisionOpen !== undefined) {
+      brief.aiRevisionOpen = state.aiRevisionOpen;
+    }
+    if (state.revisionCount !== undefined) {
+      brief.revisionCount = state.revisionCount;
+    }
+    if (state.revisionLimit !== undefined) {
+      brief.revisionLimit = state.revisionLimit;
+    }
+    if (state.confirmedAt !== undefined) {
+      brief.confirmedAt = state.confirmedAt;
+    }
+    if (state.confirmedBy !== undefined) {
+      brief.confirmedBy = state.confirmedBy;
+    }
+    if (state.manuallyEditedAt !== undefined) {
+      brief.manuallyEditedAt = state.manuallyEditedAt;
+    }
+    if (state.reopenedAt !== undefined) {
+      brief.reopenedAt = state.reopenedAt;
+    }
+    if (state.pendingField !== undefined) {
+      brief.pendingField = state.pendingField;
+    }
+    if (state.nextQuestionField !== undefined) {
+      brief.nextQuestionField = state.nextQuestionField;
+    }
+    if (state.extractionSource !== undefined) {
+      brief.extractionSource = state.extractionSource;
+    }
+    if (state.aiSource !== undefined) {
+      brief.aiSource = state.aiSource;
+    }
+  }
+
+  private buildAiDiagnostics(
+    current: Record<string, unknown> | null,
+    aiResult: {
+      fastPathUsed?: boolean;
+      fastPathReason?: string | null;
+    },
+  ) {
+    const diagnostics = this.stripWorkflowStateFromAiDecided(current) ?? {};
+
+    diagnostics.fastPathUsed = aiResult.fastPathUsed ?? false;
+    diagnostics.fastPathReason = aiResult.fastPathReason ?? null;
+
+    return Object.keys(diagnostics).length > 0 ? diagnostics : null;
+  }
+
+  private stripWorkflowStateFromAiDecided(
+    current: Record<string, unknown> | null,
+  ) {
+    const source = this.asPlainObject(current);
+    if (!source) return null;
+
+    const rest = { ...source };
+    for (const key of [
+      'missingFields',
+      'completionPercentage',
+      'extractedFields',
+      'aiRevisionOpen',
+      'revisionCount',
+      'revisionLimit',
+      'confirmedAt',
+      'confirmedBy',
+      'manuallyEditedAt',
+      'reopenedAt',
+      'pendingField',
+      'nextQuestionField',
+      'extractionSource',
+      'source',
+    ]) {
+      delete rest[key];
+    }
+
+    return Object.keys(rest).length > 0 ? rest : null;
+  }
+
   private truncate(value: string, maxLength: number): string {
     return value.length > maxLength ? value.slice(0, maxLength) : value;
   }
@@ -986,11 +1143,73 @@ export class BriefService {
   }
 
   private getRevisionCount(brief: Brief) {
+    if (
+      typeof brief.revisionCount === 'number' &&
+      Number.isFinite(brief.revisionCount)
+    ) {
+      return brief.revisionCount;
+    }
+
     const aiDecided = this.asPlainObject(brief.aiDecided);
     const revisionCount = aiDecided?.revisionCount;
 
     return typeof revisionCount === 'number' && Number.isFinite(revisionCount)
       ? revisionCount
+      : 0;
+  }
+
+  private getRevisionLimit(brief: Brief) {
+    if (
+      typeof brief.revisionLimit === 'number' &&
+      Number.isFinite(brief.revisionLimit)
+    ) {
+      return brief.revisionLimit;
+    }
+
+    const aiDecided = this.asPlainObject(brief.aiDecided);
+    const revisionLimit = aiDecided?.revisionLimit;
+
+    return typeof revisionLimit === 'number' && Number.isFinite(revisionLimit)
+      ? revisionLimit
+      : MAX_AI_REVISION_MESSAGES;
+  }
+
+  private getAiRevisionOpen(brief: Brief) {
+    if (typeof brief.aiRevisionOpen === 'boolean') return brief.aiRevisionOpen;
+    return this.asPlainObject(brief.aiDecided)?.aiRevisionOpen === true;
+  }
+
+  private getPendingField(brief: Brief) {
+    if (brief.pendingField) return brief.pendingField;
+    const pendingField = this.asPlainObject(brief.aiDecided)?.pendingField;
+    return typeof pendingField === 'string' ? pendingField : null;
+  }
+
+  private getMissingFields(brief: Brief) {
+    if (Array.isArray(brief.missingFields)) return brief.missingFields;
+
+    const missingFields = this.asPlainObject(brief.aiDecided)?.missingFields;
+    return Array.isArray(missingFields)
+      ? missingFields
+          .map((field) => this.toSingleLineText(field, 80))
+          .filter((field): field is string => Boolean(field))
+      : [];
+  }
+
+  private getCompletionPercentage(brief: Brief) {
+    if (
+      typeof brief.completionPercentage === 'number' &&
+      Number.isFinite(brief.completionPercentage)
+    ) {
+      return brief.completionPercentage;
+    }
+
+    const completionPercentage = this.asPlainObject(
+      brief.aiDecided,
+    )?.completionPercentage;
+    return typeof completionPercentage === 'number' &&
+      Number.isFinite(completionPercentage)
+      ? completionPercentage
       : 0;
   }
 

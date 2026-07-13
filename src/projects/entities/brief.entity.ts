@@ -57,6 +57,30 @@ export class Brief {
   @Column({ type: 'varchar', length: 100, nullable: true })
   domain: string | null;
 
+  @Column({ name: 'main_goal', type: 'text', nullable: true })
+  mainGoal: string | null;
+
+  @Column({ name: 'target_users', type: 'text', nullable: true })
+  targetUsers: string | null;
+
+  @Column({ name: 'core_features', type: 'text', nullable: true })
+  coreFeatures: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  platforms: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  budget: string | null;
+
+  @Column({ name: 'deadline_text', type: 'text', nullable: true })
+  deadlineText: string | null;
+
+  @Column({ name: 'deliverables_text', type: 'text', nullable: true })
+  deliverablesText: string | null;
+
+  @Column({ name: 'constraints_preferences', type: 'text', nullable: true })
+  constraintsPreferences: string | null;
+
   @Column({ type: 'jsonb', nullable: true })
   technical: Record<string, unknown> | null;
 
@@ -94,6 +118,63 @@ export class Brief {
 
   @Column({ name: 'experience_min_years', type: 'int', nullable: true })
   experienceMinYears: number | null;
+
+  @Column({ name: 'missing_fields', type: 'text', array: true, default: '{}' })
+  missingFields: string[];
+
+  @Column({ name: 'completion_percentage', type: 'int', default: 0 })
+  completionPercentage: number;
+
+  @Column({ name: 'ai_revision_open', type: 'boolean', default: false })
+  aiRevisionOpen: boolean;
+
+  @Column({ name: 'revision_count', type: 'int', default: 0 })
+  revisionCount: number;
+
+  @Column({ name: 'revision_limit', type: 'int', default: 3 })
+  revisionLimit: number;
+
+  @Column({ name: 'confirmed_at', type: 'timestamptz', nullable: true })
+  confirmedAt: Date | null;
+
+  @Column({ name: 'confirmed_by', type: 'uuid', nullable: true })
+  confirmedBy: string | null;
+
+  @Column({ name: 'manually_edited_at', type: 'timestamptz', nullable: true })
+  manuallyEditedAt: Date | null;
+
+  @Column({ name: 'reopened_at', type: 'timestamptz', nullable: true })
+  reopenedAt: Date | null;
+
+  @Column({
+    name: 'pending_field',
+    type: 'varchar',
+    length: 80,
+    nullable: true,
+  })
+  pendingField: string | null;
+
+  @Column({
+    name: 'next_question_field',
+    type: 'varchar',
+    length: 80,
+    nullable: true,
+  })
+  nextQuestionField: string | null;
+
+  @Column({
+    name: 'extraction_source',
+    type: 'varchar',
+    length: 80,
+    nullable: true,
+  })
+  extractionSource: string | null;
+
+  @Column({ name: 'ai_source', type: 'varchar', length: 40, nullable: true })
+  aiSource: string | null;
+
+  @Column({ name: 'extracted_fields', type: 'jsonb', nullable: true })
+  extractedFields: Record<string, unknown> | null;
 
   @Column({ name: 'ai_decided', type: 'jsonb', nullable: true })
   aiDecided: Record<string, unknown> | null;

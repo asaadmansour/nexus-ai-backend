@@ -7,6 +7,7 @@ import {
   IsBoolean,
   MaxLength,
   Min,
+  Max,
   ArrayMaxSize,
 } from 'class-validator';
 
@@ -41,4 +42,10 @@ export class UpdateFreelancerDto {
   @IsOptional()
   @IsBoolean()
   isAvailable?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(168)
+  availabilityHoursPerWeek?: number;
 }

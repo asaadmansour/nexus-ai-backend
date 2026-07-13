@@ -6,7 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { Notification } from 'src/notifications/entities/notification.entity';
@@ -16,13 +16,13 @@ import { FreelancerAssessmentAnswer } from './entities/freelancer-assessment-ans
 import { FreelancerAssessmentEvent } from './entities/freelancer-assessment-event.entity';
 import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-question.entity';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
-import { StartAssessmentDto } from './dtos/start-assessment.dto';
+import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
+import { FreelancerVerificationEvent } from './entities/freelancer-verification-event.entity';
 import { SaveAssessmentAnswersDto } from './dtos/save-assessment-answers.dto';
 import { SubmitAssessmentDto } from './dtos/submit-assessment.dto';
 import { TrackAssessmentEventDto } from './dtos/track-assessment-event.dto';
 
-const DEFAULT_QUESTION_COUNT = 6;
-const DEFAULT_DURATION_SECONDS = 1800;
+const MAX_WARNING_COUNT = 3;
 const ACTIVE_STATUS = 'in_progress';
 const SUBMITTED_STATUSES = new Set([
   'submitted',
@@ -32,7 +32,6 @@ const SUBMITTED_STATUSES = new Set([
   'failed',
 ]);
 const WARNING_EVENT_TYPES = [
-  'focus_lost',
   'fullscreen_exit',
   'visibility_hidden',
   'copy_attempt',
@@ -45,24 +44,10 @@ const ANTI_CHEAT = {
   requireFullscreen: true,
 };
 
-interface GeneratedQuestion {
-  questionType: string;
-  skill?: string | null;
-  difficulty?: string | null;
-  prompt: string;
-  choices?: Record<string, unknown> | unknown[] | null;
-  rubric?: Record<string, unknown> | null;
-  orderIndex?: number;
-}
-
-interface GeneratedAssessment {
-  durationSeconds?: number;
-  questions: GeneratedQuestion[];
-}
-
 interface GradedQuestionResult {
   questionId: string;
   score?: number;
+  maxScore?: number;
   feedback?: string;
 }
 
@@ -71,6 +56,8 @@ interface GradedAssessment {
   maxScore?: number;
   recommendation?: string;
   feedback?: string;
+  profileSummary?: string;
+  graderConfidence?: number;
   questionResults?: GradedQuestionResult[];
 }
 
@@ -87,6 +74,8 @@ export class FreelancerAssessmentsService {
     private readonly answerRepo: Repository<FreelancerAssessmentAnswer>,
     @InjectRepository(FreelancerAssessmentEvent)
     private readonly eventRepo: Repository<FreelancerAssessmentEvent>,
+    @InjectRepository(FreelancerSkillScore)
+    private readonly skillScoreRepo: Repository<FreelancerSkillScore>,
     private readonly aiService: AiService,
     private readonly dataSource: DataSource,
   ) {}
@@ -99,7 +88,13 @@ export class FreelancerAssessmentsService {
     const profile = await this.getProfileWithUser(userId);
     const latest = await this.getLatestAssessment(userId);
 
-    const profileComplete = this.isProfileComplete(profile);
+    const skillScoreCount = await this.skillScoreRepo.count({
+      where: { freelancerProfileId: profile.id },
+    });
+    const profileComplete = this.isAssessmentProfileComplete(
+      profile,
+      skillScoreCount,
+    );
     const cvUploaded = Boolean(profile.cvUrl);
     const cvExtracted = this.isCvExtracted(profile);
     const missing = this.getMissingProfilePieces(profile);
@@ -120,6 +115,14 @@ export class FreelancerAssessmentsService {
       emailVerified,
       cvUploaded,
       cvExtracted,
+      cvExtractionStatus: profile.cvExtractionStatus,
+      cvExtractedAt: profile.cvExtractedAt,
+      cvExtractionError: profile.cvExtractionError,
+      assessmentGenerationStatus: profile.assessmentGenerationStatus,
+      assessmentGenerationQueuedAt: profile.assessmentGenerationQueuedAt,
+      assessmentGenerationStartedAt: profile.assessmentGenerationStartedAt,
+      assessmentGeneratedAt: profile.assessmentGeneratedAt,
+      assessmentGenerationError: profile.assessmentGenerationError,
       nextAction,
       assessment: latest ? this.toAssessmentSummary(latest) : null,
       missing,
@@ -130,102 +133,103 @@ export class FreelancerAssessmentsService {
   // Freelancer: start / reuse assessment
   // ---------------------------------------------------------------------------
 
-  async start(userId: string, dto: StartAssessmentDto) {
-    const profile = await this.getProfileWithUser(userId);
+  async start(userId: string) {
+    const assessment = await this.dataSource.transaction(async (manager) => {
+      const profile = await manager
+        .getRepository(FreelancerProfile)
+        .createQueryBuilder('profile')
+        .setLock('pessimistic_write')
+        .where('profile.userId = :userId', { userId })
+        .getOne();
 
-    if (!profile.cvUrl) {
-      throw new BadRequestException(
-        'Upload your CV before starting the assessment',
-      );
-    }
-
-    const skills = (profile.skills ?? []).filter((skill) => skill?.trim());
-    if (skills.length === 0) {
-      throw new BadRequestException(
-        'Add at least one skill to your profile before starting the assessment',
-      );
-    }
-
-    const latest = await this.getLatestAssessment(userId);
-
-    if (latest && latest.status === ACTIVE_STATUS) {
-      if (!this.isExpired(latest)) {
-        const questions = await this.getSafeQuestions(latest.id);
-        return this.buildStartResponse(latest, questions);
+      if (!profile) {
+        throw new NotFoundException('Freelancer profile not found');
       }
-      latest.status = 'expired';
-      await this.assessmentRepo.save(latest);
-    }
 
-    if (latest && SUBMITTED_STATUSES.has(latest.status)) {
-      throw new ConflictException(
-        'Your latest assessment is already submitted and waiting for review',
+      this.getAssessmentStartInputs(profile);
+      const latest = await this.getLatestAssessment(userId, manager);
+
+      if (latest && latest.status === ACTIVE_STATUS) {
+        if (!this.isExpired(latest)) {
+          return latest;
+        }
+        latest.status = 'expired';
+        await manager.save(FreelancerAssessment, latest);
+      }
+
+      if (latest && SUBMITTED_STATUSES.has(latest.status)) {
+        throw new ConflictException(
+          'Your latest assessment is already submitted and waiting for review',
+        );
+      }
+
+      if (latest?.status === 'generating' || latest?.status === 'pending') {
+        throw new ConflictException(
+          'Your assessment is still being prepared. Please try again shortly.',
+        );
+      }
+
+      const readyAssessment =
+        latest?.status === 'ready'
+          ? latest
+          : await manager.findOne(FreelancerAssessment, {
+              where: { userId, status: 'ready' },
+              order: { createdAt: 'DESC' },
+            });
+
+      if (!readyAssessment) {
+        if (profile.assessmentGenerationStatus === 'failed') {
+          throw new BadRequestException(
+            'Assessment generation failed. Please upload your CV again or contact support.',
+          );
+        }
+
+        throw new ConflictException(
+          'Your assessment is still being prepared. Please try again shortly.',
+        );
+      }
+
+      const questionCount = await manager.count(FreelancerAssessmentQuestion, {
+        where: { assessmentId: readyAssessment.id },
+      });
+      if (questionCount === 0) {
+        throw new BadRequestException(
+          'Your assessment is not ready yet. Please try again shortly.',
+        );
+      }
+
+      const startedAt = new Date();
+      const expiresAt = new Date(
+        startedAt.getTime() + readyAssessment.durationSeconds * 1000,
       );
-    }
+      readyAssessment.status = ACTIVE_STATUS;
+      readyAssessment.startedAt = startedAt;
+      readyAssessment.expiresAt = expiresAt;
+      readyAssessment.submittedAt = null;
+      await manager.save(FreelancerAssessment, readyAssessment);
 
-    const questionCount = dto.questionCount ?? DEFAULT_QUESTION_COUNT;
-    const durationSeconds = dto.durationSeconds ?? DEFAULT_DURATION_SECONDS;
-
-    // AiService currently returns mock data synchronously; wrap so this keeps
-    // working once Muhanad swaps in the async FastAPI-backed client.
-    const generated = (await Promise.resolve(
-      this.aiService.generateAssessment({
-        cvUrl: profile.cvUrl,
-        skills,
-        yearsExperience: profile.yearsExperience ?? undefined,
-        headline: profile.headline ?? undefined,
-        questionCount,
-        durationSeconds,
-      }),
-    )) as GeneratedAssessment;
-
-    if (!generated?.questions?.length) {
-      throw new BadRequestException(
-        'The assessment generator did not return any questions. Please try again.',
-      );
-    }
-
-    const finalDuration = generated.durationSeconds ?? durationSeconds;
-    const startedAt = new Date();
-    const expiresAt = new Date(startedAt.getTime() + finalDuration * 1000);
-
-    const created = await this.dataSource.transaction(async (manager) => {
-      const assessment = await manager.save(
-        FreelancerAssessment,
-        manager.create(FreelancerAssessment, {
-          userId,
-          freelancerProfileId: profile.id,
-          status: ACTIVE_STATUS,
-          durationSeconds: finalDuration,
-          startedAt,
-          expiresAt,
-          submittedAt: null,
-          generatedFromCvUrl: profile.cvUrl,
-        }),
-      );
-
-      const questions = generated.questions.map((question, index) =>
-        manager.create(FreelancerAssessmentQuestion, {
-          assessmentId: assessment.id,
-          questionType: question.questionType,
-          skill: question.skill ?? null,
-          difficulty: question.difficulty ?? null,
-          prompt: question.prompt,
-          choices: this.normalizeChoices(question.choices),
-          rubric: question.rubric ?? null,
-          orderIndex: question.orderIndex ?? index + 1,
-        }),
-      );
-      await manager.save(FreelancerAssessmentQuestion, questions);
-
+      const previousStatus = profile.verificationStatus ?? null;
       profile.verificationStatus = 'assessment_in_progress';
       await manager.save(FreelancerProfile, profile);
+      await this.recordVerificationEvent(manager, {
+        profile,
+        eventType: 'assessment_started',
+        fromStatus: previousStatus,
+        toStatus: profile.verificationStatus,
+        actorType: 'freelancer',
+        actorUserId: userId,
+        metadata: {
+          assessmentId: readyAssessment.id,
+          questionCount,
+          durationSeconds: readyAssessment.durationSeconds,
+        },
+      });
 
-      return assessment;
+      return readyAssessment;
     });
 
-    const safeQuestions = await this.getSafeQuestions(created.id);
-    return this.buildStartResponse(created, safeQuestions);
+    const safeQuestions = await this.getSafeQuestions(assessment.id);
+    return this.buildStartResponse(assessment, safeQuestions);
   }
 
   // ---------------------------------------------------------------------------
@@ -280,21 +284,102 @@ export class FreelancerAssessmentsService {
   // ---------------------------------------------------------------------------
 
   async trackEvent(userId: string, id: string, dto: TrackAssessmentEventDto) {
-    const assessment = await this.getOwnedAssessment(userId, id);
+    return this.dataSource.transaction(async (manager) => {
+      const assessment = await manager
+        .getRepository(FreelancerAssessment)
+        .createQueryBuilder('assessment')
+        .setLock('pessimistic_write')
+        .where('assessment.id = :id', { id })
+        .andWhere('assessment.userId = :userId', { userId })
+        .getOne();
 
-    const event = await this.eventRepo.save(
-      this.eventRepo.create({
-        assessmentId: assessment.id,
-        eventType: dto.eventType,
-        metadata: dto.metadata ?? null,
+      if (!assessment) throw new NotFoundException('Assessment not found');
+
+      const event = await manager.save(
+        FreelancerAssessmentEvent,
+        manager.create(FreelancerAssessmentEvent, {
+          assessmentId: assessment.id,
+          eventType: dto.eventType,
+          metadata: dto.metadata ?? null,
+        }),
+      );
+
+      const warningsCount = await this.getWarningCount(assessment.id, manager);
+      let cancelled = false;
+
+      if (
+        assessment.status === ACTIVE_STATUS &&
+        WARNING_EVENT_TYPES.includes(dto.eventType) &&
+        warningsCount >= MAX_WARNING_COUNT
+      ) {
+        cancelled = true;
+        await this.cancelForWarnings(assessment, warningsCount, manager);
+      }
+
+      return {
+        id: event.id,
+        eventType: event.eventType,
+        warningsCount,
+        cancelled,
+        createdAt: event.createdAt,
+      };
+    });
+  }
+
+  private async cancelForWarnings(
+    assessment: FreelancerAssessment,
+    warningsCount: number,
+    manager: EntityManager,
+  ) {
+    const cancelledAt = new Date();
+    assessment.status = 'failed';
+    assessment.submittedAt = cancelledAt;
+    assessment.score = '0';
+    assessment.aiFeedback = {
+      recommendation: 'fail',
+      feedback:
+        'Assessment automatically cancelled after repeated integrity warnings.',
+      maxScore: 100,
+      questionResults: [],
+      reason: 'anti_cheat_cancelled',
+      warningsCount,
+    };
+    await manager.save(FreelancerAssessment, assessment);
+
+    const profile = await manager.findOne(FreelancerProfile, {
+      where: { id: assessment.freelancerProfileId },
+    });
+    if (profile) {
+      const previousStatus = profile.verificationStatus ?? null;
+      profile.verificationStatus = 'rejected';
+      profile.assessmentScore = '0';
+      profile.assessmentSubmittedAt = cancelledAt;
+      profile.rejectedAt = cancelledAt;
+      profile.rejectionReason =
+        'Assessment automatically cancelled after repeated integrity warnings.';
+      await manager.save(FreelancerProfile, profile);
+      await this.recordVerificationEvent(manager, {
+        profile,
+        eventType: 'assessment_cancelled',
+        fromStatus: previousStatus,
+        toStatus: profile.verificationStatus,
+        actorType: 'system',
+        metadata: {
+          assessmentId: assessment.id,
+          warningsCount,
+          reason: 'anti_cheat_cancelled',
+        },
+      });
+    }
+
+    await manager.save(
+      Notification,
+      manager.create(Notification, {
+        userId: assessment.userId,
+        title: 'Assessment cancelled',
+        body: 'Your assessment was cancelled after repeated integrity warnings.',
       }),
     );
-
-    return {
-      id: event.id,
-      eventType: event.eventType,
-      createdAt: event.createdAt,
-    };
   }
 
   // ---------------------------------------------------------------------------
@@ -307,9 +392,8 @@ export class FreelancerAssessmentsService {
     if (owned.status !== ACTIVE_STATUS) {
       return this.buildSubmitResponse(await this.reloadAssessment(id));
     }
-
-    if (dto.finalAnswers?.length) {
-      await this.upsertAnswers(id, dto.finalAnswers);
+    if (this.isExpired(owned)) {
+      throw new BadRequestException('This assessment has expired');
     }
 
     const claimed = await this.dataSource.transaction(async (manager) => {
@@ -322,6 +406,13 @@ export class FreelancerAssessmentsService {
 
       if (!locked || locked.status !== ACTIVE_STATUS) {
         return null;
+      }
+      if (this.isExpired(locked)) {
+        throw new BadRequestException('This assessment has expired');
+      }
+
+      if (dto.finalAnswers?.length) {
+        await this.upsertAnswers(id, dto.finalAnswers, manager);
       }
 
       const questions = await manager.find(FreelancerAssessmentQuestion, {
@@ -375,6 +466,7 @@ export class FreelancerAssessmentsService {
         recommendation: grade.recommendation ?? null,
         feedback: grade.feedback ?? null,
         maxScore: grade.maxScore ?? 100,
+        profileSummary: grade.profileSummary ?? null,
         questionResults: grade.questionResults ?? [],
         reason: dto.reason ?? 'manual_submit',
       };
@@ -384,10 +476,57 @@ export class FreelancerAssessmentsService {
         where: { id: locked.freelancerProfileId },
       });
       if (profile) {
+        const previousStatus = profile.verificationStatus ?? null;
+        const skillScores = this.buildSkillScores({
+          assessmentId: locked.id,
+          userId,
+          freelancerProfileId: profile.id,
+          questions,
+          results: grade.questionResults ?? [],
+          graderConfidence: grade.graderConfidence ?? null,
+        });
+        if (skillScores.length > 0) {
+          await manager.upsert(FreelancerSkillScore, skillScores, [
+            'freelancerProfileId',
+            'skill',
+          ]);
+        }
+
         profile.verificationStatus = 'assessment_submitted';
         profile.assessmentScore = score;
         profile.assessmentSubmittedAt = submittedAt;
+        profile.summary = {
+          profileSummary:
+            grade.profileSummary ??
+            this.buildFallbackProfileSummary(grade, skillScores),
+          skillRatings: skillScores.map((skillScore) => ({
+            skill: skillScore.skill,
+            score: Number(skillScore.score),
+            confidence:
+              skillScore.confidence == null
+                ? null
+                : Number(skillScore.confidence),
+            evidence: skillScore.evidence,
+          })),
+          assessmentId: locked.id,
+          generatedAt: submittedAt.toISOString(),
+          overallScore: grade.score ?? null,
+          recommendation: grade.recommendation ?? null,
+        };
         await manager.save(FreelancerProfile, profile);
+        await this.recordVerificationEvent(manager, {
+          profile,
+          eventType: 'assessment_submitted',
+          fromStatus: previousStatus,
+          toStatus: profile.verificationStatus,
+          actorType: 'freelancer',
+          actorUserId: userId,
+          metadata: {
+            assessmentId: locked.id,
+            score,
+            recommendation: grade.recommendation ?? null,
+          },
+        });
       }
 
       await manager.save(
@@ -433,6 +572,8 @@ export class FreelancerAssessmentsService {
       status: assessment.status,
       score: assessment.score,
       durationSeconds: assessment.durationSeconds,
+      generatedAt: assessment.generatedAt,
+      generationError: assessment.generationError,
       startedAt: assessment.startedAt,
       submittedAt: assessment.submittedAt,
       warningsCount: warningCounts.get(assessment.id) ?? 0,
@@ -479,6 +620,9 @@ export class FreelancerAssessmentsService {
             skills: profile.skills,
             yearsExperience: profile.yearsExperience,
             cvUrl: profile.cvUrl,
+            cvExtractionStatus: profile.cvExtractionStatus,
+            cvExtractedAt: profile.cvExtractedAt,
+            cvExtractionError: profile.cvExtractionError,
             verificationStatus: profile.verificationStatus,
           }
         : null,
@@ -499,7 +643,7 @@ export class FreelancerAssessmentsService {
     };
   }
 
-  async adminReview(id: string, dto: ReviewAssessmentDto) {
+  async adminReview(id: string, dto: ReviewAssessmentDto, adminUserId: string) {
     const assessment = await this.assessmentRepo.findOne({ where: { id } });
     if (!assessment) throw new NotFoundException('Assessment not found');
 
@@ -527,6 +671,7 @@ export class FreelancerAssessmentsService {
       let notificationBody = 'Your assessment review is complete.';
 
       if (profile) {
+        const previousStatus = profile.verificationStatus ?? null;
         if (dto.decision === 'pass') {
           profile.verificationStatus = 'interview_pending';
           notificationBody =
@@ -538,6 +683,19 @@ export class FreelancerAssessmentsService {
           notificationBody = 'Your assessment was not approved after review.';
         }
         await manager.save(FreelancerProfile, profile);
+        await this.recordVerificationEvent(manager, {
+          profile,
+          eventType: 'assessment_reviewed',
+          fromStatus: previousStatus,
+          toStatus: profile.verificationStatus,
+          actorType: 'admin',
+          actorUserId: adminUserId,
+          metadata: {
+            assessmentId: assessment.id,
+            decision: dto.decision,
+            scoreOverride: dto.scoreOverride ?? null,
+          },
+        });
       }
 
       await manager.save(
@@ -569,11 +727,30 @@ export class FreelancerAssessmentsService {
     return profile;
   }
 
-  private async getLatestAssessment(userId: string) {
-    return this.assessmentRepo.findOne({
+  private async getLatestAssessment(userId: string, manager?: EntityManager) {
+    const repo =
+      manager?.getRepository(FreelancerAssessment) ?? this.assessmentRepo;
+    return repo.findOne({
       where: { userId },
       order: { createdAt: 'DESC' },
     });
+  }
+
+  private getAssessmentStartInputs(profile: FreelancerProfile) {
+    if (!profile.cvUrl) {
+      throw new BadRequestException(
+        'Upload your CV before starting the assessment',
+      );
+    }
+
+    const skills = (profile.skills ?? []).filter((skill) => skill?.trim());
+    if (skills.length === 0) {
+      throw new BadRequestException(
+        'Wait until your CV is extracted before starting the assessment',
+      );
+    }
+
+    return { cvUrl: profile.cvUrl, skills };
   }
 
   private async getOwnedAssessment(userId: string, id: string) {
@@ -591,29 +768,39 @@ export class FreelancerAssessmentsService {
     return assessment;
   }
 
-  private isProfileComplete(profile: FreelancerProfile) {
+  private isAssessmentProfileComplete(
+    profile: FreelancerProfile,
+    skillScoreCount: number,
+  ) {
+    const summary = profile.summary as
+      { profileSummary?: unknown } | null | undefined;
     return Boolean(
-      profile.headline &&
-      profile.bio &&
-      (profile.skills?.length ?? 0) > 0 &&
-      profile.yearsExperience != null &&
-      profile.hourlyRate != null &&
-      profile.cvUrl,
+      typeof summary?.profileSummary === 'string' &&
+      summary.profileSummary.trim() &&
+      skillScoreCount > 0,
     );
   }
 
   private isCvExtracted(profile: FreelancerProfile) {
-    return Boolean(profile.summary && Object.keys(profile.summary).length > 0);
+    return (profile.skills?.length ?? 0) > 0;
   }
 
   private getMissingProfilePieces(profile: FreelancerProfile): string[] {
     const missing: string[] = [];
-    if (!profile.headline) missing.push('headline');
-    if (!profile.bio) missing.push('bio');
-    if ((profile.skills?.length ?? 0) === 0) missing.push('skills');
-    if (profile.yearsExperience == null) missing.push('yearsExperience');
-    if (profile.hourlyRate == null) missing.push('hourlyRate');
-    if (!profile.cvUrl) missing.push('cvUrl');
+    const summary = profile.summary as
+      { profileSummary?: unknown; skillRatings?: unknown } | null | undefined;
+    if (
+      typeof summary?.profileSummary !== 'string' ||
+      !summary.profileSummary.trim()
+    ) {
+      missing.push('assessmentProfileSummary');
+    }
+    if (
+      !Array.isArray(summary?.skillRatings) ||
+      summary.skillRatings.length === 0
+    ) {
+      missing.push('skillRatings');
+    }
     return missing;
   }
 
@@ -649,10 +836,16 @@ export class FreelancerAssessmentsService {
     if (!cvUploaded) {
       return { verificationStatus: 'cv_pending', nextAction: 'upload_cv' };
     }
-    // Profile fields (headline/bio/rate/years) no longer block the assessment —
-    // it only needs a CV plus extracted skills, so the freelancer can take it first.
+    // Skills can come from CV extraction or manual profile entry; matching-only
+    // fields like rate and generated summary do not block assessment.
     const hasSkills = (profile.skills?.length ?? 0) > 0;
     if (!hasSkills) {
+      if (profile.cvExtractionStatus === 'failed') {
+        return {
+          verificationStatus: 'cv_pending',
+          nextAction: 'upload_cv',
+        };
+      }
       return {
         verificationStatus: 'cv_processing',
         nextAction: 'wait_for_cv_extraction',
@@ -666,6 +859,18 @@ export class FreelancerAssessmentsService {
           nextAction: 'continue_assessment',
         };
       }
+      if (latest.status === 'ready') {
+        return {
+          verificationStatus: 'assessment_pending',
+          nextAction: 'start_assessment',
+        };
+      }
+      if (latest.status === 'pending' || latest.status === 'generating') {
+        return {
+          verificationStatus: 'assessment_pending',
+          nextAction: 'wait_for_assessment_generation',
+        };
+      }
       if (SUBMITTED_STATUSES.has(latest.status)) {
         return {
           verificationStatus: 'assessment_submitted',
@@ -674,9 +879,26 @@ export class FreelancerAssessmentsService {
       }
     }
 
+    if (
+      profile.assessmentGenerationStatus === 'queued' ||
+      profile.assessmentGenerationStatus === 'processing'
+    ) {
+      return {
+        verificationStatus: 'assessment_pending',
+        nextAction: 'wait_for_assessment_generation',
+      };
+    }
+
+    if (profile.assessmentGenerationStatus === 'failed') {
+      return {
+        verificationStatus: 'assessment_pending',
+        nextAction: 'retry_assessment_generation',
+      };
+    }
+
     return {
       verificationStatus: 'assessment_pending',
-      nextAction: 'start_assessment',
+      nextAction: 'wait_for_assessment_generation',
     };
   }
 
@@ -743,15 +965,15 @@ export class FreelancerAssessmentsService {
   }
 
   private async buildDetailResponse(assessment: FreelancerAssessment) {
-    const questions = await this.getSafeQuestions(assessment.id);
-    const answers = await this.getSavedAnswers(assessment.id);
+    const exposeAssessmentContent =
+      this.shouldExposeAssessmentContent(assessment);
+    const questions = exposeAssessmentContent
+      ? await this.getSafeQuestions(assessment.id)
+      : [];
+    const answers = exposeAssessmentContent
+      ? await this.getSavedAnswers(assessment.id)
+      : [];
     const eventsSummary = await this.getEventsSummary(assessment.id);
-    const nextAction =
-      assessment.status === ACTIVE_STATUS
-        ? 'continue_assessment'
-        : SUBMITTED_STATUSES.has(assessment.status)
-          ? 'wait_for_review'
-          : null;
 
     return {
       assessment: {
@@ -761,8 +983,30 @@ export class FreelancerAssessmentsService {
       questions,
       answers,
       eventsSummary,
-      nextAction,
+      nextAction: this.getAssessmentNextAction(assessment),
     };
+  }
+
+  private getAssessmentNextAction(assessment: FreelancerAssessment) {
+    if (assessment.status === ACTIVE_STATUS) return 'continue_assessment';
+    if (assessment.status === 'ready') return 'start_assessment';
+    if (assessment.status === 'pending' || assessment.status === 'generating') {
+      return 'wait_for_assessment_generation';
+    }
+    if (assessment.status === 'generation_failed') {
+      return 'retry_assessment_generation';
+    }
+    if (SUBMITTED_STATUSES.has(assessment.status)) return 'wait_for_review';
+    return null;
+  }
+
+  private shouldExposeAssessmentContent(assessment: FreelancerAssessment) {
+    return (
+      assessment.status === ACTIVE_STATUS ||
+      SUBMITTED_STATUSES.has(assessment.status) ||
+      assessment.status === 'expired' ||
+      assessment.status === 'failed'
+    );
   }
 
   private buildSubmitResponse(assessment: FreelancerAssessment) {
@@ -786,10 +1030,15 @@ export class FreelancerAssessmentsService {
   private async upsertAnswers(
     assessmentId: string,
     answers: { questionId: string; answer: Record<string, unknown> }[],
+    manager?: EntityManager,
   ) {
+    const questionRepo =
+      manager?.getRepository(FreelancerAssessmentQuestion) ?? this.questionRepo;
+    const answerRepo =
+      manager?.getRepository(FreelancerAssessmentAnswer) ?? this.answerRepo;
     const validQuestionIds = new Set(
       (
-        await this.questionRepo.find({
+        await questionRepo.find({
           where: { assessmentId },
           select: { id: true },
         })
@@ -812,7 +1061,7 @@ export class FreelancerAssessmentsService {
     }
     if (rows.length === 0) return;
 
-    await this.answerRepo.upsert(
+    await answerRepo.upsert(
       rows as QueryDeepPartialEntity<FreelancerAssessmentAnswer>[],
       ['assessmentId', 'questionId'],
     );
@@ -841,17 +1090,20 @@ export class FreelancerAssessmentsService {
   ) {
     return {
       assessmentId,
+      questions: questions.map((question) => ({
+        id: question.id,
+        questionType: question.questionType,
+        skill: question.skill,
+        difficulty: question.difficulty,
+        prompt: question.prompt,
+        choices: this.normalizeChoicesForAi(question.choices),
+        rubric: this.normalizeRubricForAi(question.rubric),
+      })),
       answers: questions.map((question) => ({
         questionId: question.id,
-        answer: answerByQuestion.get(question.id)?.answer ?? {},
-        question: {
-          questionType: question.questionType,
-          skill: question.skill,
-          difficulty: question.difficulty,
-          prompt: question.prompt,
-          choices: question.choices,
-          rubric: question.rubric,
-        },
+        answer: this.normalizeAnswerForAi(
+          answerByQuestion.get(question.id)?.answer,
+        ),
       })),
     };
   }
@@ -891,11 +1143,181 @@ export class FreelancerAssessmentsService {
     return counts;
   }
 
-  private normalizeChoices(
-    choices: GeneratedQuestion['choices'],
-  ): Record<string, unknown> | null {
-    if (!choices) return null;
-    return choices as Record<string, unknown>;
+  private async getWarningCount(assessmentId: string, manager?: EntityManager) {
+    const repo =
+      manager?.getRepository(FreelancerAssessmentEvent) ?? this.eventRepo;
+    return repo
+      .createQueryBuilder('event')
+      .where('event.assessment_id = :assessmentId', { assessmentId })
+      .andWhere('event.event_type IN (:...types)', {
+        types: WARNING_EVENT_TYPES,
+      })
+      .getCount();
+  }
+
+  private buildSkillScores(input: {
+    assessmentId: string;
+    userId: string;
+    freelancerProfileId: string;
+    questions: FreelancerAssessmentQuestion[];
+    results: GradedQuestionResult[];
+    graderConfidence: number | null;
+  }) {
+    const questionById = new Map(
+      input.questions.map((question) => [question.id, question]),
+    );
+    const grouped = new Map<
+      string,
+      { scores: number[]; feedback: string[]; count: number }
+    >();
+
+    for (const result of input.results) {
+      const question = questionById.get(result.questionId);
+      if (!question) continue;
+      const skill = question.skill?.trim();
+      if (!skill) continue;
+
+      const maxScore =
+        result.maxScore ??
+        (typeof question.rubric?.maxScore === 'number'
+          ? question.rubric.maxScore
+          : 100);
+      if (!maxScore || maxScore <= 0 || result.score == null) continue;
+
+      const scoreOutOfFive = Math.max(
+        0,
+        Math.min(5, (result.score / maxScore) * 5),
+      );
+      const bucket = grouped.get(skill) ?? {
+        scores: [],
+        feedback: [],
+        count: 0,
+      };
+      bucket.scores.push(scoreOutOfFive);
+      bucket.count += 1;
+      if (result.feedback) bucket.feedback.push(result.feedback);
+      grouped.set(skill, bucket);
+    }
+
+    return Array.from(grouped.entries()).map(([skill, bucket]) => {
+      const average =
+        bucket.scores.reduce((sum, score) => sum + score, 0) /
+        bucket.scores.length;
+      return {
+        freelancerProfileId: input.freelancerProfileId,
+        userId: input.userId,
+        assessmentId: input.assessmentId,
+        skill: skill.slice(0, 120),
+        score: average.toFixed(2),
+        confidence:
+          input.graderConfidence == null
+            ? null
+            : Math.max(0, Math.min(1, input.graderConfidence)).toFixed(2),
+        evidence: bucket.feedback.slice(0, 3).join(' '),
+        source: 'assessment',
+        updatedAt: new Date(),
+      };
+    });
+  }
+
+  private buildFallbackProfileSummary(
+    grade: GradedAssessment,
+    skillScores: { skill: string; score: string; evidence: string | null }[],
+  ) {
+    const skills = skillScores
+      .slice()
+      .sort((a, b) => Number(b.score) - Number(a.score))
+      .slice(0, 8)
+      .map((skillScore) => `${skillScore.skill} (${skillScore.score}/5)`)
+      .join(', ');
+
+    return [
+      grade.feedback ?? 'Assessment completed and graded.',
+      skills ? `Skill signals: ${skills}.` : null,
+      grade.recommendation
+        ? `Recommendation: ${grade.recommendation.replace(/_/g, ' ')}.`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  private normalizeChoicesForAi(
+    choices: FreelancerAssessmentQuestion['choices'],
+  ) {
+    if (!Array.isArray(choices)) return null;
+    return choices
+      .map((choice) => {
+        if (!choice || typeof choice !== 'object' || Array.isArray(choice)) {
+          return null;
+        }
+        const item = choice as Record<string, unknown>;
+        if (typeof item.id !== 'string' || typeof item.label !== 'string') {
+          return null;
+        }
+        return { id: item.id, label: item.label };
+      })
+      .filter(Boolean);
+  }
+
+  private normalizeRubricForAi(rubric: Record<string, unknown> | null) {
+    const maxScore =
+      typeof rubric?.maxScore === 'number' && Number.isFinite(rubric.maxScore)
+        ? rubric.maxScore
+        : 100;
+    return {
+      maxScore,
+      gradingNotes:
+        typeof rubric?.gradingNotes === 'string' && rubric.gradingNotes.trim()
+          ? rubric.gradingNotes
+          : 'Grade the answer for practical correctness, reasoning, and clarity.',
+      correctChoiceId:
+        typeof rubric?.correctChoiceId === 'string'
+          ? rubric.correctChoiceId
+          : null,
+    };
+  }
+
+  private normalizeAnswerForAi(answer: unknown) {
+    if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
+      return {};
+    }
+
+    const value = answer as Record<string, unknown>;
+    if (typeof value.choiceId === 'string' && value.choiceId.trim()) {
+      return { choiceId: value.choiceId.trim() };
+    }
+    if (typeof value.value === 'string' && value.value.trim()) {
+      return { value: value.value.trim() };
+    }
+    return {};
+  }
+
+  private async recordVerificationEvent(
+    manager: EntityManager,
+    input: {
+      profile: FreelancerProfile;
+      eventType: string;
+      fromStatus: string | null;
+      toStatus: string | null;
+      actorType: string;
+      actorUserId?: string | null;
+      metadata?: Record<string, unknown> | null;
+    },
+  ) {
+    await manager.save(
+      FreelancerVerificationEvent,
+      manager.create(FreelancerVerificationEvent, {
+        freelancerProfileId: input.profile.id,
+        userId: input.profile.userId,
+        eventType: input.eventType,
+        fromStatus: input.fromStatus,
+        toStatus: input.toStatus,
+        actorType: input.actorType,
+        actorUserId: input.actorUserId ?? null,
+        metadata: input.metadata ?? null,
+      }),
+    );
   }
 
   private fullName(user?: { firstName?: string; lastName?: string } | null) {

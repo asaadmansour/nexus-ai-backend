@@ -3,6 +3,7 @@ type Env = Record<string, string | undefined>;
 export function validateEnv(config: Env): Env {
   const requiredKeys = [
     'DATABASE_URL',
+    'REDIS_URL',
     'FRONTEND_URL',
     'AI_SERVICE_URL',
     'CLOUDINARY_CLOUD_NAME',

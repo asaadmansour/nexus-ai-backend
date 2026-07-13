@@ -1,4 +1,4 @@
-import { Controller, Get, Patch, Body, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, UseGuards } from '@nestjs/common';
 import { FreelancersService } from './freelancers.service';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
@@ -26,5 +26,11 @@ export class FreelancersController {
     @Body() dto: UpdateFreelancerDto,
   ) {
     return await this.freelancersService.updateMyProfile(user.sub, dto);
+  }
+
+  @Get(':id')
+  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  async getPublicProfile(@Param('id') id: string) {
+    return await this.freelancersService.getPublicProfile(id);
   }
 }

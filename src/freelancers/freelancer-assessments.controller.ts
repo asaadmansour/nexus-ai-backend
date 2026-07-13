@@ -15,7 +15,6 @@ import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { FreelancerAssessmentsService } from './freelancer-assessments.service';
-import { StartAssessmentDto } from './dtos/start-assessment.dto';
 import { SaveAssessmentAnswersDto } from './dtos/save-assessment-answers.dto';
 import { SubmitAssessmentDto } from './dtos/submit-assessment.dto';
 import { TrackAssessmentEventDto } from './dtos/track-assessment-event.dto';
@@ -27,11 +26,8 @@ export class FreelancerAssessmentsController {
   constructor(private readonly assessments: FreelancerAssessmentsService) {}
 
   @Post('start')
-  async start(
-    @CurrentUser() user: JwtPayload,
-    @Body() dto: StartAssessmentDto,
-  ) {
-    const data = await this.assessments.start(user.sub, dto);
+  async start(@CurrentUser() user: JwtPayload) {
+    const data = await this.assessments.start(user.sub);
     return { status: 'success', data };
   }
 

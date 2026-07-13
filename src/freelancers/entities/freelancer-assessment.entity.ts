@@ -53,6 +53,18 @@ export class FreelancerAssessment {
   @Column({ name: 'generated_from_cv_url', type: 'text', nullable: true })
   generatedFromCvUrl: string | null;
 
+  @Column({ name: 'generation_job_id', type: 'uuid', nullable: true })
+  generationJobId: string | null;
+
+  @Column({ name: 'generated_at', type: 'timestamptz', nullable: true })
+  generatedAt: Date | null;
+
+  @Column({ name: 'generation_input', type: 'jsonb', nullable: true })
+  generationInput: Record<string, unknown> | null;
+
+  @Column({ name: 'generation_error', type: 'text', nullable: true })
+  generationError: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 

@@ -11,10 +11,16 @@ import { AuthGuard } from 'src/common/guards/auth.guard';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import { RolesGuard } from 'src/common/guards/roles.guards';
 import { Roles } from 'src/common/decorators/roles.decorator';
+import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
+import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { AdminService } from './admin.service';
+import { UpdateAdminUserDto } from './dtos/update-admin-user.dto';
 import { UpdateFreelancerVerificationDto } from './dtos/update-freelancer-verification.dto';
 import { ReviewAssessmentDto } from './dtos/review-assessment.dto';
+import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
+import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
+import { UpdateFreelancerSkillScoreDto } from './dtos/update-freelancer-skill-score.dto';
 
 @Controller('admin')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
@@ -34,9 +40,16 @@ export class AdminController {
   async getUsers(
     @Query('page') page: string = '1',
     @Query('limit') limit: string = '50',
+    @Query('search') search?: string,
+    @Query('role') role?: UserRole,
+    @Query('status') status?: string,
   ) {
     const { pageNum, limitNum } = this.parsePagination(page, limit);
-    const { users, total } = await this.adminService.getUsers(pageNum, limitNum);
+    const { users, total } = await this.adminService.getUsers(
+      pageNum,
+      limitNum,
+      { search, role, status },
+    );
     return {
       status: 'success',
       data: users,
@@ -44,6 +57,16 @@ export class AdminController {
       page: pageNum,
       limit: limitNum,
     };
+  }
+
+  @Patch('users/:id')
+  async updateUser(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() body: UpdateAdminUserDto,
+  ) {
+    const data = await this.adminService.updateUser(id, body, user.sub);
+    return { status: 'success', data };
   }
 
   // ===== Projects =====
@@ -54,7 +77,10 @@ export class AdminController {
     @Query('limit') limit: string = '50',
   ) {
     const { pageNum, limitNum } = this.parsePagination(page, limit);
-    const { projects, total } = await this.adminService.getProjects(pageNum, limitNum);
+    const { projects, total } = await this.adminService.getProjects(
+      pageNum,
+      limitNum,
+    );
     return {
       status: 'success',
       data: projects,
@@ -112,10 +138,31 @@ export class AdminController {
 
   @Patch('freelancers/:id/verification')
   async updateFreelancerVerification(
+    @CurrentUser() user: JwtPayload,
     @Param('id') id: string,
     @Body() body: UpdateFreelancerVerificationDto,
   ) {
-    const data = await this.adminService.updateFreelancerVerification(id, body);
+    const data = await this.adminService.updateFreelancerVerification(
+      id,
+      body,
+      user.sub,
+    );
+    return { status: 'success', data };
+  }
+
+  @Patch('freelancers/:id/skill-scores/:skillScoreId')
+  async updateFreelancerSkillScore(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Param('skillScoreId') skillScoreId: string,
+    @Body() body: UpdateFreelancerSkillScoreDto,
+  ) {
+    const data = await this.adminService.updateFreelancerSkillScore(
+      id,
+      skillScoreId,
+      body,
+      user.sub,
+    );
     return { status: 'success', data };
   }
 
@@ -160,10 +207,41 @@ export class AdminController {
 
   @Patch('assessments/:id/review')
   async reviewAssessment(
+    @CurrentUser() user: JwtPayload,
     @Param('id') id: string,
     @Body() body: ReviewAssessmentDto,
   ) {
-    const data = await this.adminService.reviewAssessment(id, body);
+    const data = await this.adminService.reviewAssessment(id, body, user.sub);
+    return { status: 'success', data };
+  }
+
+  @Patch('assessments/:id/score')
+  async updateAssessmentScore(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() body: UpdateAssessmentScoreDto,
+  ) {
+    const data = await this.adminService.updateAssessmentScore(
+      id,
+      body,
+      user.sub,
+    );
+    return { status: 'success', data };
+  }
+
+  @Patch('assessments/:id/questions/:questionId/score')
+  async updateAssessmentAnswerScore(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Param('questionId') questionId: string,
+    @Body() body: UpdateAssessmentAnswerScoreDto,
+  ) {
+    const data = await this.adminService.updateAssessmentAnswerScore(
+      id,
+      questionId,
+      body,
+      user.sub,
+    );
     return { status: 'success', data };
   }
 
@@ -183,7 +261,12 @@ export class AdminController {
     @Query('jobType') jobType?: string,
   ) {
     const { pageNum, limitNum } = this.parsePagination(page, limit);
-    const { data, total } = await this.adminService.getAgentJobs(pageNum, limitNum, status, jobType);
+    const { data, total } = await this.adminService.getAgentJobs(
+      pageNum,
+      limitNum,
+      status,
+      jobType,
+    );
     return {
       status: 'success',
       data,

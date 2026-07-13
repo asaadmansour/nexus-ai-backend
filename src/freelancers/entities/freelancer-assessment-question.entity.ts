@@ -33,7 +33,7 @@ export class FreelancerAssessmentQuestion {
   prompt: string;
 
   @Column({ type: 'jsonb', nullable: true })
-  choices: Record<string, unknown> | null;
+  choices: Record<string, unknown> | unknown[] | null;
 
   @Column({ type: 'jsonb', nullable: true, select: false })
   rubric: Record<string, unknown> | null;

@@ -4,7 +4,7 @@ export class StartAssessmentDto {
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(20)
+  @Max(60)
   questionCount?: number;
 
   @IsOptional()

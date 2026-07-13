@@ -34,6 +34,22 @@ type FastApiValidateBriefResponse = {
   extractionSource?: string;
 };
 
+type FastApiGenerateAssessmentResponse = {
+  durationSeconds?: number;
+  questions?: unknown[];
+};
+
+type FastApiGradeAssessmentResponse = {
+  assessmentId?: string;
+  score?: number;
+  maxScore?: number;
+  recommendation?: string;
+  feedback?: string;
+  profileSummary?: string;
+  graderConfidence?: number;
+  questionResults?: unknown[];
+};
+
 const REQUIREMENT_FIELD_NAMES = [
   'projectType',
   'businessDomain',
@@ -81,7 +97,56 @@ export class AiService {
 
   constructor(private readonly configService: ConfigService) {}
 
-  extractCv(dto: ExtractCvDto) {
+  async extractCv(dto: ExtractCvDto) {
+    if (this.isMockMode()) {
+      return this.getMockExtractCvResult(dto);
+    }
+
+    return this.postToFastApi<Record<string, unknown>>(
+      '/agents/extract-cv',
+      {
+        cvUrl: dto.cvUrl,
+      },
+      'extract-cv',
+    );
+  }
+
+  async generateAssessment(dto: GenerateAssessmentDto) {
+    if (this.isMockMode()) {
+      return this.getMockGenerateAssessmentResult(dto);
+    }
+
+    return this.postToFastApi<FastApiGenerateAssessmentResponse>(
+      '/agents/generate-assessment',
+      {
+        cvUrl: dto.cvUrl,
+        skills: dto.skills,
+        yearsExperience: dto.yearsExperience,
+        headline: dto.headline,
+        questionCount: dto.questionCount,
+        durationSeconds: dto.durationSeconds,
+      },
+      'generate-assessment',
+    );
+  }
+
+  async gradeAssessment(dto: GradeAssessmentDto) {
+    if (this.isMockMode()) {
+      return this.getMockGradeAssessmentResult(dto);
+    }
+
+    return this.postToFastApi<FastApiGradeAssessmentResponse>(
+      '/agents/grade-assessment',
+      {
+        assessmentId: dto.assessmentId,
+        questions: dto.questions,
+        answers: dto.answers,
+      },
+      'grade-assessment',
+    );
+  }
+
+  private getMockExtractCvResult(dto: ExtractCvDto) {
     return {
       cvUrl: dto.cvUrl,
       skills: ['React', 'NestJS', 'PostgreSQL'],
@@ -93,10 +158,8 @@ export class AiService {
 
   async validateBrief(dto: BriefDto): Promise<ValidateBriefResult> {
     const aiServiceUrl = this.configService.get<string>('AI_SERVICE_URL');
-    const isMockMode =
-      (this.configService.get<string>('AI_MOCK_MODE') ?? 'false') === 'true';
 
-    if (isMockMode) {
+    if (this.isMockMode()) {
       return this.getMockValidateBriefResult(dto);
     }
 
@@ -115,6 +178,74 @@ export class AiService {
         'AI service is unavailable or returned an invalid response',
       );
     }
+  }
+
+  private isMockMode() {
+    return (
+      (this.configService.get<string>('AI_MOCK_MODE') ?? 'false') === 'true'
+    );
+  }
+
+  private getAiServiceUrl() {
+    const aiServiceUrl = this.configService.get<string>('AI_SERVICE_URL');
+    if (!aiServiceUrl) {
+      throw new BadGatewayException('AI_SERVICE_URL is not configured');
+    }
+    return aiServiceUrl.replace(/\/+$/, '');
+  }
+
+  private getAiServiceTimeoutMs() {
+    const configuredTimeoutMs = Number(
+      this.configService.get<string>('AI_SERVICE_TIMEOUT_MS'),
+    );
+    return Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? configuredTimeoutMs
+      : 120000;
+  }
+
+  private async postToFastApi<T>(
+    path: string,
+    body: Record<string, unknown>,
+    operation: string,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      this.getAiServiceTimeoutMs(),
+    );
+
+    try {
+      const response = await fetch(`${this.getAiServiceUrl()}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(this.stripUndefined(body)),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(
+          `AI service failed with status ${response.status}: ${errorBody}`,
+        );
+      }
+
+      return (await response.json()) as T;
+    } catch (error) {
+      this.logger.error(
+        `AI service ${operation} failed: ${this.getErrorMessage(error)}`,
+      );
+      throw new BadGatewayException(
+        `AI service ${operation} failed: ${this.getErrorMessage(error)}`,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private stripUndefined(body: Record<string, unknown>) {
+    return Object.fromEntries(
+      Object.entries(body).filter(([, value]) => value !== undefined),
+    );
   }
 
   private async callFastApiValidateBrief(
@@ -400,7 +531,7 @@ export class AiService {
     return questions[field] ?? 'Please add more detail for the project brief.';
   }
 
-  generateAssessment(dto: GenerateAssessmentDto) {
+  private getMockGenerateAssessmentResult(dto: GenerateAssessmentDto) {
     const questionCount = dto.questionCount ?? Math.min(dto.skills.length, 5);
     const selectedSkills = dto.skills.slice(0, questionCount);
 
@@ -419,12 +550,18 @@ export class AiService {
         skill,
         difficulty: this.getDifficulty(dto.yearsExperience),
         prompt: `Describe one practical ${skill} problem you solved and how you approached it.`,
+        rubric: {
+          maxScore: 100,
+          gradingNotes:
+            'Look for practical examples, trade-off reasoning, and clear ownership of the work.',
+          correctChoiceId: null,
+        },
         orderIndex: index + 1,
       })),
     };
   }
 
-  gradeAssessment(dto: GradeAssessmentDto) {
+  private getMockGradeAssessmentResult(dto: GradeAssessmentDto) {
     const answeredCount = dto.answers.filter((answer) =>
       this.hasMeaningfulAnswer(answer.answer),
     ).length;
@@ -435,7 +572,7 @@ export class AiService {
         : Math.round((answeredCount / totalQuestions) * 100);
 
     return {
-      assessmentId: dto.assessmentId ?? null,
+      assessmentId: dto.assessmentId,
       score: percentage,
       maxScore: 100,
       recommendation: this.getRecommendation(percentage),
@@ -443,9 +580,12 @@ export class AiService {
         percentage >= 70
           ? 'Mock grading: answers show enough coverage to move forward.'
           : 'Mock grading: answers need review before approval.',
+      profileSummary:
+        'Mock grading summary: the freelancer showed practical coverage across submitted answers. Replace with AI grading output in production.',
       questionResults: dto.answers.map((answer) => ({
         questionId: answer.questionId,
         score: this.hasMeaningfulAnswer(answer.answer) ? 100 : 0,
+        maxScore: 100,
         feedback: this.hasMeaningfulAnswer(answer.answer)
           ? 'Answered.'
           : 'No meaningful answer submitted.',

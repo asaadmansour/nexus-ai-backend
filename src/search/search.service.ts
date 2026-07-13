@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, ILike } from 'typeorm';
+import { Brackets, Repository } from 'typeorm';
 import { Project } from '../projects/entities/project.entity';
 import { FreelancerProfile } from '../freelancers/entities/freelancer-profile.entity';
 import { User } from '../users/entities/user.entity';
@@ -16,6 +16,8 @@ export interface SearchResult {
 
 @Injectable()
 export class SearchService {
+  private readonly maxResultsPerType = 20;
+
   constructor(
     @InjectRepository(Project)
     private projectRepository: Repository<Project>,
@@ -25,7 +27,11 @@ export class SearchService {
     private userRepository: Repository<User>,
   ) {}
 
-  async search(query: string, userId: string, role: UserRole): Promise<SearchResult[]> {
+  async search(
+    query: string,
+    userId: string,
+    role: UserRole,
+  ): Promise<SearchResult[]> {
     if (!query || query.trim().length === 0) {
       return [];
     }
@@ -37,8 +43,15 @@ export class SearchService {
     if (role === UserRole.CUSTOMER || role === UserRole.ADMIN) {
       const projectQuery = this.projectRepository
         .createQueryBuilder('project')
-        .where('project.title ILIKE :search', { search: searchTerm })
-        .orWhere('project.description ILIKE :search', { search: searchTerm });
+        .where(
+          new Brackets((qb) => {
+            qb.where('project.title ILIKE :search', {
+              search: searchTerm,
+            }).orWhere('project.description ILIKE :search', {
+              search: searchTerm,
+            });
+          }),
+        );
 
       // If customer, only show their own projects
       if (role === UserRole.CUSTOMER) {
@@ -47,6 +60,7 @@ export class SearchService {
 
       const projects = await projectQuery
         .select(['project.id', 'project.title', 'project.description'])
+        .take(this.maxResultsPerType)
         .getMany();
 
       projects.forEach((p) => {
@@ -62,14 +76,26 @@ export class SearchService {
 
     // 2. Search freelancers (for customers and admins)
     if (role === UserRole.CUSTOMER || role === UserRole.ADMIN) {
-      const freelancers = await this.freelancerProfileRepository
+      const freelancers = this.freelancerProfileRepository
         .createQueryBuilder('fp')
         .leftJoinAndSelect('fp.user', 'user')
-        .where('fp.headline ILIKE :search', { search: searchTerm })
-        .orWhere('fp.bio ILIKE :search', { search: searchTerm })
-        .orWhere('fp.skills::text ILIKE :search', { search: searchTerm })
-        .orWhere('user.firstName ILIKE :search', { search: searchTerm })
-        .orWhere('user.lastName ILIKE :search', { search: searchTerm })
+        .where(
+          new Brackets((qb) => {
+            qb.where('fp.headline ILIKE :search', {
+              search: searchTerm,
+            })
+              .orWhere('fp.bio ILIKE :search', { search: searchTerm })
+              .orWhere('fp.skills::text ILIKE :search', {
+                search: searchTerm,
+              })
+              .orWhere('user.firstName ILIKE :search', {
+                search: searchTerm,
+              })
+              .orWhere('user.lastName ILIKE :search', {
+                search: searchTerm,
+              });
+          }),
+        )
         .select([
           'fp.id',
           'fp.headline',
@@ -79,16 +105,27 @@ export class SearchService {
           'user.firstName',
           'user.lastName',
         ])
-        .getMany();
+        .take(this.maxResultsPerType);
 
-      freelancers.forEach((fp) => {
+      if (role === UserRole.CUSTOMER) {
+        freelancers.andWhere('fp.verificationStatus = :approvedStatus', {
+          approvedStatus: 'approved',
+        });
+      }
+
+      const freelancerProfiles = await freelancers.getMany();
+
+      freelancerProfiles.forEach((fp) => {
         const fullName = `${fp.user.firstName} ${fp.user.lastName}`;
         results.push({
           type: 'freelancer',
           id: fp.id,
           title: fullName,
           subtitle: fp.headline || fp.bio?.slice(0, 60) || 'Freelancer',
-          href: `/dashboard/admin/freelancers/${fp.id}`, // Admin detail; for customer maybe different
+          href:
+            role === UserRole.ADMIN
+              ? `/dashboard/admin/freelancers/${fp.id}`
+              : `/freelancers/${fp.id}`,
         });
       });
     }
@@ -97,10 +134,23 @@ export class SearchService {
     if (role === UserRole.ADMIN) {
       const users = await this.userRepository
         .createQueryBuilder('user')
-        .where('user.firstName ILIKE :search', { search: searchTerm })
-        .orWhere('user.lastName ILIKE :search', { search: searchTerm })
-        .orWhere('user.email ILIKE :search', { search: searchTerm })
-        .select(['user.id', 'user.firstName', 'user.lastName', 'user.email', 'user.role'])
+        .where(
+          new Brackets((qb) => {
+            qb.where('user.firstName ILIKE :search', {
+              search: searchTerm,
+            })
+              .orWhere('user.lastName ILIKE :search', { search: searchTerm })
+              .orWhere('user.email ILIKE :search', { search: searchTerm });
+          }),
+        )
+        .select([
+          'user.id',
+          'user.firstName',
+          'user.lastName',
+          'user.email',
+          'user.role',
+        ])
+        .take(this.maxResultsPerType)
         .getMany();
 
       users.forEach((u) => {
@@ -114,7 +164,6 @@ export class SearchService {
       });
     }
 
-    // Limit results to avoid overloading
-    return results.slice(0, 20);
+    return results;
   }
 }

@@ -12,6 +12,7 @@ import {
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 import { FreelancerProfileEmbedding } from './freelancer-profile-embedding.entity';
+import { FreelancerSkillScore } from './freelancer-skill-score.entity';
 
 @Entity('freelancer_profiles')
 export class FreelancerProfile {
@@ -30,8 +31,79 @@ export class FreelancerProfile {
   @OneToMany(() => FreelancerProfileEmbedding, (embedding) => embedding.profile)
   embeddings?: FreelancerProfileEmbedding[];
 
+  @OneToMany(
+    () => FreelancerSkillScore,
+    (skillScore) => skillScore.freelancerProfile,
+  )
+  skillScores?: FreelancerSkillScore[];
+
   @Column({ name: 'cv_url', type: 'text', nullable: true })
   cvUrl: string | null;
+
+  @Column({
+    name: 'cv_extraction_status',
+    type: 'varchar',
+    length: 40,
+    nullable: true,
+  })
+  cvExtractionStatus: string | null;
+
+  @Column({
+    name: 'cv_extracted_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  cvExtractedAt: Date | null;
+
+  @Column({
+    name: 'cv_extraction_error',
+    type: 'text',
+    nullable: true,
+  })
+  cvExtractionError: string | null;
+
+  @Column({
+    name: 'assessment_generation_status',
+    type: 'varchar',
+    length: 40,
+    nullable: true,
+  })
+  assessmentGenerationStatus: string | null;
+
+  @Column({
+    name: 'assessment_generation_queued_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  assessmentGenerationQueuedAt: Date | null;
+
+  @Column({
+    name: 'assessment_generation_started_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  assessmentGenerationStartedAt: Date | null;
+
+  @Column({
+    name: 'assessment_generated_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  assessmentGeneratedAt: Date | null;
+
+  @Column({
+    name: 'assessment_generation_error',
+    type: 'text',
+    nullable: true,
+  })
+  assessmentGenerationError: string | null;
+
+  @Column({
+    name: 'assessment_generation_job_id',
+    type: 'uuid',
+    nullable: true,
+  })
+  assessmentGenerationJobId: string | null;
 
   @Column({ type: 'text', nullable: true })
   headline: string | null;
@@ -105,6 +177,9 @@ export class FreelancerProfile {
   @Index('freelancer_profiles_is_available_idx')
   @Column({ name: 'is_available', type: 'boolean', default: true })
   isAvailable: boolean;
+
+  @Column({ name: 'availability_hours_per_week', type: 'int', nullable: true })
+  availabilityHoursPerWeek: number | null;
 
   @Column({
     name: 'avg_rating',

@@ -8,7 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { User } from 'src/users/entities/user.entity';
-import { Repository, DataSource, QueryRunner } from 'typeorm';
+import { Repository, DataSource, EntityManager, QueryRunner } from 'typeorm';
 import { SignUpUserDto } from './dtos/signup-user.dto';
 import { JwtService } from '@nestjs/jwt';
 import { LogInUserDto } from './dtos/login-user.dto';
@@ -41,6 +41,19 @@ export class AuthService {
 
   private toPublicUser(user: User): Omit<User, 'hashedPassword'> {
     return sanitizeUser(user) as Omit<User, 'hashedPassword'>;
+  }
+
+  private async ensureFreelancerProfile(
+    manager: EntityManager,
+    userId: string,
+  ) {
+    const existing = await manager.findOne(FreelancerProfile, {
+      where: { userId },
+    });
+    if (existing) return existing;
+
+    const profile = manager.create(FreelancerProfile, { userId });
+    return manager.save(profile);
   }
 
   private async generateTokens(
@@ -101,10 +114,7 @@ export class AuthService {
 
       // Freelancers need a profile row from signup so verification/assessment load.
       if (savedUser.role === UserRole.FREELANCER) {
-        const freelancerProfile = queryRunner.manager.create(FreelancerProfile, {
-          userId: savedUser.id,
-        });
-        await queryRunner.manager.save(freelancerProfile);
+        await this.ensureFreelancerProfile(queryRunner.manager, savedUser.id);
       }
 
       const { accessToken, refreshToken } = await this.generateTokens(
@@ -364,10 +374,10 @@ export class AuthService {
 
       let freelancerProfile: FreelancerProfile | null = null;
       if (user.role === UserRole.FREELANCER) {
-        freelancerProfile = queryRunner.manager.create(FreelancerProfile, {
-          userId: user.id,
-        });
-        await queryRunner.manager.save(freelancerProfile);
+        freelancerProfile = await this.ensureFreelancerProfile(
+          queryRunner.manager,
+          user.id,
+        );
       }
 
       const { accessToken, refreshToken } = await this.generateTokens(

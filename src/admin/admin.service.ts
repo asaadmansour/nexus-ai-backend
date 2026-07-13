@@ -1,6 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { User } from 'src/users/entities/user.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
@@ -8,44 +12,232 @@ import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assess
 import { FreelancerAssessmentQuestion } from 'src/freelancers/entities/freelancer-assessment-question.entity';
 import { FreelancerAssessmentAnswer } from 'src/freelancers/entities/freelancer-assessment-answer.entity';
 import { FreelancerAssessmentEvent } from 'src/freelancers/entities/freelancer-assessment-event.entity';
+import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
+import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { NotificationsService } from 'src/notifications/notifications.service';
+import { UpdateAdminUserDto } from './dtos/update-admin-user.dto';
+import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
+import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
+import { UpdateFreelancerSkillScoreDto } from './dtos/update-freelancer-skill-score.dto';
 
 @Injectable()
 export class AdminService {
+  private readonly agentTypes = [
+    'requirements',
+    'cv_extraction',
+    'assessment_generation',
+    'assessment_grading',
+    'matching',
+    'evaluation',
+  ];
+  private readonly warningEventTypes = [
+    'fullscreen_exit',
+    'visibility_hidden',
+    'copy_attempt',
+    'paste_attempt',
+  ];
+  private readonly adminReviewableAssessmentStatuses = new Set([
+    'submitted',
+    'needs_review',
+    'passed',
+    'failed',
+    'expired',
+    'cancelled',
+  ]);
+
   constructor(
     @InjectRepository(User) private userRepository: Repository<User>,
     @InjectRepository(Project) private projectRepository: Repository<Project>,
-    @InjectRepository(FreelancerProfile) private freelancerProfileRepository: Repository<FreelancerProfile>,
-    @InjectRepository(FreelancerAssessment) private assessmentRepository: Repository<FreelancerAssessment>,
-    @InjectRepository(FreelancerAssessmentQuestion) private questionRepository: Repository<FreelancerAssessmentQuestion>,
-    @InjectRepository(FreelancerAssessmentAnswer) private answerRepository: Repository<FreelancerAssessmentAnswer>,
-    @InjectRepository(FreelancerAssessmentEvent) private eventRepository: Repository<FreelancerAssessmentEvent>,
-    @InjectRepository(AgentJob) private agentJobRepository: Repository<AgentJob>,
+    @InjectRepository(FreelancerProfile)
+    private freelancerProfileRepository: Repository<FreelancerProfile>,
+    @InjectRepository(FreelancerAssessment)
+    private assessmentRepository: Repository<FreelancerAssessment>,
+    @InjectRepository(FreelancerAssessmentQuestion)
+    private questionRepository: Repository<FreelancerAssessmentQuestion>,
+    @InjectRepository(FreelancerAssessmentAnswer)
+    private answerRepository: Repository<FreelancerAssessmentAnswer>,
+    @InjectRepository(FreelancerAssessmentEvent)
+    private eventRepository: Repository<FreelancerAssessmentEvent>,
+    @InjectRepository(FreelancerSkillScore)
+    private skillScoreRepository: Repository<FreelancerSkillScore>,
+    @InjectRepository(AgentJob)
+    private agentJobRepository: Repository<AgentJob>,
+    @InjectRepository(RefreshToken)
+    private refreshTokenRepository: Repository<RefreshToken>,
+    private readonly notificationsService: NotificationsService,
   ) {}
+
+  private getAiRecommendation(feedback: Record<string, unknown> | null) {
+    const value =
+      feedback?.adminDecision ?? feedback?.recommendation ?? feedback?.decision;
+    return typeof value === 'string' ? value : null;
+  }
+
+  private getProfileSummary(summary: Record<string, unknown> | null) {
+    const value = summary?.profileSummary;
+    return typeof value === 'string' ? value : null;
+  }
+
+  private async getWarningCounts(assessmentIds: string[]) {
+    if (assessmentIds.length === 0) return new Map<string, number>();
+
+    const rows = await this.eventRepository
+      .createQueryBuilder('event')
+      .select('event.assessmentId', 'assessmentId')
+      .addSelect('COUNT(*)', 'count')
+      .where('event.assessmentId IN (:...assessmentIds)', { assessmentIds })
+      .andWhere('event.eventType IN (:...eventTypes)', {
+        eventTypes: this.warningEventTypes,
+      })
+      .groupBy('event.assessmentId')
+      .getRawMany<{ assessmentId: string; count: string }>();
+
+    return new Map(
+      rows.map((row) => [row.assessmentId, parseInt(row.count, 10)]),
+    );
+  }
+
+  private toSkillScoreDto(score: FreelancerSkillScore) {
+    return {
+      id: score.id,
+      skill: score.skill,
+      score: score.score,
+      confidence: score.confidence,
+      evidence: score.evidence,
+      source: score.source,
+      assessmentId: score.assessmentId,
+      updatedAt: score.updatedAt,
+    };
+  }
+
+  private appendAdminFeedback(
+    feedback: Record<string, unknown> | null,
+    key: string,
+    value: Record<string, unknown>,
+  ) {
+    return {
+      ...(feedback ?? {}),
+      [key]: value,
+    };
+  }
+
+  private getAgentHealthStatus(failedToday: number) {
+    if (failedToday > 2) return 'failing';
+    if (failedToday > 0) return 'degraded';
+    return 'healthy';
+  }
+
+  private getTodayStart() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return today;
+  }
+
+  private getAgentJobTarget(job: AgentJob) {
+    if (job.taskId) return { targetType: 'task', targetId: job.taskId };
+    if (job.briefId) return { targetType: 'brief', targetId: job.briefId };
+    if (job.assessmentId) {
+      return { targetType: 'assessment', targetId: job.assessmentId };
+    }
+    if (job.freelancerProfileId) {
+      return {
+        targetType: 'freelancer_profile',
+        targetId: job.freelancerProfileId,
+      };
+    }
+    if (job.submissionId) {
+      return { targetType: 'submission', targetId: job.submissionId };
+    }
+    if (job.matchingRunId) {
+      return { targetType: 'matching_run', targetId: job.matchingRunId };
+    }
+    if (job.projectId) {
+      return { targetType: 'project', targetId: job.projectId };
+    }
+    if (job.userId) return { targetType: 'user', targetId: job.userId };
+    return { targetType: null, targetId: null };
+  }
 
   // ===== Users =====
 
-  async getUsers(pageNum: number, limitNum: number) {
-    const [users, total] = await this.userRepository.findAndCount({
-      order: { createdAt: 'DESC', id: 'DESC' },
-      skip: (pageNum - 1) * limitNum,
-      take: limitNum,
-      select: {
-        id: true,
-        firstName: true,
-        lastName: true,
-        email: true,
-        phoneNumber: true,
-        isEmailVerified: true,
-        isIdVerified: true,
-        photoUrl: true,
-        role: true,
-        createdAt: true,
-      },
-    });
+  async getUsers(
+    pageNum: number,
+    limitNum: number,
+    filters: { search?: string; role?: UserRole; status?: string } = {},
+  ) {
+    const query = this.userRepository
+      .createQueryBuilder('user')
+      .withDeleted()
+      .orderBy('user.createdAt', 'DESC')
+      .addOrderBy('user.id', 'DESC')
+      .skip((pageNum - 1) * limitNum)
+      .take(limitNum);
+
+    if (filters.search) {
+      query.andWhere(
+        `(
+          user.firstName ILIKE :search
+          OR user.lastName ILIKE :search
+          OR user.email::text ILIKE :search
+          OR user.phoneNumber ILIKE :search
+        )`,
+        { search: `%${filters.search}%` },
+      );
+    }
+
+    if (filters.role) {
+      query.andWhere('user.role = :role', { role: filters.role });
+    }
+
+    if (filters.status === 'active') {
+      query.andWhere('user.deletedAt IS NULL');
+    } else if (filters.status === 'disabled') {
+      query.andWhere('user.deletedAt IS NOT NULL');
+    } else if (filters.status === 'email_pending') {
+      query.andWhere('user.isEmailVerified = false');
+      query.andWhere('user.deletedAt IS NULL');
+    }
+
+    const [users, total] = await query.getManyAndCount();
     return { users, total };
+  }
+
+  async updateUser(id: string, dto: UpdateAdminUserDto, adminUserId: string) {
+    const user = await this.userRepository.findOne({
+      where: { id },
+      withDeleted: true,
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    if (dto.disabled === true && user.id === adminUserId) {
+      throw new BadRequestException(
+        'You cannot disable your own admin account',
+      );
+    }
+
+    if (dto.firstName !== undefined) user.firstName = dto.firstName.trim();
+    if (dto.lastName !== undefined) user.lastName = dto.lastName.trim();
+    if (dto.email !== undefined) user.email = dto.email.trim().toLowerCase();
+    if (dto.phoneNumber !== undefined) {
+      user.phoneNumber = dto.phoneNumber?.trim() || null;
+    }
+    if (dto.role !== undefined) user.role = dto.role;
+    if (dto.isEmailVerified !== undefined) {
+      user.isEmailVerified = dto.isEmailVerified;
+    }
+    if (dto.isIdVerified !== undefined) user.isIdVerified = dto.isIdVerified;
+
+    if (dto.disabled === true && !user.deletedAt) {
+      user.deletedAt = new Date();
+      await this.refreshTokenRepository.delete({ userId: user.id });
+    } else if (dto.disabled === false && user.deletedAt) {
+      user.deletedAt = null;
+    }
+
+    return this.userRepository.save(user);
   }
 
   // ===== Projects =====
@@ -81,35 +273,126 @@ export class AdminService {
   // ===== Stats =====
 
   async getStats() {
-    // 1. Users
+    const today = this.getTodayStart();
+
+    const [
+      totalUsers,
+      customers,
+      freelancers,
+      admins,
+      emailVerified,
+      emailPending,
+      totalProjects,
+      draftProjects,
+      briefCompleteProjects,
+      assignedProjects,
+      activeProjects,
+      completedProjects,
+      freelancerStatuses,
+      totalFreelancers,
+      totalAssessments,
+      inProgressAssessments,
+      submittedAssessments,
+      passedAssessments,
+      failedAssessments,
+      needsReviewAssessments,
+      queuedAgents,
+      runningAgents,
+      completedToday,
+      failedToday,
+      agentFailuresToday,
+    ] = await Promise.all([
+      this.userRepository.count(),
+      this.userRepository.count({ where: { role: UserRole.CUSTOMER } }),
+      this.userRepository.count({ where: { role: UserRole.FREELANCER } }),
+      this.userRepository.count({ where: { role: UserRole.ADMIN } }),
+      this.userRepository.count({ where: { isEmailVerified: true } }),
+      this.userRepository.count({ where: { isEmailVerified: false } }),
+      this.projectRepository.count(),
+      this.projectRepository.count({ where: { status: ProjectStatus.DRAFT } }),
+      this.projectRepository.count({
+        where: { status: ProjectStatus.BRIEF_COMPLETE },
+      }),
+      this.projectRepository.count({
+        where: { status: ProjectStatus.ASSIGNED },
+      }),
+      this.projectRepository.count({ where: { status: ProjectStatus.ACTIVE } }),
+      this.projectRepository.count({
+        where: { status: ProjectStatus.COMPLETED },
+      }),
+      this.freelancerProfileRepository
+        .createQueryBuilder('fp')
+        .select('fp.verificationStatus', 'verificationStatus')
+        .addSelect('COUNT(*)', 'count')
+        .groupBy('fp.verificationStatus')
+        .getRawMany<{ verificationStatus: string; count: string }>(),
+      this.freelancerProfileRepository.count(),
+      this.assessmentRepository.count(),
+      this.assessmentRepository.count({ where: { status: 'in_progress' } }),
+      this.assessmentRepository.count({ where: { status: 'submitted' } }),
+      this.assessmentRepository.count({ where: { status: 'passed' } }),
+      this.assessmentRepository.count({ where: { status: 'failed' } }),
+      this.assessmentRepository.count({ where: { status: 'needs_review' } }),
+      this.agentJobRepository.count({ where: { status: 'queued' } }),
+      this.agentJobRepository.count({ where: { status: 'running' } }),
+      this.agentJobRepository
+        .createQueryBuilder('job')
+        .where('job.status = :status', { status: 'completed' })
+        .andWhere('job.completedAt >= :today', { today })
+        .getCount(),
+      this.agentJobRepository
+        .createQueryBuilder('job')
+        .where('job.status = :status', { status: 'failed' })
+        .andWhere('job.failedAt >= :today', { today })
+        .getCount(),
+      this.agentJobRepository
+        .createQueryBuilder('job')
+        .select('job.jobType', 'jobType')
+        .addSelect('COUNT(*)', 'count')
+        .where('job.status = :status', { status: 'failed' })
+        .andWhere('job.failedAt >= :today', { today })
+        .andWhere('job.jobType IN (:...agentTypes)', {
+          agentTypes: this.agentTypes,
+        })
+        .groupBy('job.jobType')
+        .getRawMany<{ jobType: string; count: string }>(),
+    ]);
+
+    const failuresByAgent = new Map(
+      agentFailuresToday.map((row) => [row.jobType, parseInt(row.count, 10)]),
+    );
+    const agentHealth = this.agentTypes.reduce(
+      (totals, agentType) => {
+        const status = this.getAgentHealthStatus(
+          failuresByAgent.get(agentType) ?? 0,
+        );
+        if (status === 'failing') totals.failing += 1;
+        if (status === 'healthy') totals.healthy += 1;
+        return totals;
+      },
+      { healthy: 0, failing: 0 },
+    );
+
     const userStats = {
-      total: await this.userRepository.count(),
-      customers: await this.userRepository.count({ where: { role: UserRole.CUSTOMER } }),
-      freelancers: await this.userRepository.count({ where: { role: UserRole.FREELANCER } }),
-      admins: await this.userRepository.count({ where: { role: UserRole.ADMIN } }),
-      emailVerified: await this.userRepository.count({ where: { isEmailVerified: true } }),
-      emailPending: await this.userRepository.count({ where: { isEmailVerified: false } }),
+      total: totalUsers,
+      customers,
+      freelancers,
+      admins,
+      emailVerified,
+      emailPending,
     };
 
-    // 2. Projects
     const projectStats = {
-      total: await this.projectRepository.count(),
-      draft: await this.projectRepository.count({ where: { status: ProjectStatus.DRAFT } }),
-      briefComplete: await this.projectRepository.count({ where: { status: ProjectStatus.BRIEF_COMPLETE } }),
-      assigned: await this.projectRepository.count({ where: { status: ProjectStatus.ASSIGNED } }),
-      active: await this.projectRepository.count({ where: { status: ProjectStatus.ACTIVE } }),
-      completed: await this.projectRepository.count({ where: { status: ProjectStatus.COMPLETED } }),
+      total: totalProjects,
+      draft: draftProjects,
+      briefComplete: briefCompleteProjects,
+      assigned: assignedProjects,
+      active: activeProjects,
+      completed: completedProjects,
     };
-
-    // 3. Freelancers by verification status
-    const freelancerStatuses = await this.freelancerProfileRepository
-      .createQueryBuilder('fp')
-      .select('fp.verificationStatus, COUNT(*) as count')
-      .groupBy('fp.verificationStatus')
-      .getRawMany();
 
     const freelancerStats = {
-      total: await this.freelancerProfileRepository.count(),
+      total: totalFreelancers,
       profileIncomplete: 0,
       cvPending: 0,
       assessmentPending: 0,
@@ -120,65 +403,45 @@ export class AdminService {
     };
 
     freelancerStatuses.forEach((row) => {
-      const key = row.fp_verificationStatus;
+      const key = row.verificationStatus;
       const count = parseInt(row.count, 10);
-      if (key === 'profile_incomplete') freelancerStats.profileIncomplete = count;
+      if (key === 'profile_incomplete')
+        freelancerStats.profileIncomplete = count;
       else if (key === 'cv_pending') freelancerStats.cvPending = count;
-      else if (key === 'assessment_pending') freelancerStats.assessmentPending = count;
-      else if (key === 'assessment_in_progress') freelancerStats.assessmentInProgress = count;
-      else if (key === 'assessment_submitted') freelancerStats.assessmentSubmitted = count;
+      else if (key === 'assessment_pending')
+        freelancerStats.assessmentPending = count;
+      else if (key === 'assessment_in_progress')
+        freelancerStats.assessmentInProgress = count;
+      else if (key === 'assessment_submitted')
+        freelancerStats.assessmentSubmitted = count;
       else if (key === 'approved') freelancerStats.approved = count;
       else if (key === 'rejected') freelancerStats.rejected = count;
     });
 
-    // 4. Assessments
     const assessmentStats = {
-      total: await this.assessmentRepository.count(),
-      inProgress: await this.assessmentRepository.count({ where: { status: 'in_progress' } }),
-      submitted: await this.assessmentRepository.count({ where: { status: 'submitted' } }),
-      passed: await this.assessmentRepository.count({ where: { status: 'passed' } }),
-      failed: await this.assessmentRepository.count({ where: { status: 'failed' } }),
-      needsReview: await this.assessmentRepository.count({ where: { status: 'needs_review' } }),
+      total: totalAssessments,
+      inProgress: inProgressAssessments,
+      submitted: submittedAssessments,
+      passed: passedAssessments,
+      failed: failedAssessments,
+      needsReview: needsReviewAssessments,
     };
-
-    // 5. Agent jobs
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
 
     const agentTotals = {
-      queued: await this.agentJobRepository.count({ where: { status: 'queued' } }),
-      running: await this.agentJobRepository.count({ where: { status: 'running' } }),
-      completedToday: 0,
-      failedToday: 0,
-      healthy: 3,
-      failing: 1,
+      queued: queuedAgents,
+      running: runningAgents,
+      completedToday,
+      failedToday,
+      healthy: agentHealth.healthy,
+      failing: agentHealth.failing,
     };
-
-    const completedToday = await this.agentJobRepository
-      .createQueryBuilder('job')
-      .where('job.status = :status', { status: 'completed' })
-      .andWhere('job.completedAt >= :today', { today })
-      .getCount();
-
-    const failedToday = await this.agentJobRepository
-      .createQueryBuilder('job')
-      .where('job.status = :status', { status: 'failed' })
-      .andWhere('job.failedAt >= :today', { today })
-      .getCount();
-
-    agentTotals.completedToday = completedToday;
-    agentTotals.failedToday = failedToday;
 
     return {
       users: userStats,
       projects: projectStats,
       freelancers: freelancerStats,
       assessments: assessmentStats,
-      agents: {
-        ...agentTotals,
-        healthy: 3,
-        failing: 1,
-      },
+      agents: agentTotals,
     };
   }
 
@@ -220,6 +483,22 @@ export class AdminService {
     }
 
     const [profiles, total] = await query.getManyAndCount();
+    const profileIds = profiles.map((profile) => profile.id);
+    const skillScores =
+      profileIds.length > 0
+        ? await this.skillScoreRepository.find({
+            where: { freelancerProfileId: In(profileIds) },
+            order: { score: 'DESC', skill: 'ASC' },
+          })
+        : [];
+    const topSkillScoresByProfile = skillScores.reduce((map, score) => {
+      const existing = map.get(score.freelancerProfileId) ?? [];
+      if (existing.length < 5) {
+        existing.push(this.toSkillScoreDto(score));
+        map.set(score.freelancerProfileId, existing);
+      }
+      return map;
+    }, new Map<string, ReturnType<typeof this.toSkillScoreDto>[]>());
 
     const data = profiles.map((profile) => ({
       id: profile.id,
@@ -233,6 +512,10 @@ export class AdminService {
       verificationStatus: profile.verificationStatus,
       assessmentScore: profile.assessmentScore,
       assessmentSubmittedAt: profile.assessmentSubmittedAt,
+      approvedAt: profile.approvedAt,
+      rejectedAt: profile.rejectedAt,
+      aiProfileSummary: this.getProfileSummary(profile.summary),
+      topSkillScores: topSkillScoresByProfile.get(profile.id) ?? [],
       createdAt: profile.createdAt,
     }));
 
@@ -246,16 +529,21 @@ export class AdminService {
     });
 
     if (!profile) {
-      throw new Error('Freelancer profile not found');
+      throw new NotFoundException('Freelancer profile not found');
     }
 
     const assessment = await this.assessmentRepository.findOne({
       where: { freelancerProfileId: id },
       order: { createdAt: 'DESC' },
     });
+    const skillScores = await this.skillScoreRepository.find({
+      where: { freelancerProfileId: id },
+      order: { score: 'DESC', skill: 'ASC' },
+    });
 
-    let questions: any[] = [];
-    let answers: any[] = [];
+    let questions: FreelancerAssessmentQuestion[] = [];
+    let answers: FreelancerAssessmentAnswer[] = [];
+    let warningCount = 0;
     if (assessment) {
       questions = await this.questionRepository.find({
         where: { assessmentId: assessment.id },
@@ -264,7 +552,12 @@ export class AdminService {
       answers = await this.answerRepository.find({
         where: { assessmentId: assessment.id },
       });
+      warningCount =
+        (await this.getWarningCounts([assessment.id])).get(assessment.id) ?? 0;
     }
+    const answersByQuestionId = new Map(
+      answers.map((answer) => [answer.questionId, answer]),
+    );
 
     return {
       profile: {
@@ -277,10 +570,18 @@ export class AdminService {
         skills: profile.skills,
         yearsExperience: profile.yearsExperience,
         hourlyRate: profile.hourlyRate,
+        availabilityHoursPerWeek: profile.availabilityHoursPerWeek,
+        isAvailable: profile.isAvailable,
         cvUrl: profile.cvUrl,
         verificationStatus: profile.verificationStatus,
         assessmentScore: profile.assessmentScore,
         assessmentSubmittedAt: profile.assessmentSubmittedAt,
+        approvedAt: profile.approvedAt,
+        rejectedAt: profile.rejectedAt,
+        rejectionReason: profile.rejectionReason,
+        summary: profile.summary,
+        aiProfileSummary: this.getProfileSummary(profile.summary),
+        skillScores: skillScores.map((score) => this.toSkillScoreDto(score)),
         createdAt: profile.createdAt,
         updatedAt: profile.updatedAt,
       },
@@ -289,38 +590,129 @@ export class AdminService {
             id: assessment.id,
             status: assessment.status,
             score: assessment.score,
+            recommendation: this.getAiRecommendation(assessment.aiFeedback),
+            aiFeedback: assessment.aiFeedback,
+            warningCount,
             submittedAt: assessment.submittedAt,
             startedAt: assessment.startedAt,
             expiresAt: assessment.expiresAt,
-            questions,
+            questions: questions.map((question) => {
+              const answer = answersByQuestionId.get(question.id);
+              return {
+                id: question.id,
+                type: question.questionType,
+                skill: question.skill,
+                prompt: question.prompt,
+                orderIndex: question.orderIndex,
+                answer: answer?.answer ?? null,
+                score: answer?.score ?? null,
+                feedback: answer?.feedback ?? null,
+              };
+            }),
             answers,
           }
         : null,
     };
   }
 
-  async updateFreelancerVerification(id: string, payload: { status: string; reason?: string }) {
+  async updateFreelancerVerification(
+    id: string,
+    payload: { status: string; reason?: string },
+    adminUserId?: string,
+  ) {
     const profile = await this.freelancerProfileRepository.findOne({
       where: { id },
     });
 
     if (!profile) {
-      throw new Error('Freelancer profile not found');
+      throw new NotFoundException('Freelancer profile not found');
     }
 
     profile.verificationStatus = payload.status;
     if (payload.status === 'approved') {
       profile.approvedAt = new Date();
+      profile.rejectedAt = null;
+      profile.rejectionReason = null;
     } else if (payload.status === 'rejected') {
       profile.rejectedAt = new Date();
       profile.rejectionReason = payload.reason || 'No reason provided';
+      profile.approvedAt = null;
     }
 
     await this.freelancerProfileRepository.save(profile);
 
-    // TODO: Create notification for freelancer
+    await this.notificationsService.createNotification({
+      userId: profile.userId,
+      title:
+        payload.status === 'approved'
+          ? 'Verification approved'
+          : payload.status === 'rejected'
+            ? 'Verification update'
+            : 'Verification status updated',
+      body:
+        payload.status === 'approved'
+          ? 'Your freelancer verification was approved. You can now receive matched work.'
+          : payload.status === 'rejected'
+            ? `Your freelancer verification was not approved. ${profile.rejectionReason ?? ''}`.trim()
+            : `Your verification status changed to ${payload.status}.`,
+    });
+
+    profile.summary = this.appendAdminFeedback(
+      profile.summary,
+      'lastAdminVerificationUpdate',
+      {
+        status: payload.status,
+        reason: payload.reason ?? null,
+        adminUserId: adminUserId ?? null,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+    await this.freelancerProfileRepository.save(profile);
 
     return profile;
+  }
+
+  async updateFreelancerSkillScore(
+    profileId: string,
+    skillScoreId: string,
+    dto: UpdateFreelancerSkillScoreDto,
+    adminUserId: string,
+  ) {
+    const skillScore = await this.skillScoreRepository.findOne({
+      where: { id: skillScoreId, freelancerProfileId: profileId },
+    });
+    if (!skillScore) throw new NotFoundException('Skill score not found');
+
+    skillScore.score = dto.score.toFixed(2);
+    if (dto.confidence !== undefined) {
+      skillScore.confidence = dto.confidence.toFixed(2);
+    }
+    if (dto.evidence !== undefined) {
+      skillScore.evidence = dto.evidence;
+    }
+    skillScore.source = 'admin_override';
+    await this.skillScoreRepository.save(skillScore);
+
+    const profile = await this.freelancerProfileRepository.findOne({
+      where: { id: profileId },
+    });
+    if (profile) {
+      profile.summary = this.appendAdminFeedback(
+        profile.summary,
+        'lastAdminSkillScoreUpdate',
+        {
+          skillScoreId,
+          skill: skillScore.skill,
+          score: skillScore.score,
+          confidence: skillScore.confidence,
+          adminUserId,
+          updatedAt: new Date().toISOString(),
+        },
+      );
+      await this.freelancerProfileRepository.save(profile);
+    }
+
+    return this.getFreelancerDetail(profileId);
   }
 
   // ===== Assessment Review =====
@@ -337,8 +729,8 @@ export class AdminService {
   ) {
     const query = this.assessmentRepository
       .createQueryBuilder('a')
-      .leftJoin('a.freelancerProfile', 'fp')
-      .leftJoin('fp.user', 'user')
+      .leftJoinAndSelect('a.freelancerProfile', 'fp')
+      .leftJoinAndSelect('fp.user', 'user')
       .orderBy('a.submittedAt', 'DESC')
       .skip((pageNum - 1) * limitNum)
       .take(limitNum);
@@ -366,15 +758,20 @@ export class AdminService {
     }
 
     const [assessments, total] = await query.getManyAndCount();
+    const warningCounts = await this.getWarningCounts(
+      assessments.map((assessment) => assessment.id),
+    );
 
     const data = assessments.map((a) => ({
       id: a.id,
+      freelancerProfileId: a.freelancerProfileId,
       freelancerName: `${a.freelancerProfile.user.firstName} ${a.freelancerProfile.user.lastName}`,
       freelancerEmail: a.freelancerProfile.user.email,
       score: a.score,
       status: a.status,
-      recommendation: a.aiFeedback?.decision || null,
-      warningCount: 0,
+      recommendation: this.getAiRecommendation(a.aiFeedback),
+      profileSummary: this.getProfileSummary(a.freelancerProfile.summary),
+      warningCount: warningCounts.get(a.id) ?? 0,
       submittedAt: a.submittedAt,
       startedAt: a.startedAt,
     }));
@@ -389,7 +786,7 @@ export class AdminService {
     });
 
     if (!assessment) {
-      throw new Error('Assessment not found');
+      throw new NotFoundException('Assessment not found');
     }
 
     const questions = await this.questionRepository.find({
@@ -404,12 +801,23 @@ export class AdminService {
     const events = await this.eventRepository.find({
       where: { assessmentId: id },
     });
+    const skillScores = await this.skillScoreRepository.find({
+      where: { freelancerProfileId: assessment.freelancerProfile.id },
+      order: { score: 'DESC', skill: 'ASC' },
+    });
 
     const eventSummary = {
       total: events.length,
+      warningCount: events.filter((e) =>
+        this.warningEventTypes.includes(e.eventType),
+      ).length,
       focusLost: events.filter((e) => e.eventType === 'focus_lost').length,
-      fullscreenExit: events.filter((e) => e.eventType === 'fullscreen_exit').length,
+      fullscreenExit: events.filter((e) => e.eventType === 'fullscreen_exit')
+        .length,
     };
+    const answersByQuestionId = new Map(
+      answers.map((answer) => [answer.questionId, answer]),
+    );
 
     return {
       id: assessment.id,
@@ -418,33 +826,127 @@ export class AdminService {
         name: `${assessment.freelancerProfile.user.firstName} ${assessment.freelancerProfile.user.lastName}`,
         email: assessment.freelancerProfile.user.email,
         headline: assessment.freelancerProfile.headline,
+        cvUrl: assessment.freelancerProfile.cvUrl,
+        verificationStatus: assessment.freelancerProfile.verificationStatus,
       },
       status: assessment.status,
       score: assessment.score,
-      recommendation: assessment.aiFeedback?.decision || null,
+      recommendation: this.getAiRecommendation(assessment.aiFeedback),
+      aiFeedback: assessment.aiFeedback,
+      profileSummary: this.getProfileSummary(
+        assessment.freelancerProfile.summary,
+      ),
+      skillScores: skillScores.map((score) => this.toSkillScoreDto(score)),
       submittedAt: assessment.submittedAt,
       startedAt: assessment.startedAt,
       expiresAt: assessment.expiresAt,
       questions: questions.map((q) => {
-        const ans = answers.find((a) => a.questionId === q.id);
+        const ans = answersByQuestionId.get(q.id);
         return {
           id: q.id,
           type: q.questionType,
           skill: q.skill,
           prompt: q.prompt,
           orderIndex: q.orderIndex,
-          answer: ans?.answer || null,
-          score: ans?.score || null,
-          feedback: ans?.feedback || null,
+          answer: ans?.answer ?? null,
+          score: ans?.score ?? null,
+          feedback: ans?.feedback ?? null,
         };
       }),
+      events: events
+        .slice()
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .map((event) => ({
+          id: event.id,
+          eventType: event.eventType,
+          metadata: event.metadata,
+          isWarning: this.warningEventTypes.includes(event.eventType),
+          createdAt: event.createdAt,
+        })),
       eventsSummary: eventSummary,
     };
   }
 
+  async updateAssessmentScore(
+    id: string,
+    dto: UpdateAssessmentScoreDto,
+    adminUserId: string,
+  ) {
+    const assessment = await this.assessmentRepository.findOne({
+      where: { id },
+      relations: ['freelancerProfile'],
+    });
+    if (!assessment) throw new NotFoundException('Assessment not found');
+
+    assessment.score = dto.score.toFixed(2);
+    assessment.aiFeedback = this.appendAdminFeedback(
+      assessment.aiFeedback,
+      'lastAdminScoreOverride',
+      {
+        score: assessment.score,
+        notes: dto.notes ?? null,
+        adminUserId,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+    await this.assessmentRepository.save(assessment);
+
+    if (assessment.freelancerProfile) {
+      assessment.freelancerProfile.assessmentScore = assessment.score;
+      await this.freelancerProfileRepository.save(assessment.freelancerProfile);
+    }
+
+    return this.getAssessmentDetail(id);
+  }
+
+  async updateAssessmentAnswerScore(
+    id: string,
+    questionId: string,
+    dto: UpdateAssessmentAnswerScoreDto,
+    adminUserId: string,
+  ) {
+    const assessment = await this.assessmentRepository.findOne({
+      where: { id },
+    });
+    if (!assessment) throw new NotFoundException('Assessment not found');
+
+    const answer = await this.answerRepository.findOne({
+      where: { assessmentId: id, questionId },
+    });
+    if (!answer) {
+      throw new NotFoundException('No saved answer exists for this question');
+    }
+
+    answer.score = dto.score.toFixed(2);
+    if (dto.feedback !== undefined) {
+      answer.feedback = dto.feedback;
+    }
+    await this.answerRepository.save(answer);
+
+    assessment.aiFeedback = this.appendAdminFeedback(
+      assessment.aiFeedback,
+      'lastAdminAnswerScoreOverride',
+      {
+        questionId,
+        score: answer.score,
+        feedback: answer.feedback,
+        adminUserId,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+    await this.assessmentRepository.save(assessment);
+
+    return this.getAssessmentDetail(id);
+  }
+
   async reviewAssessment(
     id: string,
-    payload: { decision: 'pass' | 'fail' | 'needs_review'; notes?: string; scoreOverride?: number },
+    payload: {
+      decision: 'pass' | 'fail' | 'needs_review';
+      notes?: string;
+      scoreOverride?: number;
+    },
+    adminUserId?: string,
   ) {
     const assessment = await this.assessmentRepository.findOne({
       where: { id },
@@ -452,17 +954,24 @@ export class AdminService {
     });
 
     if (!assessment) {
-      throw new Error('Assessment not found');
+      throw new NotFoundException('Assessment not found');
     }
 
-    if (assessment.status !== 'submitted' && assessment.status !== 'needs_review') {
-      throw new Error('Assessment is not in a reviewable state');
+    if (!this.adminReviewableAssessmentStatuses.has(assessment.status)) {
+      throw new BadRequestException(
+        'Assessment is not ready for admin review yet',
+      );
     }
 
     // Update assessment
-    assessment.status = payload.decision === 'pass' ? 'passed' : payload.decision === 'fail' ? 'failed' : 'needs_review';
+    assessment.status =
+      payload.decision === 'pass'
+        ? 'passed'
+        : payload.decision === 'fail'
+          ? 'failed'
+          : 'needs_review';
     if (payload.scoreOverride !== undefined && payload.scoreOverride !== null) {
-      assessment.score = String(payload.scoreOverride); // cast to string
+      assessment.score = payload.scoreOverride.toFixed(2);
     }
 
     // Store decision and notes in aiFeedback
@@ -470,34 +979,54 @@ export class AdminService {
       ...(assessment.aiFeedback || {}),
       decision: payload.decision,
       notes: payload.notes,
+      reviewedBy: adminUserId ?? null,
       reviewedAt: new Date(),
     };
 
     await this.assessmentRepository.save(assessment);
 
-    // Update freelancer verification status based on decision
+    const profile = assessment.freelancerProfile;
+
+    // Update freelancer verification status based on decision. Admin decisions
+    // are authoritative and can override an AI pass/fail recommendation.
     if (payload.decision === 'pass') {
-      const profile = await this.freelancerProfileRepository.findOne({
-        where: { id: assessment.freelancerProfile.id },
-      });
-      if (profile) {
-        profile.verificationStatus = 'approved';
-        profile.approvedAt = new Date();
-        await this.freelancerProfileRepository.save(profile);
-      }
+      profile.verificationStatus = 'approved';
+      profile.approvedAt = new Date();
+      profile.rejectedAt = null;
+      profile.rejectionReason = null;
     } else if (payload.decision === 'fail') {
-      const profile = await this.freelancerProfileRepository.findOne({
-        where: { id: assessment.freelancerProfile.id },
-      });
-      if (profile) {
-        profile.verificationStatus = 'rejected';
-        profile.rejectedAt = new Date();
-        profile.rejectionReason = payload.notes || 'Assessment failed review';
-        await this.freelancerProfileRepository.save(profile);
-      }
+      profile.verificationStatus = 'rejected';
+      profile.rejectedAt = new Date();
+      profile.rejectionReason = payload.notes || 'Assessment failed review';
+      profile.approvedAt = null;
+    } else {
+      profile.verificationStatus = 'assessment_submitted';
+      profile.approvedAt = null;
+      profile.rejectedAt = null;
+      profile.rejectionReason = null;
     }
 
-    // TODO: Create notification for freelancer
+    if (assessment.score !== null) {
+      profile.assessmentScore = assessment.score;
+    }
+    await this.freelancerProfileRepository.save(profile);
+
+    await this.notificationsService.createNotification({
+      userId: assessment.freelancerProfile.userId,
+      title:
+        payload.decision === 'pass'
+          ? 'Assessment approved'
+          : payload.decision === 'fail'
+            ? 'Assessment reviewed'
+            : 'Assessment needs review',
+      body:
+        payload.decision === 'pass'
+          ? 'Your assessment was approved. Your profile is now ready for matching.'
+          : payload.decision === 'fail'
+            ? payload.notes || 'Your assessment was not approved after review.'
+            : payload.notes ||
+              'Your assessment needs another review before verification can continue.',
+    });
 
     return { id: assessment.id, status: assessment.status };
   }
@@ -505,56 +1034,49 @@ export class AdminService {
   // ===== Agent Overview =====
 
   async getAgentOverview() {
-    const agentTypes = [
-      'requirements',
-      'cv_extraction',
-      'assessment_generation',
-      'assessment_grading',
-      'matching',
-      'evaluation',
-    ];
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = this.getTodayStart();
 
     const agents = await Promise.all(
-      agentTypes.map(async (name) => {
-        const queued = await this.agentJobRepository.count({
-          where: { jobType: name, status: 'queued' },
-        });
-        const running = await this.agentJobRepository.count({
-          where: { jobType: name, status: 'running' },
-        });
+      this.agentTypes.map(async (name) => {
+        const [
+          queued,
+          running,
+          completedToday,
+          failedToday,
+          lastSuccess,
+          lastFailure,
+        ] = await Promise.all([
+          this.agentJobRepository.count({
+            where: { jobType: name, status: 'queued' },
+          }),
+          this.agentJobRepository.count({
+            where: { jobType: name, status: 'running' },
+          }),
+          this.agentJobRepository
+            .createQueryBuilder('job')
+            .where('job.jobType = :jobType', { jobType: name })
+            .andWhere('job.status = :status', { status: 'completed' })
+            .andWhere('job.completedAt >= :today', { today })
+            .getCount(),
+          this.agentJobRepository
+            .createQueryBuilder('job')
+            .where('job.jobType = :jobType', { jobType: name })
+            .andWhere('job.status = :status', { status: 'failed' })
+            .andWhere('job.failedAt >= :today', { today })
+            .getCount(),
+          this.agentJobRepository.findOne({
+            where: { jobType: name, status: 'completed' },
+            order: { completedAt: 'DESC' },
+            select: ['completedAt'],
+          }),
+          this.agentJobRepository.findOne({
+            where: { jobType: name, status: 'failed' },
+            order: { failedAt: 'DESC' },
+            select: ['failedAt'],
+          }),
+        ]);
 
-        const completedToday = await this.agentJobRepository
-          .createQueryBuilder('job')
-          .where('job.jobType = :jobType', { jobType: name })
-          .andWhere('job.status = :status', { status: 'completed' })
-          .andWhere('job.completedAt >= :today', { today })
-          .getCount();
-
-        const failedToday = await this.agentJobRepository
-          .createQueryBuilder('job')
-          .where('job.jobType = :jobType', { jobType: name })
-          .andWhere('job.status = :status', { status: 'failed' })
-          .andWhere('job.failedAt >= :today', { today })
-          .getCount();
-
-        const lastSuccess = await this.agentJobRepository.findOne({
-          where: { jobType: name, status: 'completed' },
-          order: { completedAt: 'DESC' },
-          select: ['completedAt'],
-        });
-
-        const lastFailure = await this.agentJobRepository.findOne({
-          where: { jobType: name, status: 'failed' },
-          order: { failedAt: 'DESC' },
-          select: ['failedAt'],
-        });
-
-        let health = 'healthy';
-        if (failedToday > 2) health = 'failing';
-        else if (failedToday > 0) health = 'degraded';
+        const health = this.getAgentHealthStatus(failedToday);
 
         return {
           name,
@@ -563,15 +1085,28 @@ export class AdminService {
           running,
           completedToday,
           failedToday,
-          lastSuccessAt: lastSuccess?.completedAt || null,
-          lastFailureAt: lastFailure?.failedAt || null,
+          lastSuccessAt: lastSuccess?.completedAt ?? null,
+          lastFailureAt: lastFailure?.failedAt ?? null,
         };
-      })
+      }),
+    );
+
+    const healthTotals = agents.reduce(
+      (totals, agent) => {
+        if (agent.status === 'healthy') totals.healthy += 1;
+        if (agent.status === 'failing') totals.failing += 1;
+        return totals;
+      },
+      { healthy: 0, failing: 0 },
     );
 
     const totals = {
-      queued: await this.agentJobRepository.count({ where: { status: 'queued' } }),
-      running: await this.agentJobRepository.count({ where: { status: 'running' } }),
+      queued: await this.agentJobRepository.count({
+        where: { status: 'queued' },
+      }),
+      running: await this.agentJobRepository.count({
+        where: { status: 'running' },
+      }),
       completedToday: await this.agentJobRepository
         .createQueryBuilder('job')
         .where('job.status = :status', { status: 'completed' })
@@ -582,6 +1117,8 @@ export class AdminService {
         .where('job.status = :status', { status: 'failed' })
         .andWhere('job.failedAt >= :today', { today })
         .getCount(),
+      healthy: healthTotals.healthy,
+      failing: healthTotals.failing,
     };
 
     return { agents, totals };
@@ -589,7 +1126,12 @@ export class AdminService {
 
   // ===== Agent Jobs =====
 
-  async getAgentJobs(pageNum: number, limitNum: number, status?: string, jobType?: string) {
+  async getAgentJobs(
+    pageNum: number,
+    limitNum: number,
+    status?: string,
+    jobType?: string,
+  ) {
     const query = this.agentJobRepository
       .createQueryBuilder('job')
       .orderBy('job.createdAt', 'DESC')
@@ -609,10 +1151,9 @@ export class AdminService {
       id: job.id,
       jobType: job.jobType,
       status: job.status,
-      userId: null,
+      userId: job.userId,
       projectId: job.projectId,
-      targetType: job.taskId ? 'task' : job.briefId ? 'brief' : job.submissionId ? 'submission' : job.matchingRunId ? 'matching_run' : null,
-      targetId: job.taskId || job.briefId || job.submissionId || job.matchingRunId || null,
+      ...this.getAgentJobTarget(job),
       payload: job.input,
       result: job.output,
       error: job.error,
@@ -632,17 +1173,16 @@ export class AdminService {
     });
 
     if (!job) {
-      throw new Error('Agent job not found');
+      throw new NotFoundException('Agent job not found');
     }
 
     return {
       id: job.id,
       jobType: job.jobType,
       status: job.status,
-      userId: null,
+      userId: job.userId,
       projectId: job.projectId,
-      targetType: job.taskId ? 'task' : job.briefId ? 'brief' : job.submissionId ? 'submission' : job.matchingRunId ? 'matching_run' : null,
-      targetId: job.taskId || job.briefId || job.submissionId || job.matchingRunId || null,
+      ...this.getAgentJobTarget(job),
       payload: job.input,
       result: job.output,
       error: job.error,
