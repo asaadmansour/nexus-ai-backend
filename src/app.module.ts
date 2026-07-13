@@ -13,6 +13,7 @@ import { AgentsModule } from './agents/agents.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { EmailModule } from './email/email.module';
 import { AdminModule } from './admin/admin.module';
+import { SearchModule } from './search/search.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { AdminModule } from './admin/admin.module';
     NotificationsModule,
     EmailModule,
     AdminModule,
+    SearchModule,
   ],
   controllers: [AppController],
   providers: [AppService],

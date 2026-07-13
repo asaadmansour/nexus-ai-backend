@@ -12,37 +12,37 @@ import { User } from '../../users/entities/user.entity';
 @Entity('notifications')
 export class Notification {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ name: 'user_id', type: 'uuid' })
-  userId: string;
+  userId!: string;
 
   @ManyToOne(() => User, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'user_id' })
-  user: User;
+  user!: User;
 
   @Column({ name: 'project_id', type: 'uuid', nullable: true })
-  projectId: string | null;
+  projectId!: string | null;
 
   @ManyToOne(() => Project, { nullable: true, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'project_id' })
-  project: Project | null;
+  project!: Project | null;
 
   @Column({ name: 'task_id', type: 'uuid', nullable: true })
-  taskId: string | null;
+  taskId!: string | null;
 
   @Column({ type: 'varchar', length: 255 })
-  title: string;
+  title!: string;
 
   @Column({ type: 'text', nullable: true })
-  body: string | null;
+  body!: string | null;
 
   @Column({ name: 'is_read', type: 'boolean', default: false })
-  isRead: boolean;
+  isRead!: boolean;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
-  createdAt: Date;
+  createdAt!: Date;
 
   @Column({ name: 'read_at', type: 'timestamptz', nullable: true })
-  readAt: Date | null;
+  readAt!: Date | null;
 }
