@@ -18,9 +18,10 @@ async function bootstrap() {
   app.useGlobalFilters(new DatabaseExceptionFilter());
   app.use(cookieParser());
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: ['http://localhost:3000', 'http://localhost:3001'],
     credentials: true,
   });
+
   app.enableShutdownHooks();
   await app.listen(process.env.PORT ?? 3000);
 }

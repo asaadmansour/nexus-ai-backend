@@ -13,42 +13,42 @@ import { Brief } from '../../projects/entities/brief.entity';
 @Entity('agent_jobs')
 export class AgentJob {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ name: 'agent_name', type: 'varchar', length: 50, nullable: true })
-  agentName: string | null;
+  agentName!: string | null;
 
   @Column({ name: 'job_type', type: 'varchar', length: 50 })
-  jobType: string;
+  jobType!: string;
 
   @Column({ name: 'project_id', type: 'uuid', nullable: true })
-  projectId: string | null;
+  projectId!: string | null;
 
   @ManyToOne(() => Project, { nullable: true, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'project_id' })
-  project: Project | null;
+  project!: Project | null;
 
   @Column({ name: 'task_id', type: 'uuid', nullable: true })
-  taskId: string | null;
+  taskId!: string | null;
 
   @Column({ name: 'brief_id', type: 'uuid', nullable: true })
-  briefId: string | null;
+  briefId!: string | null;
 
   @ManyToOne(() => Brief, { nullable: true, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'brief_id' })
-  brief: Brief | null;
+  brief!: Brief | null;
 
   @Column({ name: 'submission_id', type: 'uuid', nullable: true })
-  submissionId: string | null;
+  submissionId!: string | null;
 
   @Column({ name: 'matching_run_id', type: 'uuid', nullable: true })
-  matchingRunId: string | null;
+  matchingRunId!: string | null;
 
   @Column({ type: 'varchar', length: 40, default: 'queued' })
-  status: string;
+  status!: string;
 
   @Column({ name: 'queue_name', type: 'varchar', length: 100, nullable: true })
-  queueName: string | null;
+  queueName!: string | null;
 
   @Column({
     name: 'queue_job_id',
@@ -56,38 +56,38 @@ export class AgentJob {
     length: 255,
     nullable: true,
   })
-  queueJobId: string | null;
+  queueJobId!: string | null;
 
   @Column({ type: 'jsonb', nullable: true })
-  input: Record<string, unknown> | null;
+  input!: Record<string, unknown> | null;
 
   @Column({ type: 'jsonb', nullable: true })
-  output: Record<string, unknown> | null;
+  output!: Record<string, unknown> | null;
 
   @Column({ type: 'text', nullable: true })
-  error: string | null;
+  error!: string | null;
 
   @Column({ type: 'int', default: 0 })
-  attempts: number;
+  attempts!: number;
 
   @Column({ name: 'max_attempts', type: 'int', default: 3 })
-  maxAttempts: number;
+  maxAttempts!: number;
 
   @Column({ name: 'locked_at', type: 'timestamptz', nullable: true })
-  lockedAt: Date | null;
+  lockedAt!: Date | null;
 
   @Column({ name: 'started_at', type: 'timestamptz', nullable: true })
-  startedAt: Date | null;
+  startedAt!: Date | null;
 
   @Column({ name: 'completed_at', type: 'timestamptz', nullable: true })
-  completedAt: Date | null;
+  completedAt!: Date | null;
 
   @Column({ name: 'failed_at', type: 'timestamptz', nullable: true })
-  failedAt: Date | null;
+  failedAt!: Date | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
-  createdAt: Date;
+  createdAt!: Date;
 
   @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
-  updatedAt: Date;
+  updatedAt!: Date;
 }

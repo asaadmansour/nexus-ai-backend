@@ -1,12 +1,29 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AdminController } from './admin.controller';
+import { AdminService } from './admin.service';
 import { User } from 'src/users/entities/user.entity';
 import { Project } from 'src/projects/entities/project.entity';
-import { AdminService } from './admin.service';
+import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
+import { FreelancerAssessmentQuestion } from 'src/freelancers/entities/freelancer-assessment-question.entity';
+import { FreelancerAssessmentAnswer } from 'src/freelancers/entities/freelancer-assessment-answer.entity';
+import { FreelancerAssessmentEvent } from 'src/freelancers/entities/freelancer-assessment-event.entity';
+import { AgentJob } from 'src/agents/entities/agent-job.entity';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([User, Project])],
+  imports: [
+    TypeOrmModule.forFeature([
+      User,
+      Project,
+      FreelancerProfile,
+      FreelancerAssessment,
+      FreelancerAssessmentQuestion,
+      FreelancerAssessmentAnswer,
+      FreelancerAssessmentEvent, 
+      AgentJob,
+    ]),
+  ],
   controllers: [AdminController],
   providers: [AdminService],
 })
