@@ -99,6 +99,14 @@ export class AuthService {
       const savedUser = await queryRunner.manager.save(user);
       const userResponse = this.toPublicUser(savedUser);
 
+      // Freelancers need a profile row from signup so verification/assessment load.
+      if (savedUser.role === UserRole.FREELANCER) {
+        const freelancerProfile = queryRunner.manager.create(FreelancerProfile, {
+          userId: savedUser.id,
+        });
+        await queryRunner.manager.save(freelancerProfile);
+      }
+
       const { accessToken, refreshToken } = await this.generateTokens(
         savedUser.id,
         queryRunner,
