@@ -3,7 +3,14 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { BriefEmbedding } from './entities/brief-embedding.entity';
 import { BriefMessage } from './entities/brief-message.entity';
 import { Brief } from './entities/brief.entity';
+import { ProjectMilestone } from './entities/project-milestone.entity';
+import { ProjectPlan } from './entities/project-plan.entity';
+import { ProjectPlanningSubmission } from './entities/project-planning-submission.entity';
+import { ProjectRoleAssignment } from './entities/project-role-assignment.entity';
+import { ProjectSpec } from './entities/project-spec.entity';
 import { Project } from './entities/project.entity';
+import { ProjectTaskDependency } from './entities/project-task-dependency.entity';
+import { ProjectTask } from './entities/project-task.entity';
 import { ProjectsController } from './projects.controller';
 import { ProjectsService } from './projects.service';
 import { ProjectStatusHistory } from './entities/project-status-history.entity';
@@ -19,6 +26,13 @@ import { AgentsModule } from 'src/agents/agents.module';
       Brief,
       BriefEmbedding,
       BriefMessage,
+      ProjectRoleAssignment,
+      ProjectPlanningSubmission,
+      ProjectPlan,
+      ProjectSpec,
+      ProjectMilestone,
+      ProjectTask,
+      ProjectTaskDependency,
     ]),
   ],
   controllers: [ProjectsController, BriefController],

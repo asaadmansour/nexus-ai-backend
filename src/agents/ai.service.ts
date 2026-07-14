@@ -1,8 +1,10 @@
+import { createHash } from 'crypto';
 import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { BriefDto } from './dto/BriefDto';
 import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
+import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
 
 type ValidateBriefResult = {
@@ -48,6 +50,12 @@ type FastApiGradeAssessmentResponse = {
   profileSummary?: string;
   graderConfidence?: number;
   questionResults?: unknown[];
+};
+
+type FastApiGenerateEmbeddingResponse = {
+  embedding?: number[];
+  model?: string;
+  dimensions?: number;
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -146,6 +154,22 @@ export class AiService {
     );
   }
 
+  async generateEmbedding(dto: GenerateEmbeddingDto) {
+    if (this.isMockMode()) {
+      return this.getMockGenerateEmbeddingResult(dto);
+    }
+
+    return this.postToFastApi<FastApiGenerateEmbeddingResponse>(
+      '/agents/generate-embedding',
+      {
+        text: dto.text,
+        dimensions: dto.dimensions,
+        model: dto.model,
+      },
+      'generate-embedding',
+    );
+  }
+
   private getMockExtractCvResult(dto: ExtractCvDto) {
     return {
       cvUrl: dto.cvUrl,
@@ -153,6 +177,24 @@ export class AiService {
       yearsExperience: 2,
       headline: 'Full-stack developer',
       summary: 'Mock CV extraction result.',
+    };
+  }
+
+  private getMockGenerateEmbeddingResult(dto: GenerateEmbeddingDto) {
+    const dimensions = dto.dimensions ?? 1024;
+    const values = Array.from({ length: dimensions }, (_, index) => {
+      const hash = createHash('sha256')
+        .update(`${dto.model ?? 'mock'}:${index}:${dto.text}`)
+        .digest();
+      return hash.readUInt32BE(0) / 0xffffffff - 0.5;
+    });
+    const magnitude =
+      Math.sqrt(values.reduce((sum, value) => sum + value * value, 0)) || 1;
+
+    return {
+      embedding: values.map((value) => Number((value / magnitude).toFixed(8))),
+      model: dto.model ?? 'mock-profile-embedding-v1',
+      dimensions,
     };
   }
 

@@ -5,7 +5,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import type { RedisOptions } from 'ioredis';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { AiJobsProducer } from './ai-jobs.producer';
-import { QUEUES } from './queue.constants';
+import { AI_JOB_RETRY, QUEUES } from './queue.constants';
 
 function getRedisConnection(redisUrl: string): RedisOptions {
   const url = new URL(redisUrl);
@@ -31,8 +31,11 @@ function getRedisConnection(redisUrl: string): RedisOptions {
           configService.getOrThrow<string>('REDIS_URL'),
         ),
         defaultJobOptions: {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 5000 },
+          attempts: AI_JOB_RETRY.ATTEMPTS,
+          backoff: {
+            type: 'exponential',
+            delay: AI_JOB_RETRY.BACKOFF_DELAY_MS,
+          },
           removeOnComplete: 1000,
           removeOnFail: 5000,
         },
@@ -42,6 +45,7 @@ function getRedisConnection(redisUrl: string): RedisOptions {
       { name: QUEUES.CV_EXTRACTION },
       { name: QUEUES.ASSESSMENT_GENERATION },
       { name: QUEUES.ASSESSMENT_GRADING },
+      { name: QUEUES.PROFILE_EMBEDDING },
     ),
   ],
   providers: [AiJobsProducer],

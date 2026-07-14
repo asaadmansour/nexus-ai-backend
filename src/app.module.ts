@@ -14,6 +14,8 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { EmailModule } from './email/email.module';
 import { AdminModule } from './admin/admin.module';
 import { SearchModule } from './search/search.module';
+import { MatchingModule } from './matching/matching.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -32,6 +34,8 @@ import { SearchModule } from './search/search.module';
     EmailModule,
     AdminModule,
     SearchModule,
+    MatchingModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

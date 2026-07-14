@@ -36,6 +36,17 @@ const USER_REQUIRED_BRIEF_FIELDS = [
   'experienceMinYears',
 ];
 const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.PLANNING_MATCHING,
+  ProjectStatus.PLANNING_ASSIGNED,
+  ProjectStatus.PLANNING_IN_PROGRESS,
+  ProjectStatus.PLANNING_REVIEW,
+  ProjectStatus.IMPLEMENTATION_READY,
+  ProjectStatus.MATCHING,
+  ProjectStatus.MATCHED,
+  ProjectStatus.SPEC_IN_PROGRESS,
+  ProjectStatus.SPEC_UNDER_REVIEW,
+  ProjectStatus.SPEC_COMPLETE,
+  ProjectStatus.SCOPED,
   ProjectStatus.ASSIGNED,
   ProjectStatus.ACTIVE,
   ProjectStatus.UNDER_REVIEW,

@@ -15,6 +15,10 @@ import { FreelancerProfileEmbedding } from './freelancer-profile-embedding.entit
 import { FreelancerSkillScore } from './freelancer-skill-score.entity';
 
 @Entity('freelancer_profiles')
+@Index('freelancer_profiles_stripe_account_id_uidx', ['stripeAccountId'], {
+  unique: true,
+  where: '"stripe_account_id" IS NOT NULL',
+})
 export class FreelancerProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -128,6 +132,42 @@ export class FreelancerProfile {
     nullable: true,
   })
   hourlyRate: string | null;
+
+  @Column({
+    name: 'stripe_account_id',
+    type: 'varchar',
+    length: 255,
+    nullable: true,
+  })
+  stripeAccountId: string | null;
+
+  @Column({
+    name: 'stripe_onboarding_status',
+    type: 'varchar',
+    length: 40,
+    default: 'not_started',
+  })
+  stripeOnboardingStatus: string;
+
+  @Column({ name: 'stripe_charges_enabled', type: 'boolean', default: false })
+  stripeChargesEnabled: boolean;
+
+  @Column({ name: 'stripe_payouts_enabled', type: 'boolean', default: false })
+  stripePayoutsEnabled: boolean;
+
+  @Column({
+    name: 'stripe_requirements_due',
+    type: 'jsonb',
+    nullable: true,
+  })
+  stripeRequirementsDue: Record<string, unknown> | null;
+
+  @Column({
+    name: 'stripe_onboarded_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  stripeOnboardedAt: Date | null;
 
   @Column({ name: 'last_interview_at', type: 'timestamptz', nullable: true })
   lastInterviewAt: Date | null;

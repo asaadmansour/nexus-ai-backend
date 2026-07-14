@@ -1,4 +1,4 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, UseGuards } from '@nestjs/common';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { RolesGuard } from 'src/common/guards/roles.guards';
 import { Roles } from 'src/common/decorators/roles.decorator';
@@ -19,6 +19,18 @@ export class FreelancerVerificationController {
       user.sub,
       user.isEmailVerified === true,
     );
+    return { status: 'success', data };
+  }
+
+  @Post('me/cv-extraction/retry')
+  async retryCvExtraction(@CurrentUser() user: JwtPayload) {
+    const data = await this.assessments.retryCvExtraction(user.sub);
+    return { status: 'success', data };
+  }
+
+  @Post('me/assessment-generation/retry')
+  async retryAssessmentGeneration(@CurrentUser() user: JwtPayload) {
+    const data = await this.assessments.retryAssessmentGeneration(user.sub);
     return { status: 'success', data };
   }
 }

@@ -6,11 +6,16 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
+  OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { ProjectStatus } from '../../common/enums/project-status.enum';
 import { User } from '../../users/entities/user.entity';
+import { ProjectMilestone } from './project-milestone.entity';
+import { ProjectPlan } from './project-plan.entity';
+import { ProjectRoleAssignment } from './project-role-assignment.entity';
+import { ProjectTask } from './project-task.entity';
 
 @Entity('projects')
 export class Project {
@@ -72,6 +77,47 @@ export class Project {
     default: ProjectStatus.DRAFT,
   })
   status: ProjectStatus;
+
+  @Index('projects_planning_status_idx')
+  @Column({
+    name: 'planning_status',
+    type: 'varchar',
+    length: 40,
+    default: 'not_started',
+  })
+  planningStatus: string;
+
+  @Column({ name: 'planning_started_at', type: 'timestamptz', nullable: true })
+  planningStartedAt: Date | null;
+
+  @Column({
+    name: 'planning_completed_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  planningCompletedAt: Date | null;
+
+  @Column({
+    name: 'implementation_ready_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  implementationReadyAt: Date | null;
+
+  @Column({ name: 'assigned_at', type: 'timestamptz', nullable: true })
+  assignedAt: Date | null;
+
+  @OneToMany(() => ProjectRoleAssignment, (assignment) => assignment.project)
+  roleAssignments?: ProjectRoleAssignment[];
+
+  @OneToMany(() => ProjectPlan, (plan) => plan.project)
+  plans?: ProjectPlan[];
+
+  @OneToMany(() => ProjectMilestone, (milestone) => milestone.project)
+  milestones?: ProjectMilestone[];
+
+  @OneToMany(() => ProjectTask, (task) => task.project)
+  tasks?: ProjectTask[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { NotificationsService } from 'src/notifications/notifications.service';
@@ -8,14 +9,20 @@ import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
+  ProfileEmbeddingJobData,
 } from 'src/queues/queue.types';
+import { AI_JOB_RETRY } from 'src/queues/queue.constants';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
 import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-question.entity';
+import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedding.entity';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
+import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
 import { FreelancerVerificationEvent } from './entities/freelancer-verification-event.entity';
 
 const DEFAULT_QUESTION_COUNT = 40;
 const DEFAULT_DURATION_SECONDS = 2700;
+const PROFILE_EMBEDDING_DIMENSIONS = 1024;
+const PROFILE_EMBEDDING_MODEL = 'nexus-freelancer-profile-v1';
 const OPEN_ASSESSMENT_STATUSES = [
   'pending',
   'generating',
@@ -64,14 +71,22 @@ export class FreelancerAiJobsService {
     private readonly assessmentRepository: Repository<FreelancerAssessment>,
     @InjectRepository(FreelancerAssessmentQuestion)
     private readonly questionRepository: Repository<FreelancerAssessmentQuestion>,
+    @InjectRepository(FreelancerProfileEmbedding)
+    private readonly profileEmbeddingRepository: Repository<FreelancerProfileEmbedding>,
+    @InjectRepository(FreelancerSkillScore)
+    private readonly skillScoreRepository: Repository<FreelancerSkillScore>,
     private readonly aiService: AiService,
     private readonly aiJobsProducer: AiJobsProducer,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
   ) {}
 
-  async processCvExtraction(data: CvExtractionJobData, attemptsMade: number) {
-    await this.markJobRunning(data.agentJobId, attemptsMade);
+  async processCvExtraction(
+    data: CvExtractionJobData,
+    attemptsMade: number,
+    maxAttempts: number = AI_JOB_RETRY.ATTEMPTS,
+  ) {
+    await this.markJobRunning(data.agentJobId, attemptsMade, maxAttempts);
 
     let cvSaved = false;
     try {
@@ -163,23 +178,32 @@ export class FreelancerAiJobsService {
         assessmentGenerationJobId: generationJob.id,
       });
     } catch (error) {
-      if (cvSaved) {
-        await this.markAssessmentGenerationFailed(
-          data.profileId,
-          data.userId,
-          this.getErrorMessage(error),
-          data.agentJobId,
-        );
+      if (this.isFinalAttempt(attemptsMade, maxAttempts)) {
+        if (cvSaved) {
+          await this.markAssessmentGenerationFailed(
+            data.profileId,
+            data.userId,
+            this.getErrorMessage(error),
+            data.agentJobId,
+          );
+        } else {
+          await this.markCvExtractionFailed(
+            data.profileId,
+            data.userId,
+            data.cvUrl,
+            this.getErrorMessage(error),
+            data.agentJobId,
+          );
+        }
+        await this.markJobFailed(data.agentJobId, error, maxAttempts);
       } else {
-        await this.markCvExtractionFailed(
-          data.profileId,
-          data.userId,
-          data.cvUrl,
-          this.getErrorMessage(error),
+        await this.markJobRetrying(
           data.agentJobId,
+          error,
+          attemptsMade,
+          maxAttempts,
         );
       }
-      await this.markJobFailed(data.agentJobId, error);
       throw error;
     }
   }
@@ -187,8 +211,9 @@ export class FreelancerAiJobsService {
   async processAssessmentGeneration(
     data: AssessmentGenerationJobData,
     attemptsMade: number,
+    maxAttempts: number = AI_JOB_RETRY.ATTEMPTS,
   ) {
-    await this.markJobRunning(data.agentJobId, attemptsMade);
+    await this.markJobRunning(data.agentJobId, attemptsMade, maxAttempts);
 
     let assessmentId: string | null = null;
     try {
@@ -228,14 +253,146 @@ export class FreelancerAiJobsService {
         questionCount: generated.questions.length,
       });
     } catch (error) {
-      await this.markAssessmentGenerationFailed(
-        data.profileId,
-        data.userId,
-        this.getErrorMessage(error),
-        data.agentJobId,
-        assessmentId,
+      if (this.isFinalAttempt(attemptsMade, maxAttempts)) {
+        await this.markAssessmentGenerationFailed(
+          data.profileId,
+          data.userId,
+          this.getErrorMessage(error),
+          data.agentJobId,
+          assessmentId,
+        );
+        await this.markJobFailed(data.agentJobId, error, maxAttempts);
+      } else {
+        await this.markJobRetrying(
+          data.agentJobId,
+          error,
+          attemptsMade,
+          maxAttempts,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async processProfileEmbedding(
+    data: ProfileEmbeddingJobData,
+    attemptsMade: number,
+    maxAttempts: number = AI_JOB_RETRY.ATTEMPTS,
+  ) {
+    await this.markJobRunning(data.agentJobId, attemptsMade, maxAttempts);
+
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { id: data.profileId, userId: data.userId },
+        relations: ['user'],
+      });
+
+      if (!profile) {
+        await this.markJobCancelled(data.agentJobId, {
+          reason: 'stale_profile_embedding_job',
+        });
+        return;
+      }
+
+      const assessment = data.assessmentId
+        ? await this.assessmentRepository.findOne({
+            where: { id: data.assessmentId },
+          })
+        : await this.assessmentRepository.findOne({
+            where: { freelancerProfileId: data.profileId },
+            order: { submittedAt: 'DESC', createdAt: 'DESC' },
+          });
+
+      if (
+        data.assessmentId &&
+        (!assessment || assessment.freelancerProfileId !== profile.id)
+      ) {
+        await this.markJobCancelled(data.agentJobId, {
+          reason: 'stale_assessment_embedding_job',
+          assessmentId: data.assessmentId,
+        });
+        return;
+      }
+
+      const skillScores = await this.skillScoreRepository.find({
+        where: { freelancerProfileId: profile.id },
+        order: { score: 'DESC', skill: 'ASC' },
+      });
+      const sourceText = this.buildProfileEmbeddingSourceText(
+        profile,
+        skillScores,
+        assessment,
       );
-      await this.markJobFailed(data.agentJobId, error);
+
+      if (!sourceText.trim()) {
+        await this.markJobCancelled(data.agentJobId, {
+          reason: 'empty_profile_embedding_source',
+        });
+        return;
+      }
+
+      const generated = await this.aiService.generateEmbedding({
+        text: sourceText,
+        dimensions: PROFILE_EMBEDDING_DIMENSIONS,
+        model: PROFILE_EMBEDDING_MODEL,
+      });
+      const embedding = this.normalizeEmbedding(generated.embedding);
+      const embeddingModel = generated.model ?? PROFILE_EMBEDDING_MODEL;
+
+      const embeddingRow = {
+        freelancerProfileId: profile.id,
+        embeddingModel,
+        sourceText,
+        dimensions: embedding.length,
+        embedding: this.toVectorLiteral(embedding),
+        metadata: {
+          reason: data.reason,
+          agentJobId: data.agentJobId,
+          assessmentId: assessment?.id ?? data.assessmentId ?? null,
+          assessmentScore: assessment?.score ?? null,
+          skillScoresCount: skillScores.length,
+          generatedDimensions: generated.dimensions ?? null,
+        },
+      } as QueryDeepPartialEntity<FreelancerProfileEmbedding>;
+
+      await this.profileEmbeddingRepository.upsert(embeddingRow, [
+        'freelancerProfileId',
+        'embeddingModel',
+      ]);
+
+      await this.recordVerificationEvent(this.dataSource.manager, {
+        profile,
+        eventType: 'profile_embedding_generated',
+        fromStatus: profile.verificationStatus ?? null,
+        toStatus: profile.verificationStatus ?? null,
+        actorType: 'ai',
+        metadata: {
+          agentJobId: data.agentJobId,
+          assessmentId: assessment?.id ?? data.assessmentId ?? null,
+          embeddingModel,
+          dimensions: embedding.length,
+          reason: data.reason,
+        },
+      });
+
+      await this.markJobCompleted(data.agentJobId, {
+        profileId: profile.id,
+        assessmentId: assessment?.id ?? data.assessmentId ?? null,
+        embeddingModel,
+        dimensions: embedding.length,
+        sourceTextLength: sourceText.length,
+      });
+    } catch (error) {
+      if (this.isFinalAttempt(attemptsMade, maxAttempts)) {
+        await this.markJobFailed(data.agentJobId, error, maxAttempts);
+      } else {
+        await this.markJobRetrying(
+          data.agentJobId,
+          error,
+          attemptsMade,
+          maxAttempts,
+        );
+      }
       throw error;
     }
   }
@@ -419,6 +576,96 @@ export class FreelancerAiJobsService {
     });
   }
 
+  private buildProfileEmbeddingSourceText(
+    profile: FreelancerProfile,
+    skillScores: FreelancerSkillScore[],
+    assessment: FreelancerAssessment | null,
+  ) {
+    const userName = [profile.user?.firstName, profile.user?.lastName]
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    const summary = this.getProfileSummaryText(profile.summary);
+    const aiFeedback = assessment?.aiFeedback as
+      | {
+          recommendation?: unknown;
+          feedback?: unknown;
+          profileSummary?: unknown;
+        }
+      | null
+      | undefined;
+
+    const skillRatings = skillScores
+      .slice(0, 50)
+      .map((skillScore) => {
+        const confidence = skillScore.confidence
+          ? `, confidence ${skillScore.confidence}`
+          : '';
+        return `${skillScore.skill}: ${skillScore.score}/5${confidence}`;
+      })
+      .join('\n');
+
+    const sections = [
+      userName ? `Freelancer: ${userName}` : null,
+      profile.headline ? `Headline: ${profile.headline}` : null,
+      profile.bio ? `Bio: ${profile.bio}` : null,
+      profile.yearsExperience != null
+        ? `Years of experience: ${profile.yearsExperience}`
+        : null,
+      profile.availabilityHoursPerWeek != null
+        ? `Availability: ${profile.availabilityHoursPerWeek} hours per week`
+        : null,
+      profile.hourlyRate ? `Hourly rate: ${profile.hourlyRate}` : null,
+      profile.assessmentScore
+        ? `Assessment score: ${profile.assessmentScore}`
+        : null,
+      typeof aiFeedback?.recommendation === 'string'
+        ? `AI recommendation: ${aiFeedback.recommendation}`
+        : null,
+      profile.skills?.length ? `CV skills: ${profile.skills.join(', ')}` : null,
+      summary ? `Assessment profile summary: ${summary}` : null,
+      typeof aiFeedback?.feedback === 'string'
+        ? `Assessment feedback: ${aiFeedback.feedback}`
+        : null,
+      skillRatings ? `Assessed skill ratings:\n${skillRatings}` : null,
+    ].filter((section): section is string => Boolean(section?.trim()));
+
+    return sections.join('\n\n').slice(0, 8000);
+  }
+
+  private getProfileSummaryText(summary: Record<string, unknown> | null) {
+    if (!summary) return null;
+    if (typeof summary.profileSummary === 'string') {
+      return summary.profileSummary.trim();
+    }
+    if (typeof summary.summary === 'string') {
+      return summary.summary.trim();
+    }
+    return null;
+  }
+
+  private normalizeEmbedding(embedding: unknown) {
+    if (!Array.isArray(embedding)) {
+      throw new Error('The embedding generator did not return an embedding');
+    }
+
+    const values = embedding.map((value) => Number(value));
+    if (values.some((value) => !Number.isFinite(value))) {
+      throw new Error('The embedding generator returned invalid numbers');
+    }
+    if (values.length !== PROFILE_EMBEDDING_DIMENSIONS) {
+      throw new Error(
+        `The embedding generator returned ${values.length} dimensions instead of ${PROFILE_EMBEDDING_DIMENSIONS}`,
+      );
+    }
+
+    return values;
+  }
+
+  private toVectorLiteral(embedding: number[]) {
+    return `[${embedding.join(',')}]`;
+  }
+
   private async markCvProcessing(profile: FreelancerProfile) {
     const previousStatus = profile.verificationStatus ?? null;
     profile.cvExtractionStatus = 'processing';
@@ -449,7 +696,7 @@ export class FreelancerAiJobsService {
     const previousStatus = profile.verificationStatus ?? null;
     profile.cvExtractionStatus = 'failed';
     profile.cvExtractionError = error;
-    profile.verificationStatus = 'cv_pending';
+    profile.verificationStatus = 'cv_extraction_failed';
     const savedProfile = await this.profileRepository.save(profile);
     await this.recordVerificationEvent(this.dataSource.manager, {
       profile: savedProfile,
@@ -478,7 +725,7 @@ export class FreelancerAiJobsService {
       const previousStatus = profile.verificationStatus ?? null;
       profile.assessmentGenerationStatus = 'failed';
       profile.assessmentGenerationError = error;
-      profile.verificationStatus = 'assessment_pending';
+      profile.verificationStatus = 'assessment_generation_failed';
       const savedProfile = await this.profileRepository.save(profile);
       await this.recordVerificationEvent(this.dataSource.manager, {
         profile: savedProfile,
@@ -498,15 +745,21 @@ export class FreelancerAiJobsService {
     }
   }
 
-  private async markJobRunning(agentJobId: string, attemptsMade: number) {
+  private async markJobRunning(
+    agentJobId: string,
+    attemptsMade: number,
+    maxAttempts: number,
+  ) {
     await this.agentJobRepository.update(
       { id: agentJobId },
       {
         status: 'running',
         attempts: attemptsMade + 1,
+        maxAttempts,
         lockedAt: new Date(),
         startedAt: new Date(),
         error: null,
+        failedAt: null,
       },
     );
   }
@@ -544,16 +797,53 @@ export class FreelancerAiJobsService {
     await this.agentJobRepository.save(agentJob);
   }
 
-  private async markJobFailed(agentJobId: string, error: unknown) {
+  private async markJobRetrying(
+    agentJobId: string,
+    error: unknown,
+    attemptsMade: number,
+    maxAttempts: number,
+  ) {
+    const currentAttempt = attemptsMade + 1;
+    await this.agentJobRepository.update(
+      { id: agentJobId },
+      {
+        status: 'queued',
+        attempts: currentAttempt,
+        maxAttempts,
+        error: this.getErrorMessage(error),
+        output: {
+          retrying: true,
+          attempt: currentAttempt,
+          maxAttempts,
+        },
+        lockedAt: null,
+        failedAt: null,
+      },
+    );
+    this.logger.warn(
+      `AI job ${agentJobId} failed attempt ${currentAttempt}/${maxAttempts}; BullMQ will retry: ${this.getErrorMessage(error)}`,
+    );
+  }
+
+  private async markJobFailed(
+    agentJobId: string,
+    error: unknown,
+    maxAttempts: number = AI_JOB_RETRY.ATTEMPTS,
+  ) {
     await this.agentJobRepository.update(
       { id: agentJobId },
       {
         status: 'failed',
         error: this.getErrorMessage(error),
+        maxAttempts,
         failedAt: new Date(),
         lockedAt: null,
       },
     );
+  }
+
+  private isFinalAttempt(attemptsMade: number, maxAttempts: number) {
+    return attemptsMade + 1 >= maxAttempts;
   }
 
   private async recordVerificationEvent(

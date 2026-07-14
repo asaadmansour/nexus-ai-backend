@@ -13,6 +13,8 @@ import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
+import { FreelancerProfileEmbedding } from 'src/freelancers/entities/freelancer-profile-embedding.entity';
+import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
 import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 
@@ -28,6 +30,10 @@ export class UserService {
     private readonly freelancerAssessmentRepository: Repository<FreelancerAssessment>,
     @InjectRepository(FreelancerVerificationEvent)
     private readonly verificationEventRepository: Repository<FreelancerVerificationEvent>,
+    @InjectRepository(FreelancerProfileEmbedding)
+    private readonly profileEmbeddingRepository: Repository<FreelancerProfileEmbedding>,
+    @InjectRepository(FreelancerSkillScore)
+    private readonly skillScoreRepository: Repository<FreelancerSkillScore>,
     private readonly configService: ConfigService,
     private readonly aiJobsProducer: AiJobsProducer,
   ) {
@@ -125,6 +131,11 @@ export class UserService {
       const previousStatus = profile.verificationStatus ?? null;
 
       profile.cvUrl = cvResult.secure_url;
+      profile.headline = null;
+      profile.skills = null;
+      profile.yearsExperience = null;
+      profile.summary = null;
+      profile.assessmentScore = null;
       profile.cvExtractionStatus = 'queued';
       profile.cvExtractionError = null;
       profile.cvExtractedAt = null;
@@ -138,6 +149,12 @@ export class UserService {
 
       const savedProfile = await this.freelancerProfileRepository.save(profile);
       await this.cancelOpenAssessmentsForNewCv(userId);
+      await this.skillScoreRepository.delete({
+        freelancerProfileId: savedProfile.id,
+      });
+      await this.profileEmbeddingRepository.delete({
+        freelancerProfileId: savedProfile.id,
+      });
       await this.recordVerificationEvent({
         profile: savedProfile,
         eventType: 'cv_uploaded',
@@ -171,7 +188,7 @@ export class UserService {
       } catch (queueError) {
         savedProfile.cvExtractionStatus = 'failed';
         savedProfile.cvExtractionError = this.getErrorMessage(queueError);
-        savedProfile.verificationStatus = 'cv_pending';
+        savedProfile.verificationStatus = 'cv_extraction_failed';
         const failedProfile =
           await this.freelancerProfileRepository.save(savedProfile);
         await this.recordVerificationEvent({
@@ -184,7 +201,9 @@ export class UserService {
             error: failedProfile.cvExtractionError,
           },
         });
-        throw queueError;
+        this.logger.error(
+          `CV extraction queue failed for profile ${savedProfile.id}: ${failedProfile.cvExtractionError}`,
+        );
       }
 
       if (oldCvPublicId) {

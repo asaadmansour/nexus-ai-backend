@@ -395,9 +395,13 @@ export class AdminService {
       total: totalFreelancers,
       profileIncomplete: 0,
       cvPending: 0,
+      cvProcessing: 0,
+      cvExtractionFailed: 0,
       assessmentPending: 0,
+      assessmentGenerationFailed: 0,
       assessmentInProgress: 0,
       assessmentSubmitted: 0,
+      interviewPending: 0,
       approved: 0,
       rejected: 0,
     };
@@ -408,12 +412,19 @@ export class AdminService {
       if (key === 'profile_incomplete')
         freelancerStats.profileIncomplete = count;
       else if (key === 'cv_pending') freelancerStats.cvPending = count;
+      else if (key === 'cv_processing') freelancerStats.cvProcessing = count;
+      else if (key === 'cv_extraction_failed')
+        freelancerStats.cvExtractionFailed = count;
       else if (key === 'assessment_pending')
         freelancerStats.assessmentPending = count;
+      else if (key === 'assessment_generation_failed')
+        freelancerStats.assessmentGenerationFailed = count;
       else if (key === 'assessment_in_progress')
         freelancerStats.assessmentInProgress = count;
       else if (key === 'assessment_submitted')
         freelancerStats.assessmentSubmitted = count;
+      else if (key === 'interview_pending')
+        freelancerStats.interviewPending = count;
       else if (key === 'approved') freelancerStats.approved = count;
       else if (key === 'rejected') freelancerStats.rejected = count;
     });

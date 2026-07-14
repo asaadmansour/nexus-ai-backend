@@ -3,6 +3,7 @@ import {
   CreateDateColumn,
   DeleteDateColumn,
   Entity,
+  Index,
   OneToMany,
   OneToOne,
   PrimaryGeneratedColumn,
@@ -13,6 +14,10 @@ import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile
 import { RefreshToken } from '../../auth/entities/refresh-token.entity';
 
 @Entity('users')
+@Index('users_stripe_customer_id_uidx', ['stripeCustomerId'], {
+  unique: true,
+  where: '"stripe_customer_id" IS NOT NULL',
+})
 export class User {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -51,6 +56,22 @@ export class User {
 
   @Column({ name: 'photo_url', type: 'text', nullable: true })
   photoUrl!: string | null;
+
+  @Column({
+    name: 'stripe_customer_id',
+    type: 'varchar',
+    length: 255,
+    nullable: true,
+  })
+  stripeCustomerId!: string | null;
+
+  @Column({
+    name: 'stripe_default_payment_method_id',
+    type: 'varchar',
+    length: 255,
+    nullable: true,
+  })
+  stripeDefaultPaymentMethodId!: string | null;
 
   @Column({
     type: 'enum',

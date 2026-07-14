@@ -1,6 +1,6 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
-import { JOBS, QUEUES } from 'src/queues/queue.constants';
+import { AI_JOB_RETRY, JOBS, QUEUES } from 'src/queues/queue.constants';
 import { AssessmentGenerationJobData } from 'src/queues/queue.types';
 import { FreelancerAiJobsService } from '../freelancer-ai-jobs.service';
 
@@ -15,6 +15,7 @@ export class AssessmentGenerationProcessor extends WorkerHost {
     return this.freelancerAiJobs.processAssessmentGeneration(
       job.data,
       job.attemptsMade,
+      job.opts.attempts ?? AI_JOB_RETRY.ATTEMPTS,
     );
   }
 }

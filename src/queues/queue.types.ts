@@ -13,3 +13,11 @@ export interface AssessmentGenerationJobData {
   questionCount: number;
   durationSeconds: number;
 }
+
+export interface ProfileEmbeddingJobData {
+  agentJobId: string;
+  userId: string;
+  profileId: string;
+  assessmentId?: string | null;
+  reason: string;
+}

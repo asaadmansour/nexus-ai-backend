@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -10,6 +11,7 @@ import { DataSource, EntityManager, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { Notification } from 'src/notifications/entities/notification.entity';
+import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import { ReviewAssessmentDto } from 'src/admin/dtos/review-assessment.dto';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
 import { FreelancerAssessmentAnswer } from './entities/freelancer-assessment-answer.entity';
@@ -37,6 +39,8 @@ const WARNING_EVENT_TYPES = [
   'copy_attempt',
   'paste_attempt',
 ];
+const DEFAULT_RETRY_QUESTION_COUNT = 40;
+const DEFAULT_RETRY_DURATION_SECONDS = 2700;
 
 const ANTI_CHEAT = {
   trackFocusLoss: true,
@@ -63,6 +67,8 @@ interface GradedAssessment {
 
 @Injectable()
 export class FreelancerAssessmentsService {
+  private readonly logger = new Logger(FreelancerAssessmentsService.name);
+
   constructor(
     @InjectRepository(FreelancerProfile)
     private readonly profileRepo: Repository<FreelancerProfile>,
@@ -77,6 +83,7 @@ export class FreelancerAssessmentsService {
     @InjectRepository(FreelancerSkillScore)
     private readonly skillScoreRepo: Repository<FreelancerSkillScore>,
     private readonly aiService: AiService,
+    private readonly aiJobsProducer: AiJobsProducer,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -127,6 +134,170 @@ export class FreelancerAssessmentsService {
       assessment: latest ? this.toAssessmentSummary(latest) : null,
       missing,
     };
+  }
+
+  async retryCvExtraction(userId: string) {
+    const profile = await this.getProfileWithUser(userId);
+    if (!profile.cvUrl) {
+      throw new BadRequestException(
+        'Upload your CV before retrying extraction',
+      );
+    }
+
+    if (
+      profile.cvExtractionStatus === 'queued' ||
+      profile.cvExtractionStatus === 'processing'
+    ) {
+      return {
+        status: 'already_queued',
+        cvUrl: profile.cvUrl,
+        cvExtractionStatus: profile.cvExtractionStatus,
+        nextAction: 'wait_for_cv_extraction',
+      };
+    }
+
+    const previousStatus = profile.verificationStatus ?? null;
+    profile.cvExtractionStatus = 'queued';
+    profile.cvExtractionError = null;
+    profile.verificationStatus = 'cv_processing';
+    const queuedProfile = await this.profileRepo.save(profile);
+    await this.recordVerificationEvent(this.dataSource.manager, {
+      profile: queuedProfile,
+      eventType: 'cv_extraction_retry_requested',
+      fromStatus: previousStatus,
+      toStatus: queuedProfile.verificationStatus,
+      actorType: 'freelancer',
+      actorUserId: userId,
+    });
+
+    try {
+      const job = await this.aiJobsProducer.emitCvUploaded({
+        userId,
+        profileId: queuedProfile.id,
+        cvUrl: queuedProfile.cvUrl!,
+      });
+      await this.recordVerificationEvent(this.dataSource.manager, {
+        profile: queuedProfile,
+        eventType: 'cv_extraction_queued',
+        fromStatus: queuedProfile.verificationStatus,
+        toStatus: queuedProfile.verificationStatus,
+        actorType: 'system',
+        metadata: {
+          agentJobId: job.id,
+          queueName: job.queueName,
+          retry: true,
+        },
+      });
+      return {
+        status: 'queued',
+        cvUrl: queuedProfile.cvUrl,
+        cvExtractionStatus: queuedProfile.cvExtractionStatus,
+        agentJobId: job.id,
+        nextAction: 'wait_for_cv_extraction',
+      };
+    } catch (error) {
+      queuedProfile.cvExtractionStatus = 'failed';
+      queuedProfile.cvExtractionError = this.getErrorMessage(error);
+      queuedProfile.verificationStatus = 'cv_extraction_failed';
+      const failedProfile = await this.profileRepo.save(queuedProfile);
+      await this.recordVerificationEvent(this.dataSource.manager, {
+        profile: failedProfile,
+        eventType: 'cv_extraction_queue_failed',
+        fromStatus: 'cv_processing',
+        toStatus: failedProfile.verificationStatus,
+        actorType: 'system',
+        metadata: { error: failedProfile.cvExtractionError, retry: true },
+      });
+      throw error;
+    }
+  }
+
+  async retryAssessmentGeneration(userId: string) {
+    const profile = await this.getProfileWithUser(userId);
+    if (!profile.cvUrl) {
+      throw new BadRequestException(
+        'Upload your CV before retrying assessment generation',
+      );
+    }
+
+    if (!this.isCvExtracted(profile)) {
+      if (profile.cvExtractionStatus === 'failed') {
+        throw new BadRequestException(
+          'Retry CV extraction before generating the assessment',
+        );
+      }
+      throw new ConflictException(
+        'Your CV is still being processed. Please try again shortly.',
+      );
+    }
+
+    if (
+      profile.assessmentGenerationStatus === 'queued' ||
+      profile.assessmentGenerationStatus === 'processing'
+    ) {
+      return {
+        status: 'already_queued',
+        assessmentGenerationStatus: profile.assessmentGenerationStatus,
+        nextAction: 'wait_for_assessment_generation',
+      };
+    }
+
+    const previousStatus = profile.verificationStatus ?? null;
+    profile.assessmentGenerationStatus = 'queued';
+    profile.assessmentGenerationQueuedAt = new Date();
+    profile.assessmentGenerationStartedAt = null;
+    profile.assessmentGeneratedAt = null;
+    profile.assessmentGenerationError = null;
+    profile.assessmentGenerationJobId = null;
+    profile.verificationStatus = 'assessment_pending';
+    const queuedProfile = await this.profileRepo.save(profile);
+
+    try {
+      const job = await this.aiJobsProducer.emitCvExtracted({
+        userId,
+        profileId: queuedProfile.id,
+        cvUrl: queuedProfile.cvUrl!,
+        questionCount: DEFAULT_RETRY_QUESTION_COUNT,
+        durationSeconds: DEFAULT_RETRY_DURATION_SECONDS,
+      });
+      queuedProfile.assessmentGenerationJobId = job.id;
+      const savedProfile = await this.profileRepo.save(queuedProfile);
+      await this.recordVerificationEvent(this.dataSource.manager, {
+        profile: savedProfile,
+        eventType: 'assessment_generation_queued',
+        fromStatus: previousStatus,
+        toStatus: savedProfile.verificationStatus,
+        actorType: 'system',
+        metadata: {
+          agentJobId: job.id,
+          queueName: job.queueName,
+          retry: true,
+        },
+      });
+      return {
+        status: 'queued',
+        assessmentGenerationStatus: savedProfile.assessmentGenerationStatus,
+        agentJobId: job.id,
+        nextAction: 'wait_for_assessment_generation',
+      };
+    } catch (error) {
+      queuedProfile.assessmentGenerationStatus = 'failed';
+      queuedProfile.assessmentGenerationError = this.getErrorMessage(error);
+      queuedProfile.verificationStatus = 'assessment_generation_failed';
+      const failedProfile = await this.profileRepo.save(queuedProfile);
+      await this.recordVerificationEvent(this.dataSource.manager, {
+        profile: failedProfile,
+        eventType: 'assessment_generation_queue_failed',
+        fromStatus: 'assessment_pending',
+        toStatus: failedProfile.verificationStatus,
+        actorType: 'system',
+        metadata: {
+          error: failedProfile.assessmentGenerationError,
+          retry: true,
+        },
+      });
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -180,7 +351,7 @@ export class FreelancerAssessmentsService {
       if (!readyAssessment) {
         if (profile.assessmentGenerationStatus === 'failed') {
           throw new BadRequestException(
-            'Assessment generation failed. Please upload your CV again or contact support.',
+            'Assessment generation failed. Retry assessment generation from the verification page.',
           );
         }
 
@@ -396,7 +567,7 @@ export class FreelancerAssessmentsService {
       throw new BadRequestException('This assessment has expired');
     }
 
-    const claimed = await this.dataSource.transaction(async (manager) => {
+    const submission = await this.dataSource.transaction(async (manager) => {
       const locked = await manager
         .getRepository(FreelancerAssessment)
         .createQueryBuilder('assessment')
@@ -405,7 +576,7 @@ export class FreelancerAssessmentsService {
         .getOne();
 
       if (!locked || locked.status !== ACTIVE_STATUS) {
-        return null;
+        return { assessment: null, shouldEmbedProfile: false };
       }
       if (this.isExpired(locked)) {
         throw new BadRequestException('This assessment has expired');
@@ -433,11 +604,73 @@ export class FreelancerAssessmentsService {
         answers.map((answer) => [answer.questionId, answer]),
       );
 
-      const grade = (await Promise.resolve(
-        this.aiService.gradeAssessment(
-          this.buildGradePayload(id, questions, answerByQuestion),
-        ),
-      )) as GradedAssessment;
+      let grade: GradedAssessment | null = null;
+      let gradingError: string | null = null;
+      try {
+        grade = (await Promise.resolve(
+          this.aiService.gradeAssessment(
+            this.buildGradePayload(id, questions, answerByQuestion),
+          ),
+        )) as GradedAssessment;
+      } catch (error) {
+        gradingError = this.getErrorMessage(error);
+        this.logger.error(
+          `Assessment grading failed for assessment ${id}: ${gradingError}`,
+        );
+      }
+
+      const submittedAt = new Date();
+      if (!grade) {
+        locked.status = 'needs_review';
+        locked.submittedAt = submittedAt;
+        locked.score = null;
+        locked.aiFeedback = {
+          recommendation: 'needs_review',
+          feedback:
+            'The assessment was submitted successfully, but automatic grading could not complete. An admin needs to review it manually.',
+          maxScore: 100,
+          profileSummary: null,
+          questionResults: [],
+          reason: dto.reason ?? 'manual_submit',
+          manualReviewRequired: true,
+          gradingError,
+        };
+        await manager.save(FreelancerAssessment, locked);
+
+        const profile = await manager.findOne(FreelancerProfile, {
+          where: { id: locked.freelancerProfileId },
+        });
+        if (profile) {
+          const previousStatus = profile.verificationStatus ?? null;
+          profile.verificationStatus = 'assessment_submitted';
+          profile.assessmentSubmittedAt = submittedAt;
+          await manager.save(FreelancerProfile, profile);
+          await this.recordVerificationEvent(manager, {
+            profile,
+            eventType: 'assessment_submitted',
+            fromStatus: previousStatus,
+            toStatus: profile.verificationStatus,
+            actorType: 'freelancer',
+            actorUserId: userId,
+            metadata: {
+              assessmentId: locked.id,
+              manualReviewRequired: true,
+              gradingError,
+            },
+          });
+        }
+
+        await manager.save(
+          Notification,
+          manager.create(Notification, {
+            userId,
+            title: 'Assessment submitted',
+            body: 'Your assessment was submitted and is waiting for manual review.',
+          }),
+        );
+
+        return { assessment: locked, shouldEmbedProfile: false };
+      }
 
       const resultByQuestion = new Map(
         (grade.questionResults ?? []).map((result) => [
@@ -456,8 +689,8 @@ export class FreelancerAssessmentsService {
         await manager.save(FreelancerAssessmentAnswer, answers);
       }
 
-      const submittedAt = new Date();
       const score = grade.score != null ? String(grade.score) : null;
+      let shouldEmbedProfile = false;
 
       locked.status = 'submitted';
       locked.submittedAt = submittedAt;
@@ -490,6 +723,7 @@ export class FreelancerAssessmentsService {
             'freelancerProfileId',
             'skill',
           ]);
+          shouldEmbedProfile = score != null;
         }
 
         profile.verificationStatus = 'assessment_submitted';
@@ -538,8 +772,18 @@ export class FreelancerAssessmentsService {
         }),
       );
 
-      return locked;
+      return { assessment: locked, shouldEmbedProfile };
     });
+    const claimed = submission.assessment;
+
+    if (claimed?.freelancerProfileId && submission.shouldEmbedProfile) {
+      await this.enqueueProfileEmbedding({
+        userId,
+        profileId: claimed.freelancerProfileId,
+        assessmentId: claimed.id,
+        reason: 'assessment_submitted',
+      });
+    }
 
     return this.buildSubmitResponse(
       claimed ?? (await this.reloadAssessment(id)),
@@ -653,7 +897,7 @@ export class FreelancerAssessmentsService {
       needs_review: 'needs_review',
     };
 
-    return this.dataSource.transaction(async (manager) => {
+    const reviewResult = await this.dataSource.transaction(async (manager) => {
       assessment.status = statusByDecision[dto.decision];
       if (dto.scoreOverride != null) {
         assessment.score = String(dto.scoreOverride);
@@ -672,6 +916,11 @@ export class FreelancerAssessmentsService {
 
       if (profile) {
         const previousStatus = profile.verificationStatus ?? null;
+        if (dto.scoreOverride != null) {
+          profile.assessmentScore = String(dto.scoreOverride);
+        } else {
+          profile.assessmentScore = assessment.score;
+        }
         if (dto.decision === 'pass') {
           profile.verificationStatus = 'interview_pending';
           notificationBody =
@@ -713,11 +962,39 @@ export class FreelancerAssessmentsService {
         score: assessment.score,
       };
     });
+
+    await this.enqueueProfileEmbedding({
+      userId: assessment.userId,
+      profileId: assessment.freelancerProfileId,
+      assessmentId: assessment.id,
+      reason: 'assessment_reviewed',
+    });
+
+    return reviewResult;
   }
 
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private async enqueueProfileEmbedding(input: {
+    userId: string;
+    profileId: string;
+    assessmentId: string;
+    reason: string;
+  }) {
+    try {
+      await this.aiJobsProducer.emitProfileEmbeddingRequested(input);
+    } catch (error) {
+      this.logger.warn(
+        `Could not enqueue profile embedding for profile ${input.profileId}: ${this.getErrorMessage(error)}`,
+      );
+    }
+  }
+
+  private getErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error);
+  }
 
   private async getProfileWithUser(userId: string) {
     const profile = await this.profileRepo.findOne({ where: { userId } });
@@ -817,7 +1094,7 @@ export class FreelancerAssessmentsService {
     if (stored === 'approved') {
       return { verificationStatus: 'approved', nextAction: 'approved' };
     }
-    if (stored === 'rejected') {
+    if (stored === 'rejected' && (!latest || latest.status === 'failed')) {
       return { verificationStatus: 'rejected', nextAction: 'rejected' };
     }
     if (stored === 'interview_pending') {
@@ -842,8 +1119,8 @@ export class FreelancerAssessmentsService {
     if (!hasSkills) {
       if (profile.cvExtractionStatus === 'failed') {
         return {
-          verificationStatus: 'cv_pending',
-          nextAction: 'upload_cv',
+          verificationStatus: 'cv_extraction_failed',
+          nextAction: 'retry_cv_extraction',
         };
       }
       return {
@@ -891,7 +1168,7 @@ export class FreelancerAssessmentsService {
 
     if (profile.assessmentGenerationStatus === 'failed') {
       return {
-        verificationStatus: 'assessment_pending',
+        verificationStatus: 'assessment_generation_failed',
         nextAction: 'retry_assessment_generation',
       };
     }

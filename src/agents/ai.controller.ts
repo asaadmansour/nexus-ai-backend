@@ -3,6 +3,7 @@ import { AiService } from './ai.service';
 import { BriefDto } from './dto/BriefDto';
 import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
+import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -34,5 +35,10 @@ export class AiController {
   @Post('grade-assessment')
   gradeAssessment(@Body() assessmentDto: GradeAssessmentDto) {
     return this.aiService.gradeAssessment(assessmentDto);
+  }
+
+  @Post('generate-embedding')
+  generateEmbedding(@Body() embeddingDto: GenerateEmbeddingDto) {
+    return this.aiService.generateEmbedding(embeddingDto);
   }
 }

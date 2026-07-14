@@ -18,8 +18,9 @@ import { FreelancerVerificationController } from './freelancer-verification.cont
 import { FreelancerAssessmentsController } from './freelancer-assessments.controller';
 import { FreelancerAssessmentsService } from './freelancer-assessments.service';
 import { FreelancerAiJobsService } from './freelancer-ai-jobs.service';
-import { CvExtractionProcessor } from './jobs/cv-extraction.processor';
 import { AssessmentGenerationProcessor } from './jobs/assessment-generation.processor';
+import { CvExtractionProcessor } from './jobs/cv-extraction.processor';
+import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
 
 @Module({
   imports: [
@@ -49,6 +50,7 @@ import { AssessmentGenerationProcessor } from './jobs/assessment-generation.proc
     FreelancerAiJobsService,
     CvExtractionProcessor,
     AssessmentGenerationProcessor,
+    ProfileEmbeddingProcessor,
   ],
   exports: [TypeOrmModule],
 })

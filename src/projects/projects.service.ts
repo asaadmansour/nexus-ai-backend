@@ -12,6 +12,15 @@ import { UpdateProjectDto } from './dtos/update-project.dto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 
 const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.PLANNING_ASSIGNED,
+  ProjectStatus.PLANNING_IN_PROGRESS,
+  ProjectStatus.PLANNING_REVIEW,
+  ProjectStatus.IMPLEMENTATION_READY,
+  ProjectStatus.MATCHED,
+  ProjectStatus.SPEC_IN_PROGRESS,
+  ProjectStatus.SPEC_UNDER_REVIEW,
+  ProjectStatus.SPEC_COMPLETE,
+  ProjectStatus.SCOPED,
   ProjectStatus.ASSIGNED,
   ProjectStatus.ACTIVE,
   ProjectStatus.UNDER_REVIEW,

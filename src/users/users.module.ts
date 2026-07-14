@@ -7,6 +7,8 @@ import { UserService } from './users.service';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
 import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
+import { FreelancerProfileEmbedding } from 'src/freelancers/entities/freelancer-profile-embedding.entity';
+import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
 import { QueuesModule } from 'src/queues/queues.module';
 
 @Module({
@@ -17,6 +19,8 @@ import { QueuesModule } from 'src/queues/queues.module';
       FreelancerProfile,
       FreelancerAssessment,
       FreelancerVerificationEvent,
+      FreelancerProfileEmbedding,
+      FreelancerSkillScore,
     ]),
     ConfigModule,
   ],
