@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { Notification } from 'src/notifications/entities/notification.entity';
@@ -31,8 +31,18 @@ const SUBMITTED_STATUSES = new Set([
   'graded',
   'needs_review',
   'passed',
-  'failed',
 ]);
+const ASSESSMENT_RETRY_FAILURE_STATUSES = new Set(['failed', 'expired']);
+const ASSESSMENT_ATTEMPT_COUNT_STATUSES = [
+  ACTIVE_STATUS,
+  'submitted',
+  'needs_review',
+  'passed',
+  'failed',
+  'expired',
+];
+const MAX_ASSESSMENT_ATTEMPTS = 3;
+const ASSESSMENT_RETRY_COOLDOWN_DAYS = 30;
 const WARNING_EVENT_TYPES = [
   'fullscreen_exit',
   'visibility_hidden',
@@ -63,6 +73,14 @@ interface GradedAssessment {
   profileSummary?: string;
   graderConfidence?: number;
   questionResults?: GradedQuestionResult[];
+}
+
+export interface AssessmentRetryState {
+  attemptsUsed: number;
+  maxAttempts: number;
+  canRetry: boolean;
+  retryAvailableAt: Date | null;
+  reason: 'available' | 'cooldown' | 'limit_reached' | 'not_failed';
 }
 
 @Injectable()
@@ -105,6 +123,7 @@ export class FreelancerAssessmentsService {
     const cvUploaded = Boolean(profile.cvUrl);
     const cvExtracted = this.isCvExtracted(profile);
     const missing = this.getMissingProfilePieces(profile);
+    const assessmentRetry = await this.getAssessmentRetryState(userId, latest);
 
     const { verificationStatus, nextAction } = this.deriveVerification({
       profile,
@@ -112,6 +131,7 @@ export class FreelancerAssessmentsService {
       profileComplete,
       cvUploaded,
       emailVerified,
+      assessmentRetry,
     });
 
     return {
@@ -130,6 +150,7 @@ export class FreelancerAssessmentsService {
       assessmentGenerationStartedAt: profile.assessmentGenerationStartedAt,
       assessmentGeneratedAt: profile.assessmentGeneratedAt,
       assessmentGenerationError: profile.assessmentGenerationError,
+      assessmentRetry,
       nextAction,
       assessment: latest ? this.toAssessmentSummary(latest) : null,
       missing,
@@ -242,6 +263,9 @@ export class FreelancerAssessmentsService {
       };
     }
 
+    const latest = await this.getLatestAssessment(userId);
+    await this.assertAssessmentRetryAllowed(userId, latest);
+
     const previousStatus = profile.verificationStatus ?? null;
     profile.assessmentGenerationStatus = 'queued';
     profile.assessmentGenerationQueuedAt = new Date();
@@ -334,6 +358,19 @@ export class FreelancerAssessmentsService {
         );
       }
 
+      if (latest && ASSESSMENT_RETRY_FAILURE_STATUSES.has(latest.status)) {
+        const retryState = await this.getAssessmentRetryState(
+          userId,
+          latest,
+          manager,
+        );
+        if (!retryState.canRetry) {
+          throw new ConflictException(
+            this.getAssessmentRetryBlockedMessage(retryState),
+          );
+        }
+      }
+
       if (latest?.status === 'generating' || latest?.status === 'pending') {
         throw new ConflictException(
           'Your assessment is still being prepared. Please try again shortly.',
@@ -381,6 +418,12 @@ export class FreelancerAssessmentsService {
 
       const previousStatus = profile.verificationStatus ?? null;
       profile.verificationStatus = 'assessment_in_progress';
+      await this.syncProfileAssessmentAttemptState(
+        manager,
+        profile,
+        userId,
+        readyAssessment,
+      );
       await manager.save(FreelancerProfile, profile);
       await this.recordVerificationEvent(manager, {
         profile,
@@ -528,6 +571,12 @@ export class FreelancerAssessmentsService {
       profile.rejectedAt = cancelledAt;
       profile.rejectionReason =
         'Assessment automatically cancelled after repeated integrity warnings.';
+      await this.syncProfileAssessmentAttemptState(
+        manager,
+        profile,
+        assessment.userId,
+        assessment,
+      );
       await manager.save(FreelancerProfile, profile);
       await this.recordVerificationEvent(manager, {
         profile,
@@ -644,6 +693,12 @@ export class FreelancerAssessmentsService {
           const previousStatus = profile.verificationStatus ?? null;
           profile.verificationStatus = 'assessment_submitted';
           profile.assessmentSubmittedAt = submittedAt;
+          await this.syncProfileAssessmentAttemptState(
+            manager,
+            profile,
+            userId,
+            locked,
+          );
           await manager.save(FreelancerProfile, profile);
           await this.recordVerificationEvent(manager, {
             profile,
@@ -729,6 +784,12 @@ export class FreelancerAssessmentsService {
         profile.verificationStatus = 'assessment_submitted';
         profile.assessmentScore = score;
         profile.assessmentSubmittedAt = submittedAt;
+        await this.syncProfileAssessmentAttemptState(
+          manager,
+          profile,
+          userId,
+          locked,
+        );
         profile.summary = {
           profileSummary:
             grade.profileSummary ??
@@ -931,6 +992,12 @@ export class FreelancerAssessmentsService {
           profile.rejectionReason = dto.notes ?? null;
           notificationBody = 'Your assessment was not approved after review.';
         }
+        await this.syncProfileAssessmentAttemptState(
+          manager,
+          profile,
+          assessment.userId,
+          assessment,
+        );
         await manager.save(FreelancerProfile, profile);
         await this.recordVerificationEvent(manager, {
           profile,
@@ -1087,14 +1154,19 @@ export class FreelancerAssessmentsService {
     profileComplete: boolean;
     cvUploaded: boolean;
     emailVerified: boolean;
+    assessmentRetry: AssessmentRetryState;
   }): { verificationStatus: string; nextAction: string } {
-    const { profile, latest, cvUploaded, emailVerified } = input;
+    const { profile, latest, cvUploaded, emailVerified, assessmentRetry } =
+      input;
     const stored = profile.verificationStatus;
 
     if (stored === 'approved') {
       return { verificationStatus: 'approved', nextAction: 'approved' };
     }
-    if (stored === 'rejected' && (!latest || latest.status === 'failed')) {
+    if (
+      stored === 'rejected' &&
+      (!latest || !ASSESSMENT_RETRY_FAILURE_STATUSES.has(latest.status))
+    ) {
       return { verificationStatus: 'rejected', nextAction: 'rejected' };
     }
     if (stored === 'interview_pending') {
@@ -1154,6 +1226,24 @@ export class FreelancerAssessmentsService {
           nextAction: 'wait_for_review',
         };
       }
+      if (ASSESSMENT_RETRY_FAILURE_STATUSES.has(latest.status)) {
+        if (assessmentRetry.canRetry) {
+          return {
+            verificationStatus: 'assessment_retry_available',
+            nextAction: 'retry_assessment_generation',
+          };
+        }
+        if (assessmentRetry.reason === 'cooldown') {
+          return {
+            verificationStatus: 'assessment_retry_cooldown',
+            nextAction: 'wait_for_assessment_retry',
+          };
+        }
+        return {
+          verificationStatus: 'rejected',
+          nextAction: 'rejected',
+        };
+      }
     }
 
     if (
@@ -1183,6 +1273,127 @@ export class FreelancerAssessmentsService {
     return Boolean(
       assessment.expiresAt && assessment.expiresAt.getTime() < Date.now(),
     );
+  }
+
+  private async getAssessmentRetryState(
+    userId: string,
+    latest?: FreelancerAssessment | null,
+    manager?: EntityManager,
+  ): Promise<AssessmentRetryState> {
+    const repository = manager
+      ? manager.getRepository(FreelancerAssessment)
+      : this.assessmentRepo;
+    const attemptsUsed = await repository.count({
+      where: {
+        userId,
+        status: In(ASSESSMENT_ATTEMPT_COUNT_STATUSES),
+      },
+    });
+
+    const failedAssessment =
+      latest && ASSESSMENT_RETRY_FAILURE_STATUSES.has(latest.status)
+        ? latest
+        : await repository.findOne({
+            where: {
+              userId,
+              status: In(Array.from(ASSESSMENT_RETRY_FAILURE_STATUSES)),
+            },
+            order: { updatedAt: 'DESC', createdAt: 'DESC' },
+          });
+
+    if (!failedAssessment) {
+      return {
+        attemptsUsed,
+        maxAttempts: MAX_ASSESSMENT_ATTEMPTS,
+        canRetry: true,
+        retryAvailableAt: null,
+        reason: 'not_failed',
+      };
+    }
+
+    const failedAt =
+      failedAssessment.submittedAt ??
+      failedAssessment.updatedAt ??
+      failedAssessment.createdAt;
+    const retryAvailableAt = this.addDays(
+      failedAt,
+      ASSESSMENT_RETRY_COOLDOWN_DAYS,
+    );
+
+    if (attemptsUsed >= MAX_ASSESSMENT_ATTEMPTS) {
+      return {
+        attemptsUsed,
+        maxAttempts: MAX_ASSESSMENT_ATTEMPTS,
+        canRetry: false,
+        retryAvailableAt,
+        reason: 'limit_reached',
+      };
+    }
+
+    const canRetry = retryAvailableAt.getTime() <= Date.now();
+    return {
+      attemptsUsed,
+      maxAttempts: MAX_ASSESSMENT_ATTEMPTS,
+      canRetry,
+      retryAvailableAt,
+      reason: canRetry ? 'available' : 'cooldown',
+    };
+  }
+
+  private async assertAssessmentRetryAllowed(
+    userId: string,
+    latest?: FreelancerAssessment | null,
+    manager?: EntityManager,
+  ) {
+    if (latest && SUBMITTED_STATUSES.has(latest.status)) {
+      throw new ConflictException(
+        'Your latest assessment is already submitted and waiting for review',
+      );
+    }
+
+    if (!latest || !ASSESSMENT_RETRY_FAILURE_STATUSES.has(latest.status)) {
+      return;
+    }
+
+    const retryState = await this.getAssessmentRetryState(
+      userId,
+      latest,
+      manager,
+    );
+    if (!retryState.canRetry) {
+      throw new ConflictException(
+        this.getAssessmentRetryBlockedMessage(retryState),
+      );
+    }
+  }
+
+  private async syncProfileAssessmentAttemptState(
+    manager: EntityManager,
+    profile: FreelancerProfile,
+    userId: string,
+    latest?: FreelancerAssessment | null,
+  ) {
+    const retryState = await this.getAssessmentRetryState(
+      userId,
+      latest,
+      manager,
+    );
+    profile.assessmentAttemptsUsed = retryState.attemptsUsed;
+    profile.assessmentRetryAvailableAt = retryState.retryAvailableAt;
+  }
+
+  private getAssessmentRetryBlockedMessage(retryState: AssessmentRetryState) {
+    if (retryState.reason === 'limit_reached') {
+      return 'Assessment retry limit reached. Please contact support if you need an admin review.';
+    }
+    if (retryState.retryAvailableAt) {
+      return `You can retry the assessment after ${retryState.retryAvailableAt.toISOString()}.`;
+    }
+    return 'Assessment retry is not available yet.';
+  }
+
+  private addDays(date: Date, days: number) {
+    return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
   }
 
   private remainingSeconds(assessment: FreelancerAssessment) {
@@ -1271,6 +1482,9 @@ export class FreelancerAssessmentsService {
       return 'wait_for_assessment_generation';
     }
     if (assessment.status === 'generation_failed') {
+      return 'retry_assessment_generation';
+    }
+    if (ASSESSMENT_RETRY_FAILURE_STATUSES.has(assessment.status)) {
       return 'retry_assessment_generation';
     }
     if (SUBMITTED_STATUSES.has(assessment.status)) return 'wait_for_review';

@@ -1,4 +1,5 @@
 import {
+  ConflictException,
   Injectable,
   NotFoundException,
   InternalServerErrorException,
@@ -6,6 +7,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { User } from 'src/users/entities/user.entity';
 import { In, Repository } from 'typeorm';
+import { createHash } from 'crypto';
 import { UpdateUserDto } from './dtos/update-user.dto';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
@@ -16,7 +18,12 @@ import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
 import { FreelancerProfileEmbedding } from 'src/freelancers/entities/freelancer-profile-embedding.entity';
 import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
 import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
+import { FreelancerCvVersion } from 'src/freelancers/entities/freelancer-cv-version.entity';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
+
+const CV_UPLOAD_COOLDOWN_DAYS = 7;
+const CV_UPLOAD_MONTHLY_LIMIT = 3;
+const CV_UPLOAD_MONTHLY_WINDOW_DAYS = 30;
 
 @Injectable()
 export class UserService {
@@ -34,6 +41,8 @@ export class UserService {
     private readonly profileEmbeddingRepository: Repository<FreelancerProfileEmbedding>,
     @InjectRepository(FreelancerSkillScore)
     private readonly skillScoreRepository: Repository<FreelancerSkillScore>,
+    @InjectRepository(FreelancerCvVersion)
+    private readonly cvVersionRepository: Repository<FreelancerCvVersion>,
     private readonly configService: ConfigService,
     private readonly aiJobsProducer: AiJobsProducer,
   ) {
@@ -87,18 +96,19 @@ export class UserService {
     userId: string,
     file: Express.Multer.File,
   ): Promise<{ status: string; cvUrl: string }> {
+    const fileSha256 = createHash('sha256').update(file.buffer).digest('hex');
     const existingUser = await this.userRepository.findOne({
       where: { id: userId },
       relations: ['freelancerProfile'],
     });
     if (!existingUser) throw new NotFoundException('User not found');
 
-    const oldCvPublicId = (() => {
-      const oldUrl = existingUser?.freelancerProfile?.cvUrl;
-      if (!oldUrl) return null;
-      const match = oldUrl.match(/cvs\/[^/]+$/);
-      return match ? match[0] : null;
-    })();
+    if (existingUser.freelancerProfile) {
+      await this.assertCvUploadAllowed(
+        existingUser.freelancerProfile,
+        fileSha256,
+      );
+    }
 
     const cvResult = await new Promise<UploadApiResponse>((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
@@ -128,33 +138,53 @@ export class UserService {
       const profile =
         existingUser.freelancerProfile ??
         this.freelancerProfileRepository.create({ userId });
-      const previousStatus = profile.verificationStatus ?? null;
 
-      profile.cvUrl = cvResult.secure_url;
-      profile.headline = null;
-      profile.skills = null;
-      profile.yearsExperience = null;
-      profile.summary = null;
-      profile.assessmentScore = null;
-      profile.cvExtractionStatus = 'queued';
-      profile.cvExtractionError = null;
-      profile.cvExtractedAt = null;
-      profile.assessmentGenerationStatus = 'pending';
-      profile.assessmentGenerationQueuedAt = null;
-      profile.assessmentGenerationStartedAt = null;
-      profile.assessmentGeneratedAt = null;
-      profile.assessmentGenerationError = null;
-      profile.assessmentGenerationJobId = null;
-      profile.verificationStatus = 'cv_processing';
+      const savedBaseProfile =
+        profile.id == null
+          ? await this.freelancerProfileRepository.save(profile)
+          : profile;
+      const previousStatus = savedBaseProfile.verificationStatus ?? null;
+      const versionNumber = await this.getNextCvVersionNumber(
+        savedBaseProfile.id,
+      );
+      const cvVersion = await this.cvVersionRepository.save(
+        this.cvVersionRepository.create({
+          freelancerProfileId: savedBaseProfile.id,
+          userId,
+          versionNumber,
+          cvUrl: cvResult.secure_url,
+          cloudinaryPublicId: cvResult.public_id,
+          fileSha256,
+          originalFilename: file.originalname ?? null,
+          fileSize: file.size ?? null,
+          mimeType: file.mimetype ?? null,
+          status: 'processing',
+          metadata: {
+            uploadSource: 'freelancer_profile',
+          },
+        }),
+      );
 
-      const savedProfile = await this.freelancerProfileRepository.save(profile);
+      savedBaseProfile.cvUrl = cvResult.secure_url;
+      savedBaseProfile.currentCvVersionId = cvVersion.id;
+      savedBaseProfile.cvUploadCooldownUntil = this.addDays(
+        new Date(),
+        CV_UPLOAD_COOLDOWN_DAYS,
+      );
+      savedBaseProfile.cvExtractionStatus = 'queued';
+      savedBaseProfile.cvExtractionError = null;
+      savedBaseProfile.cvExtractedAt = null;
+      savedBaseProfile.assessmentGenerationStatus = 'pending';
+      savedBaseProfile.assessmentGenerationQueuedAt = null;
+      savedBaseProfile.assessmentGenerationStartedAt = null;
+      savedBaseProfile.assessmentGeneratedAt = null;
+      savedBaseProfile.assessmentGenerationError = null;
+      savedBaseProfile.assessmentGenerationJobId = null;
+      savedBaseProfile.verificationStatus = 'cv_processing';
+
+      const savedProfile =
+        await this.freelancerProfileRepository.save(savedBaseProfile);
       await this.cancelOpenAssessmentsForNewCv(userId);
-      await this.skillScoreRepository.delete({
-        freelancerProfileId: savedProfile.id,
-      });
-      await this.profileEmbeddingRepository.delete({
-        freelancerProfileId: savedProfile.id,
-      });
       await this.recordVerificationEvent({
         profile: savedProfile,
         eventType: 'cv_uploaded',
@@ -164,6 +194,9 @@ export class UserService {
         actorUserId: userId,
         metadata: {
           cvUrl: cvResult.secure_url,
+          cvVersionId: cvVersion.id,
+          versionNumber,
+          fileSha256,
         },
       });
 
@@ -183,9 +216,14 @@ export class UserService {
           metadata: {
             agentJobId: extractionJob.id,
             queueName: extractionJob.queueName,
+            cvVersionId: cvVersion.id,
           },
         });
       } catch (queueError) {
+        await this.cvVersionRepository.update(cvVersion.id, {
+          status: 'extraction_failed',
+          extractionError: this.getErrorMessage(queueError),
+        });
         savedProfile.cvExtractionStatus = 'failed';
         savedProfile.cvExtractionError = this.getErrorMessage(queueError);
         savedProfile.verificationStatus = 'cv_extraction_failed';
@@ -199,22 +237,12 @@ export class UserService {
           actorType: 'system',
           metadata: {
             error: failedProfile.cvExtractionError,
+            cvVersionId: cvVersion.id,
           },
         });
         this.logger.error(
           `CV extraction queue failed for profile ${savedProfile.id}: ${failedProfile.cvExtractionError}`,
         );
-      }
-
-      if (oldCvPublicId) {
-        cloudinary.uploader
-          .destroy(oldCvPublicId, { resource_type: 'raw' })
-          .catch((err) =>
-            this.logger.error(
-              `Failed to clean old CV asset ${oldCvPublicId}`,
-              err,
-            ),
-          );
       }
 
       return { status: 'success', cvUrl: cvResult.secure_url };
@@ -229,6 +257,61 @@ export class UserService {
         );
       throw dbError;
     }
+  }
+
+  private async assertCvUploadAllowed(
+    profile: FreelancerProfile,
+    fileSha256: string,
+  ) {
+    const duplicate = await this.cvVersionRepository.findOne({
+      where: { freelancerProfileId: profile.id, fileSha256 },
+      select: ['id', 'createdAt'],
+    });
+    if (duplicate) {
+      throw new ConflictException(
+        'This CV file was already uploaded. Use retry processing instead of uploading it again.',
+      );
+    }
+
+    const now = new Date();
+    if (profile.cvUploadCooldownUntil && profile.cvUploadCooldownUntil > now) {
+      throw new ConflictException(
+        `You can upload another CV after ${profile.cvUploadCooldownUntil.toISOString()}.`,
+      );
+    }
+
+    const windowStart = this.addDays(now, -CV_UPLOAD_MONTHLY_WINDOW_DAYS);
+    const recentUploads = await this.cvVersionRepository
+      .createQueryBuilder('version')
+      .where('version.freelancerProfileId = :profileId', {
+        profileId: profile.id,
+      })
+      .andWhere('version.createdAt >= :windowStart', { windowStart })
+      .orderBy('version.createdAt', 'ASC')
+      .getMany();
+
+    if (recentUploads.length >= CV_UPLOAD_MONTHLY_LIMIT) {
+      const nextUploadAt = this.addDays(
+        recentUploads[0].createdAt,
+        CV_UPLOAD_MONTHLY_WINDOW_DAYS,
+      );
+      throw new ConflictException(
+        `Monthly CV upload limit reached. You can upload another CV after ${nextUploadAt.toISOString()}.`,
+      );
+    }
+  }
+
+  private async getNextCvVersionNumber(profileId: string) {
+    const latest = await this.cvVersionRepository.findOne({
+      where: { freelancerProfileId: profileId },
+      order: { versionNumber: 'DESC' },
+      select: ['versionNumber'],
+    });
+    return (latest?.versionNumber ?? 0) + 1;
+  }
+
+  private addDays(date: Date, days: number) {
+    return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
   }
 
   async uploadAndSavePhoto(

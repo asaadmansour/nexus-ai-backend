@@ -13,10 +13,12 @@ import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { NotificationsModule } from 'src/notifications/notifications.module';
+import { QueuesModule } from 'src/queues/queues.module';
 
 @Module({
   imports: [
     NotificationsModule,
+    QueuesModule,
     TypeOrmModule.forFeature([
       User,
       Project,

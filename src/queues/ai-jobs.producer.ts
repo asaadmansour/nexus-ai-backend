@@ -4,25 +4,18 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
 import { Repository } from 'typeorm';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
-import { AI_JOB_RETRY, JOBS, QUEUES } from './queue.constants';
+import {
+  AI_JOB_RETRY,
+  AI_JOB_TYPES,
+  AI_QUEUE_JOB_OPTIONS,
+  JOBS,
+  QUEUES,
+} from './queue.constants';
 import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
   ProfileEmbeddingJobData,
 } from './queue.types';
-
-const CV_EXTRACTION_JOB_TYPE = 'cv_extraction';
-const ASSESSMENT_GENERATION_JOB_TYPE = 'assessment_generation';
-const PROFILE_EMBEDDING_JOB_TYPE = 'profile_embedding';
-const AI_QUEUE_JOB_OPTIONS = {
-  attempts: AI_JOB_RETRY.ATTEMPTS,
-  backoff: {
-    type: 'exponential' as const,
-    delay: AI_JOB_RETRY.BACKOFF_DELAY_MS,
-  },
-  removeOnComplete: 1000,
-  removeOnFail: 5000,
-};
 
 @Injectable()
 export class AiJobsProducer {
@@ -44,8 +37,8 @@ export class AiJobsProducer {
   }) {
     const agentJob = await this.agentJobRepository.save(
       this.agentJobRepository.create({
-        agentName: CV_EXTRACTION_JOB_TYPE,
-        jobType: CV_EXTRACTION_JOB_TYPE,
+        agentName: AI_JOB_TYPES.CV_EXTRACTION,
+        jobType: AI_JOB_TYPES.CV_EXTRACTION,
         userId: input.userId,
         freelancerProfileId: input.profileId,
         status: 'queued',
@@ -89,8 +82,8 @@ export class AiJobsProducer {
   }) {
     const agentJob = await this.agentJobRepository.save(
       this.agentJobRepository.create({
-        agentName: ASSESSMENT_GENERATION_JOB_TYPE,
-        jobType: ASSESSMENT_GENERATION_JOB_TYPE,
+        agentName: AI_JOB_TYPES.ASSESSMENT_GENERATION,
+        jobType: AI_JOB_TYPES.ASSESSMENT_GENERATION,
         userId: input.userId,
         freelancerProfileId: input.profileId,
         status: 'queued',
@@ -137,8 +130,8 @@ export class AiJobsProducer {
   }) {
     const agentJob = await this.agentJobRepository.save(
       this.agentJobRepository.create({
-        agentName: PROFILE_EMBEDDING_JOB_TYPE,
-        jobType: PROFILE_EMBEDDING_JOB_TYPE,
+        agentName: AI_JOB_TYPES.PROFILE_EMBEDDING,
+        jobType: AI_JOB_TYPES.PROFILE_EMBEDDING,
         userId: input.userId,
         freelancerProfileId: input.profileId,
         assessmentId: input.assessmentId ?? null,

@@ -18,6 +18,7 @@ import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
+import { AiJobRecoveryService } from 'src/queues/ai-job-recovery.service';
 import { UpdateAdminUserDto } from './dtos/update-admin-user.dto';
 import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
 import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
@@ -68,6 +69,7 @@ export class AdminService {
     @InjectRepository(RefreshToken)
     private refreshTokenRepository: Repository<RefreshToken>,
     private readonly notificationsService: NotificationsService,
+    private readonly aiJobRecoveryService: AiJobRecoveryService,
   ) {}
 
   private getAiRecommendation(feedback: Record<string, unknown> | null) {
@@ -1203,5 +1205,10 @@ export class AdminService {
       startedAt: job.startedAt,
       completedAt: job.completedAt,
     };
+  }
+
+  async retryAgentJob(id: string) {
+    await this.aiJobRecoveryService.retryFailedJobNow(id);
+    return this.getAgentJobDetail(id);
   }
 }

@@ -44,6 +44,16 @@ export class FreelancerProfile {
   @Column({ name: 'cv_url', type: 'text', nullable: true })
   cvUrl: string | null;
 
+  @Column({ name: 'current_cv_version_id', type: 'uuid', nullable: true })
+  currentCvVersionId: string | null;
+
+  @Column({
+    name: 'cv_upload_cooldown_until',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  cvUploadCooldownUntil: Date | null;
+
   @Column({
     name: 'cv_extraction_status',
     type: 'varchar',
@@ -204,6 +214,16 @@ export class FreelancerProfile {
     nullable: true,
   })
   assessmentSubmittedAt: Date | null;
+
+  @Column({ name: 'assessment_attempts_used', type: 'int', default: 0 })
+  assessmentAttemptsUsed: number;
+
+  @Column({
+    name: 'assessment_retry_available_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  assessmentRetryAvailableAt: Date | null;
 
   @Column({ name: 'approved_at', type: 'timestamptz', nullable: true })
   approvedAt: Date | null;

@@ -53,6 +53,12 @@ export class FreelancerAssessment {
   @Column({ name: 'generated_from_cv_url', type: 'text', nullable: true })
   generatedFromCvUrl: string | null;
 
+  @Column({ name: 'cv_version_id', type: 'uuid', nullable: true })
+  cvVersionId: string | null;
+
+  @Column({ name: 'attempt_number', type: 'int', default: 1 })
+  attemptNumber: number;
+
   @Column({ name: 'generation_job_id', type: 'uuid', nullable: true })
   generationJobId: string | null;
 

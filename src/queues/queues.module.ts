@@ -6,6 +6,7 @@ import type { RedisOptions } from 'ioredis';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { AiJobsProducer } from './ai-jobs.producer';
 import { AI_JOB_RETRY, QUEUES } from './queue.constants';
+import { AiJobRecoveryService } from './ai-job-recovery.service';
 
 function getRedisConnection(redisUrl: string): RedisOptions {
   const url = new URL(redisUrl);
@@ -48,7 +49,7 @@ function getRedisConnection(redisUrl: string): RedisOptions {
       { name: QUEUES.PROFILE_EMBEDDING },
     ),
   ],
-  providers: [AiJobsProducer],
-  exports: [BullModule, AiJobsProducer],
+  providers: [AiJobsProducer, AiJobRecoveryService],
+  exports: [BullModule, AiJobsProducer, AiJobRecoveryService],
 })
 export class QueuesModule {}

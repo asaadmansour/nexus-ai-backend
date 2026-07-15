@@ -8,6 +8,7 @@ import { FreelancerAssessmentAnswer } from './entities/freelancer-assessment-ans
 import { FreelancerAssessmentEvent } from './entities/freelancer-assessment-event.entity';
 import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-question.entity';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
+import { FreelancerCvVersion } from './entities/freelancer-cv-version.entity';
 import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedding.entity';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
@@ -30,6 +31,7 @@ import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
     TypeOrmModule.forFeature([
       AgentJob,
       FreelancerProfile,
+      FreelancerCvVersion,
       FreelancerAssessment,
       FreelancerAssessmentQuestion,
       FreelancerAssessmentAnswer,

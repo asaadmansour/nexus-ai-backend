@@ -5,6 +5,7 @@ import {
   Query,
   Param,
   Patch,
+  Post,
   Body,
 } from '@nestjs/common';
 import { AuthGuard } from 'src/common/guards/auth.guard';
@@ -279,6 +280,12 @@ export class AdminController {
   @Get('agent-jobs/:id')
   async getAgentJobDetail(@Param('id') id: string) {
     const data = await this.adminService.getAgentJobDetail(id);
+    return { status: 'success', data };
+  }
+
+  @Post('agent-jobs/:id/retry')
+  async retryAgentJob(@Param('id') id: string) {
+    const data = await this.adminService.retryAgentJob(id);
     return { status: 'success', data };
   }
 }

@@ -14,6 +14,7 @@ import {
 import { AI_JOB_RETRY } from 'src/queues/queue.constants';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
 import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-question.entity';
+import { FreelancerCvVersion } from './entities/freelancer-cv-version.entity';
 import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedding.entity';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
@@ -23,11 +24,20 @@ const DEFAULT_QUESTION_COUNT = 40;
 const DEFAULT_DURATION_SECONDS = 2700;
 const PROFILE_EMBEDDING_DIMENSIONS = 1024;
 const PROFILE_EMBEDDING_MODEL = 'nexus-freelancer-profile-v1';
+const PROFILE_EMBEDDING_PROVIDER_MODEL = 'gemini-embedding-001';
 const OPEN_ASSESSMENT_STATUSES = [
   'pending',
   'generating',
   'ready',
   'in_progress',
+];
+const ASSESSMENT_ATTEMPT_COUNT_STATUSES = [
+  'in_progress',
+  'submitted',
+  'needs_review',
+  'passed',
+  'failed',
+  'expired',
 ];
 
 interface CvExtractionResult {
@@ -58,6 +68,12 @@ interface AssessmentGenerationReservation {
   skills: string[];
 }
 
+interface SkillDiff {
+  newSkills: string[];
+  retainedSkills: string[];
+  removedSkills: string[];
+}
+
 @Injectable()
 export class FreelancerAiJobsService {
   private readonly logger = new Logger(FreelancerAiJobsService.name);
@@ -71,6 +87,8 @@ export class FreelancerAiJobsService {
     private readonly assessmentRepository: Repository<FreelancerAssessment>,
     @InjectRepository(FreelancerAssessmentQuestion)
     private readonly questionRepository: Repository<FreelancerAssessmentQuestion>,
+    @InjectRepository(FreelancerCvVersion)
+    private readonly cvVersionRepository: Repository<FreelancerCvVersion>,
     @InjectRepository(FreelancerProfileEmbedding)
     private readonly profileEmbeddingRepository: Repository<FreelancerProfileEmbedding>,
     @InjectRepository(FreelancerSkillScore)
@@ -112,6 +130,9 @@ export class FreelancerAiJobsService {
         throw new Error('The CV extractor did not return any skills');
       }
 
+      const previousSkills = this.normalizeSkills(profile.skills ?? []);
+      const skillDiff = this.diffSkills(previousSkills, skills);
+      const cvVersion = await this.getCvVersion(data.profileId, data.cvUrl);
       const previousStatus = profile.verificationStatus ?? null;
       if (this.hasText(result.headline)) {
         profile.headline = result.headline.trim();
@@ -127,11 +148,20 @@ export class FreelancerAiJobsService {
       profile.cvExtractionStatus = 'completed';
       profile.cvExtractionError = null;
       profile.cvExtractedAt = new Date();
+      profile.currentCvVersionId = cvVersion?.id ?? profile.currentCvVersionId;
       profile.assessmentGenerationStatus = 'pending';
       profile.assessmentGenerationError = null;
       profile.verificationStatus = 'assessment_pending';
 
       const savedProfile = await this.profileRepository.save(profile);
+      if (cvVersion) {
+        await this.markCvVersionActive(cvVersion, {
+          skills,
+          skillDiff,
+          confidence: result.confidence ?? null,
+          agentJobId: data.agentJobId,
+        });
+      }
       cvSaved = true;
       await this.recordVerificationEvent(this.dataSource.manager, {
         profile: savedProfile,
@@ -141,8 +171,11 @@ export class FreelancerAiJobsService {
         actorType: 'ai',
         metadata: {
           agentJobId: data.agentJobId,
+          cvVersionId: cvVersion?.id ?? null,
           confidence: result.confidence ?? null,
           skillsCount: skills.length,
+          newSkills: skillDiff.newSkills,
+          removedSkills: skillDiff.removedSkills,
         },
       });
 
@@ -170,6 +203,7 @@ export class FreelancerAiJobsService {
         metadata: {
           agentJobId: generationJob.id,
           queueName: generationJob.queueName,
+          cvVersionId: cvVersion?.id ?? null,
         },
       });
 
@@ -334,10 +368,11 @@ export class FreelancerAiJobsService {
       const generated = await this.aiService.generateEmbedding({
         text: sourceText,
         dimensions: PROFILE_EMBEDDING_DIMENSIONS,
-        model: PROFILE_EMBEDDING_MODEL,
+        model: PROFILE_EMBEDDING_PROVIDER_MODEL,
       });
       const embedding = this.normalizeEmbedding(generated.embedding);
-      const embeddingModel = generated.model ?? PROFILE_EMBEDDING_MODEL;
+      const embeddingModel = PROFILE_EMBEDDING_MODEL;
+      const providerModel = generated.model ?? PROFILE_EMBEDDING_PROVIDER_MODEL;
 
       const embeddingRow = {
         freelancerProfileId: profile.id,
@@ -352,6 +387,7 @@ export class FreelancerAiJobsService {
           assessmentScore: assessment?.score ?? null,
           skillScoresCount: skillScores.length,
           generatedDimensions: generated.dimensions ?? null,
+          providerModel,
         },
       } as QueryDeepPartialEntity<FreelancerProfileEmbedding>;
 
@@ -370,6 +406,7 @@ export class FreelancerAiJobsService {
           agentJobId: data.agentJobId,
           assessmentId: assessment?.id ?? data.assessmentId ?? null,
           embeddingModel,
+          providerModel,
           dimensions: embedding.length,
           reason: data.reason,
         },
@@ -379,6 +416,7 @@ export class FreelancerAiJobsService {
         profileId: profile.id,
         assessmentId: assessment?.id ?? data.assessmentId ?? null,
         embeddingModel,
+        providerModel,
         dimensions: embedding.length,
         sourceTextLength: sourceText.length,
       });
@@ -457,9 +495,13 @@ export class FreelancerAiJobsService {
           expiresAt: null,
           submittedAt: null,
           generatedFromCvUrl: data.cvUrl,
+          cvVersionId: profile.currentCvVersionId,
           generationJobId: data.agentJobId,
+          attemptNumber:
+            (await this.countAssessmentAttempts(manager, data.userId)) + 1,
           generationInput: {
             cvUrl: data.cvUrl,
+            cvVersionId: profile.currentCvVersionId,
             skills,
             yearsExperience: profile.yearsExperience,
             headline: profile.headline,
@@ -572,6 +614,102 @@ export class FreelancerAiJobsService {
       metadata: {
         agentJobId: input.agentJobId,
         assessmentId: input.assessmentId,
+      },
+    });
+  }
+
+  private async getCvVersion(profileId: string, cvUrl: string) {
+    return this.cvVersionRepository.findOne({
+      where: { freelancerProfileId: profileId, cvUrl },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  private async markCvVersionActive(
+    cvVersion: FreelancerCvVersion,
+    input: {
+      skills: string[];
+      skillDiff: SkillDiff;
+      confidence: number | null;
+      agentJobId: string;
+    },
+  ) {
+    await this.cvVersionRepository
+      .createQueryBuilder()
+      .update(FreelancerCvVersion)
+      .set({ status: 'superseded' })
+      .where('"freelancer_profile_id" = :profileId', {
+        profileId: cvVersion.freelancerProfileId,
+      })
+      .andWhere('status = :status', { status: 'active' })
+      .andWhere('id != :id', { id: cvVersion.id })
+      .execute();
+
+    cvVersion.status = 'active';
+    cvVersion.extractedSkills = input.skills;
+    cvVersion.newSkills = input.skillDiff.newSkills;
+    cvVersion.retainedSkills = input.skillDiff.retainedSkills;
+    cvVersion.removedSkills = input.skillDiff.removedSkills;
+    cvVersion.extractionError = null;
+    cvVersion.extractedAt = new Date();
+    cvVersion.metadata = {
+      ...(cvVersion.metadata ?? {}),
+      confidence: input.confidence,
+      agentJobId: input.agentJobId,
+    };
+    await this.cvVersionRepository.save(cvVersion);
+  }
+
+  private async markCvVersionExtractionFailed(
+    profileId: string,
+    cvUrl: string,
+    error: string,
+    agentJobId: string,
+  ) {
+    const cvVersion = await this.getCvVersion(profileId, cvUrl);
+    if (!cvVersion) return;
+
+    cvVersion.status = 'extraction_failed';
+    cvVersion.extractionError = error;
+    cvVersion.metadata = {
+      ...(cvVersion.metadata ?? {}),
+      failedAgentJobId: agentJobId,
+    };
+    await this.cvVersionRepository.save(cvVersion);
+  }
+
+  private diffSkills(
+    previousSkills: string[],
+    nextSkills: string[],
+  ): SkillDiff {
+    const previousByKey = new Map(
+      previousSkills.map((skill) => [skill.toLowerCase(), skill]),
+    );
+    const nextByKey = new Map(
+      nextSkills.map((skill) => [skill.toLowerCase(), skill]),
+    );
+
+    return {
+      newSkills: nextSkills.filter(
+        (skill) => !previousByKey.has(skill.toLowerCase()),
+      ),
+      retainedSkills: nextSkills.filter((skill) =>
+        previousByKey.has(skill.toLowerCase()),
+      ),
+      removedSkills: previousSkills.filter(
+        (skill) => !nextByKey.has(skill.toLowerCase()),
+      ),
+    };
+  }
+
+  private async countAssessmentAttempts(
+    manager: EntityManager,
+    userId: string,
+  ) {
+    return manager.count(FreelancerAssessment, {
+      where: {
+        userId,
+        status: In(ASSESSMENT_ATTEMPT_COUNT_STATUSES),
       },
     });
   }
@@ -693,6 +831,12 @@ export class FreelancerAiJobsService {
     });
     if (!profile) return;
 
+    await this.markCvVersionExtractionFailed(
+      profileId,
+      cvUrl,
+      error,
+      agentJobId,
+    );
     const previousStatus = profile.verificationStatus ?? null;
     profile.cvExtractionStatus = 'failed';
     profile.cvExtractionError = error;

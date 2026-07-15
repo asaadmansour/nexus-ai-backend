@@ -9,6 +9,7 @@ import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer
 import { FreelancerAssessment } from 'src/freelancers/entities/freelancer-assessment.entity';
 import { FreelancerProfileEmbedding } from 'src/freelancers/entities/freelancer-profile-embedding.entity';
 import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
+import { FreelancerCvVersion } from 'src/freelancers/entities/freelancer-cv-version.entity';
 import { QueuesModule } from 'src/queues/queues.module';
 
 @Module({
@@ -21,6 +22,7 @@ import { QueuesModule } from 'src/queues/queues.module';
       FreelancerVerificationEvent,
       FreelancerProfileEmbedding,
       FreelancerSkillScore,
+      FreelancerCvVersion,
     ]),
     ConfigModule,
   ],
