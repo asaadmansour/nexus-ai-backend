@@ -6,6 +6,10 @@ import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
+import {
+  MatchCandidateInputDto,
+  MatchFreelancersDto,
+} from './dto/MatchFreelancersDto';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -56,6 +60,22 @@ type FastApiGenerateEmbeddingResponse = {
   embedding?: number[];
   model?: string;
   dimensions?: number;
+};
+
+export type MatchFreelancersResultCandidate = {
+  freelancerProfileId: string;
+  rank: number;
+  score: number;
+  scoreBreakdown: Record<string, number>;
+  rationale: string;
+  evidence: Record<string, unknown>;
+};
+
+export type MatchFreelancersResult = {
+  targetRoleKey: string;
+  summary: string;
+  candidates: MatchFreelancersResultCandidate[];
+  source: 'fastapi' | 'local_mock';
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -168,6 +188,192 @@ export class AiService {
       },
       'generate-embedding',
     );
+  }
+
+  async matchFreelancers(
+    dto: MatchFreelancersDto,
+  ): Promise<MatchFreelancersResult> {
+    if (this.isMockMode()) {
+      return this.getMockMatchFreelancersResult(dto);
+    }
+
+    const result = await this.postToFastApi<{
+      summary?: string;
+      candidates?: MatchFreelancersResultCandidate[];
+    }>(
+      '/agents/match-freelancers',
+      {
+        matchingRunId: dto.matchingRunId,
+        targetRoleKey: dto.targetRoleKey,
+        limit: dto.limit,
+        project: dto.project,
+        brief: dto.brief,
+        candidates: dto.candidates,
+      },
+      'match-freelancers',
+    );
+
+    return {
+      targetRoleKey: dto.targetRoleKey,
+      summary: result.summary ?? `Ranked candidates for ${dto.targetRoleKey}.`,
+      candidates: result.candidates ?? [],
+      source: 'fastapi',
+    };
+  }
+
+  private getMockMatchFreelancersResult(
+    dto: MatchFreelancersDto,
+  ): MatchFreelancersResult {
+    const requiredSkills = this.getRoleRequiredSkills(dto);
+    const budgetMax = this.toNumber(dto.project?.budgetMax);
+    const limit = dto.limit ?? 10;
+
+    const scored = dto.candidates.map((candidate) => {
+      const breakdown = this.scoreMockCandidate(
+        candidate,
+        requiredSkills,
+        budgetMax,
+      );
+      const score = Object.values(breakdown).reduce(
+        (sum, value) => sum + value,
+        0,
+      );
+      const candidateSkills = this.candidateSkillNames(candidate);
+      const matchedSkills = requiredSkills.filter((skill) =>
+        candidateSkills.includes(skill.toLowerCase()),
+      );
+      const missingSkills = requiredSkills.filter(
+        (skill) => !candidateSkills.includes(skill.toLowerCase()),
+      );
+
+      return {
+        freelancerProfileId: candidate.freelancerProfileId,
+        score: Number(score.toFixed(2)),
+        scoreBreakdown: breakdown,
+        rationale: this.buildMockRationale(
+          dto.targetRoleKey,
+          matchedSkills,
+          candidate,
+        ),
+        evidence: {
+          matchedSkills,
+          missingSkills,
+          availabilityHours: candidate.availabilityHours ?? null,
+          hourlyRate: candidate.hourlyRate ?? null,
+          averageSkillScore: candidate.averageSkillScore ?? null,
+          riskFlags: this.buildMockRiskFlags(candidate, budgetMax),
+        },
+      };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    const candidates = scored.slice(0, limit).map((candidate, index) => ({
+      ...candidate,
+      rank: index + 1,
+    }));
+
+    return {
+      targetRoleKey: dto.targetRoleKey,
+      summary: `${candidates.length} approved ${dto.targetRoleKey} candidates ranked for this project.`,
+      candidates,
+      source: 'local_mock',
+    };
+  }
+
+  private scoreMockCandidate(
+    candidate: MatchCandidateInputDto,
+    requiredSkills: string[],
+    budgetMax: number | null,
+  ): Record<string, number> {
+    const candidateSkills = this.candidateSkillNames(candidate);
+    const matched = requiredSkills.filter((skill) =>
+      candidateSkills.includes(skill.toLowerCase()),
+    ).length;
+    const skillRatio =
+      requiredSkills.length > 0 ? matched / requiredSkills.length : 0.5;
+
+    const availability = candidate.availabilityHours ?? 0;
+    const rate = candidate.hourlyRate ?? null;
+    const avgSkillScore = candidate.averageSkillScore ?? 0;
+    const years = candidate.yearsExperience ?? 0;
+
+    const rateFit =
+      rate == null || budgetMax == null
+        ? 8
+        : rate * 40 <= budgetMax
+          ? 12
+          : rate * 40 <= budgetMax * 1.25
+            ? 8
+            : 3;
+
+    return {
+      skills: Number((skillRatio * 40).toFixed(2)),
+      availability: Number(((Math.min(availability, 40) / 40) * 15).toFixed(2)),
+      experience: Number(((Math.min(years, 8) / 8) * 18).toFixed(2)),
+      rateFit,
+      projectFit: Number(((Math.min(avgSkillScore, 5) / 5) * 15).toFixed(2)),
+    };
+  }
+
+  private getRoleRequiredSkills(dto: MatchFreelancersDto): string[] {
+    const filterSkills = Array.isArray(dto.project?.requiredSkills)
+      ? (dto.project.requiredSkills as unknown[]).filter(
+          (skill): skill is string => typeof skill === 'string',
+        )
+      : [];
+    if (filterSkills.length > 0) return filterSkills;
+
+    return dto.targetRoleKey === 'ui_ux'
+      ? ['Figma', 'Design Systems', 'User Flows']
+      : ['System Architecture', 'NestJS', 'PostgreSQL'];
+  }
+
+  private candidateSkillNames(candidate: MatchCandidateInputDto): string[] {
+    const fromScores = (candidate.skillScores ?? []).map((entry) =>
+      String(entry.skill).toLowerCase(),
+    );
+    const fromSkills = (candidate.skills ?? []).map((skill) =>
+      skill.toLowerCase(),
+    );
+    return Array.from(new Set([...fromScores, ...fromSkills]));
+  }
+
+  private buildMockRationale(
+    roleKey: string,
+    matchedSkills: string[],
+    candidate: MatchCandidateInputDto,
+  ): string {
+    const skillText =
+      matchedSkills.length > 0
+        ? `strong in ${matchedSkills.slice(0, 3).join(', ')}`
+        : 'limited direct skill overlap';
+    const availabilityText =
+      (candidate.availabilityHours ?? 0) >= 10
+        ? 'good availability'
+        : 'low availability';
+    return `Candidate for ${roleKey}: ${skillText}, ${availabilityText}.`;
+  }
+
+  private buildMockRiskFlags(
+    candidate: MatchCandidateInputDto,
+    budgetMax: number | null,
+  ): string[] {
+    const flags: string[] = [];
+    if ((candidate.availabilityHours ?? 0) < 10) {
+      flags.push('low_availability');
+    }
+    const rate = candidate.hourlyRate ?? null;
+    if (rate != null && budgetMax != null && rate * 40 > budgetMax * 1.25) {
+      flags.push('rate_above_budget');
+    }
+    return flags;
+  }
+
+  private toNumber(value: unknown): number | null {
+    const parsed = typeof value === 'string' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed)
+      ? parsed
+      : null;
   }
 
   private getMockExtractCvResult(dto: ExtractCvDto) {

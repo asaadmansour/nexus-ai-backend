@@ -5,6 +5,7 @@ import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
+import { MatchFreelancersDto } from './dto/MatchFreelancersDto';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { AuthGuard } from 'src/common/guards/auth.guard';
@@ -40,5 +41,10 @@ export class AiController {
   @Post('generate-embedding')
   generateEmbedding(@Body() embeddingDto: GenerateEmbeddingDto) {
     return this.aiService.generateEmbedding(embeddingDto);
+  }
+
+  @Post('match-freelancers')
+  matchFreelancers(@Body() matchDto: MatchFreelancersDto) {
+    return this.aiService.matchFreelancers(matchDto);
   }
 }
