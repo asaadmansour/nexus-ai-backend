@@ -6,6 +6,11 @@ import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
+import {
+  MatchCandidateInputDto,
+  MatchFreelancersDto,
+} from './dto/MatchFreelancersDto';
+import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -56,6 +61,57 @@ type FastApiGenerateEmbeddingResponse = {
   embedding?: number[];
   model?: string;
   dimensions?: number;
+};
+
+export type MatchFreelancersResultCandidate = {
+  freelancerProfileId: string;
+  rank: number;
+  score: number;
+  scoreBreakdown: Record<string, number>;
+  rationale: string;
+  evidence: Record<string, unknown>;
+};
+
+export type MatchFreelancersResult = {
+  targetRoleKey: string;
+  summary: string;
+  candidates: MatchFreelancersResultCandidate[];
+  source: 'fastapi' | 'local_mock';
+};
+
+export type ProjectPlanMilestone = {
+  key: string;
+  title: string;
+  description?: string;
+  orderIndex: number;
+  budgetAmount?: number | null;
+  currency?: string | null;
+  acceptanceCriteria?: string[];
+};
+
+export type ProjectPlanTask = {
+  key: string;
+  milestoneKey: string;
+  title: string;
+  description?: string;
+  priority?: string;
+  roleKey?: string;
+  requiredSkills?: string[];
+  estimatedHours?: number | null;
+  orderIndex: number;
+  acceptanceCriteria?: string[];
+  dependsOn?: string[];
+};
+
+export type ProjectPlanResult = {
+  summary: string;
+  assumptions: string[];
+  timeline: Record<string, unknown>;
+  milestones: ProjectPlanMilestone[];
+  tasks: ProjectPlanTask[];
+  teamPlan: Record<string, unknown>;
+  riskRegister: Record<string, unknown>[];
+  source: 'fastapi' | 'local_mock';
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -168,6 +224,323 @@ export class AiService {
       },
       'generate-embedding',
     );
+  }
+
+  async matchFreelancers(
+    dto: MatchFreelancersDto,
+  ): Promise<MatchFreelancersResult> {
+    if (this.isMockMode()) {
+      return this.getMockMatchFreelancersResult(dto);
+    }
+
+    const result = await this.postToFastApi<{
+      summary?: string;
+      candidates?: MatchFreelancersResultCandidate[];
+    }>(
+      '/agents/match-freelancers',
+      {
+        matchingRunId: dto.matchingRunId,
+        targetRoleKey: dto.targetRoleKey,
+        limit: dto.limit,
+        project: dto.project,
+        brief: dto.brief,
+        candidates: dto.candidates,
+      },
+      'match-freelancers',
+    );
+
+    return {
+      targetRoleKey: dto.targetRoleKey,
+      summary: result.summary ?? `Ranked candidates for ${dto.targetRoleKey}.`,
+      candidates: result.candidates ?? [],
+      source: 'fastapi',
+    };
+  }
+
+  private getMockMatchFreelancersResult(
+    dto: MatchFreelancersDto,
+  ): MatchFreelancersResult {
+    const requiredSkills = this.getRoleRequiredSkills(dto);
+    const budgetMax = this.toNumber(dto.project?.budgetMax);
+    const limit = dto.limit ?? 10;
+
+    const scored = dto.candidates.map((candidate) => {
+      const breakdown = this.scoreMockCandidate(
+        candidate,
+        requiredSkills,
+        budgetMax,
+      );
+      const score = Object.values(breakdown).reduce(
+        (sum, value) => sum + value,
+        0,
+      );
+      const candidateSkills = this.candidateSkillNames(candidate);
+      const matchedSkills = requiredSkills.filter((skill) =>
+        candidateSkills.includes(skill.toLowerCase()),
+      );
+      const missingSkills = requiredSkills.filter(
+        (skill) => !candidateSkills.includes(skill.toLowerCase()),
+      );
+
+      return {
+        freelancerProfileId: candidate.freelancerProfileId,
+        score: Number(score.toFixed(2)),
+        scoreBreakdown: breakdown,
+        rationale: this.buildMockRationale(
+          dto.targetRoleKey,
+          matchedSkills,
+          candidate,
+        ),
+        evidence: {
+          matchedSkills,
+          missingSkills,
+          availabilityHours: candidate.availabilityHours ?? null,
+          hourlyRate: candidate.hourlyRate ?? null,
+          averageSkillScore: candidate.averageSkillScore ?? null,
+          riskFlags: this.buildMockRiskFlags(candidate, budgetMax),
+        },
+      };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    const candidates = scored.slice(0, limit).map((candidate, index) => ({
+      ...candidate,
+      rank: index + 1,
+    }));
+
+    return {
+      targetRoleKey: dto.targetRoleKey,
+      summary: `${candidates.length} approved ${dto.targetRoleKey} candidates ranked for this project.`,
+      candidates,
+      source: 'local_mock',
+    };
+  }
+
+  private scoreMockCandidate(
+    candidate: MatchCandidateInputDto,
+    requiredSkills: string[],
+    budgetMax: number | null,
+  ): Record<string, number> {
+    const candidateSkills = this.candidateSkillNames(candidate);
+    const matched = requiredSkills.filter((skill) =>
+      candidateSkills.includes(skill.toLowerCase()),
+    ).length;
+    const skillRatio =
+      requiredSkills.length > 0 ? matched / requiredSkills.length : 0.5;
+
+    const availability = candidate.availabilityHours ?? 0;
+    const rate = candidate.hourlyRate ?? null;
+    const avgSkillScore = candidate.averageSkillScore ?? 0;
+    const years = candidate.yearsExperience ?? 0;
+
+    const rateFit =
+      rate == null || budgetMax == null
+        ? 8
+        : rate * 40 <= budgetMax
+          ? 12
+          : rate * 40 <= budgetMax * 1.25
+            ? 8
+            : 3;
+
+    return {
+      skills: Number((skillRatio * 40).toFixed(2)),
+      availability: Number(((Math.min(availability, 40) / 40) * 15).toFixed(2)),
+      experience: Number(((Math.min(years, 8) / 8) * 18).toFixed(2)),
+      rateFit,
+      projectFit: Number(((Math.min(avgSkillScore, 5) / 5) * 15).toFixed(2)),
+    };
+  }
+
+  private getRoleRequiredSkills(dto: MatchFreelancersDto): string[] {
+    const filterSkills = Array.isArray(dto.project?.requiredSkills)
+      ? (dto.project.requiredSkills as unknown[]).filter(
+          (skill): skill is string => typeof skill === 'string',
+        )
+      : [];
+    if (filterSkills.length > 0) return filterSkills;
+
+    return dto.targetRoleKey === 'ui_ux'
+      ? ['Figma', 'Design Systems', 'User Flows']
+      : ['System Architecture', 'NestJS', 'PostgreSQL'];
+  }
+
+  private candidateSkillNames(candidate: MatchCandidateInputDto): string[] {
+    const fromScores = (candidate.skillScores ?? []).map((entry) =>
+      String(entry.skill).toLowerCase(),
+    );
+    const fromSkills = (candidate.skills ?? []).map((skill) =>
+      skill.toLowerCase(),
+    );
+    return Array.from(new Set([...fromScores, ...fromSkills]));
+  }
+
+  private buildMockRationale(
+    roleKey: string,
+    matchedSkills: string[],
+    candidate: MatchCandidateInputDto,
+  ): string {
+    const skillText =
+      matchedSkills.length > 0
+        ? `strong in ${matchedSkills.slice(0, 3).join(', ')}`
+        : 'limited direct skill overlap';
+    const availabilityText =
+      (candidate.availabilityHours ?? 0) >= 10
+        ? 'good availability'
+        : 'low availability';
+    return `Candidate for ${roleKey}: ${skillText}, ${availabilityText}.`;
+  }
+
+  private buildMockRiskFlags(
+    candidate: MatchCandidateInputDto,
+    budgetMax: number | null,
+  ): string[] {
+    const flags: string[] = [];
+    if ((candidate.availabilityHours ?? 0) < 10) {
+      flags.push('low_availability');
+    }
+    const rate = candidate.hourlyRate ?? null;
+    if (rate != null && budgetMax != null && rate * 40 > budgetMax * 1.25) {
+      flags.push('rate_above_budget');
+    }
+    return flags;
+  }
+
+  private toNumber(value: unknown): number | null {
+    const parsed = typeof value === 'string' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed)
+      ? parsed
+      : null;
+  }
+
+  async generateProjectPlan(
+    dto: GenerateProjectPlanDto,
+  ): Promise<ProjectPlanResult> {
+    if (this.isMockMode()) {
+      return this.getMockProjectPlanResult(dto);
+    }
+
+    const result = await this.postToFastApi<Partial<ProjectPlanResult>>(
+      '/agents/generate-project-plan',
+      {
+        projectId: dto.projectId,
+        project: dto.project,
+        brief: dto.brief,
+        architectureSubmission: dto.architectureSubmission,
+        uiuxSubmission: dto.uiuxSubmission,
+        team: dto.team,
+        notes: dto.notes,
+      },
+      'generate-project-plan',
+    );
+
+    return {
+      summary: result.summary ?? 'Generated implementation plan.',
+      assumptions: result.assumptions ?? [],
+      timeline: result.timeline ?? {},
+      milestones: result.milestones ?? [],
+      tasks: result.tasks ?? [],
+      teamPlan: result.teamPlan ?? {},
+      riskRegister: result.riskRegister ?? [],
+      source: 'fastapi',
+    };
+  }
+
+  private getMockProjectPlanResult(
+    dto: GenerateProjectPlanDto,
+  ): ProjectPlanResult {
+    const currency =
+      typeof dto.project?.currency === 'string' ? dto.project.currency : 'EGP';
+
+    const milestones: ProjectPlanMilestone[] = [
+      {
+        key: 'm1',
+        title: 'Foundation and core setup',
+        description:
+          'Auth, data model, and base API from the architecture plan.',
+        orderIndex: 1,
+        budgetAmount: 3000,
+        currency,
+        acceptanceCriteria: [
+          'Auth and roles work',
+          'Core entities and migrations exist',
+        ],
+      },
+      {
+        key: 'm2',
+        title: 'Primary product flow',
+        description: 'Main user-facing screens and their supporting endpoints.',
+        orderIndex: 2,
+        budgetAmount: 4000,
+        currency,
+        acceptanceCriteria: [
+          'Main flow works end to end',
+          'UI matches the approved UI/UX plan',
+        ],
+      },
+    ];
+
+    const tasks: ProjectPlanTask[] = [
+      {
+        key: 't1',
+        milestoneKey: 'm1',
+        title: 'Set up backend project and data model',
+        description: 'Scaffold the backend, entities, and migrations.',
+        priority: 'high',
+        roleKey: 'backend',
+        requiredSkills: ['NestJS', 'PostgreSQL'],
+        estimatedHours: 12,
+        orderIndex: 1,
+        acceptanceCriteria: [
+          'Migrations run',
+          'Entities match the architecture',
+        ],
+        dependsOn: [],
+      },
+      {
+        key: 't2',
+        milestoneKey: 'm1',
+        title: 'Implement authentication and roles',
+        description: 'Auth guards and role-based access.',
+        priority: 'high',
+        roleKey: 'backend',
+        requiredSkills: ['NestJS', 'JWT'],
+        estimatedHours: 10,
+        orderIndex: 2,
+        acceptanceCriteria: ['Login works', 'Role guards enforced'],
+        dependsOn: ['t1'],
+      },
+      {
+        key: 't3',
+        milestoneKey: 'm2',
+        title: 'Build primary UI screens',
+        description: 'Implement the main screens from the UI/UX plan.',
+        priority: 'medium',
+        roleKey: 'frontend',
+        requiredSkills: ['React', 'TypeScript'],
+        estimatedHours: 16,
+        orderIndex: 1,
+        acceptanceCriteria: ['Screens responsive', 'Matches design system'],
+        dependsOn: ['t2'],
+      },
+    ];
+
+    return {
+      summary:
+        'Build the product in two milestones: foundation, then core flow.',
+      assumptions: ['Scope follows the approved architecture and UI/UX plans.'],
+      timeline: { totalWeeks: 4, milestones: milestones.length },
+      milestones,
+      tasks,
+      teamPlan: { backend: 1, frontend: 1 },
+      riskRegister: [
+        {
+          risk: 'Scope creep beyond the approved plan',
+          severity: 'medium',
+          mitigation: 'Lock scope to the materialized tasks.',
+        },
+      ],
+      source: 'local_mock',
+    };
   }
 
   private getMockExtractCvResult(dto: ExtractCvDto) {
