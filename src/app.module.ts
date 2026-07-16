@@ -15,6 +15,7 @@ import { EmailModule } from './email/email.module';
 import { AdminModule } from './admin/admin.module';
 import { SearchModule } from './search/search.module';
 import { MatchingModule } from './matching/matching.module';
+import { AssignmentsModule } from './assignments/assignments.module';
 import { PaymentsModule } from './payments/payments.module';
 
 @Module({
@@ -35,6 +36,7 @@ import { PaymentsModule } from './payments/payments.module';
     AdminModule,
     SearchModule,
     MatchingModule,
+    AssignmentsModule,
     PaymentsModule,
   ],
   controllers: [AppController],
