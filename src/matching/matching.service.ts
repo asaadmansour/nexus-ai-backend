@@ -25,6 +25,44 @@ import { ReviewRunDto } from './dtos/review-run.dto';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
 const DEFAULT_LIMIT = 10;
+
+// Budget-aware rate cap for planning matching. The project budget is a total
+// lump sum, so we convert it into an affordable hourly rate: planning takes a
+// share of the budget, split across the planning roles, over a rough per-role
+// effort. These are tunable product assumptions.
+const PLANNING_BUDGET_SHARE = 0.2; // planning ≈ 20% of the total project budget
+const PLANNING_HOURS_PER_ROLE = 40; // a planning deliverable ≈ one focused week
+const MIN_AFFORDABLE_POOL = 3; // below this, relax the cap so the pool isn't empty
+
+// Sensible default required-skills per planning role, used when the admin does
+// not pass explicit `filters.skills`. Lets the architect and ui_ux runs rank
+// against role-relevant skills instead of one shared list.
+const PLANNING_ROLE_SKILLS: Record<string, string[]> = {
+  architect: [
+    'System Design',
+    'API Design',
+    'Database Design',
+    'PostgreSQL',
+    'NestJS',
+    'Node.js',
+    'Backend',
+    'Security',
+    'Microservices',
+    'Scalability',
+  ],
+  ui_ux: [
+    'Figma',
+    'Design Systems',
+    'User Flows',
+    'Wireframing',
+    'Prototyping',
+    'UI Design',
+    'UX Research',
+    'Accessibility',
+    'Ecommerce UX',
+    'Responsive Design',
+  ],
+};
 const MATCH_START_ALLOWED_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.BRIEF_COMPLETE,
   ProjectStatus.PLANNING_MATCHING,
@@ -55,10 +93,34 @@ export class MatchingService {
   // Start planning-role matching
   // ---------------------------------------------------------------------------
 
+  // Automatically triggered when a project's brief becomes complete. No-ops if
+  // matching already ran or the project is not startable, and never throws — it
+  // must not disrupt the brief-completion flow that calls it.
+  async autoStartPlanningRoles(projectId: string): Promise<void> {
+    try {
+      const existingRuns = await this.runRepo.count({ where: { projectId } });
+      if (existingRuns > 0) return;
+
+      const project = await this.projectRepo.findOne({ where: { id: projectId } });
+      if (!project || project.status !== ProjectStatus.BRIEF_COMPLETE) return;
+
+      await this.startPlanningRoles(
+        projectId,
+        {} as StartPlanningMatchingDto,
+        null,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        `Auto-start matching failed for project ${projectId}: ${message}`,
+      );
+    }
+  }
+
   async startPlanningRoles(
     projectId: string,
     dto: StartPlanningMatchingDto,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const project = await this.getProject(projectId);
     if (!MATCH_START_ALLOWED_STATUSES.has(project.status)) {
@@ -72,7 +134,7 @@ export class MatchingService {
       : [...PLANNING_ROLES];
 
     const brief = await this.briefRepo.findOne({ where: { projectId } });
-    const { candidates } = await this.buildCandidatePool(dto);
+    const { candidates } = await this.buildCandidatePool(dto, brief, project);
     const limit = dto.filters?.limit ?? DEFAULT_LIMIT;
 
     // Create the runs and flip the project up front, in a short transaction, so
@@ -114,11 +176,15 @@ export class MatchingService {
 
     for (const run of runs) {
       try {
+        // Rank against role-specific skills (admin override, else per-role default).
+        const roleSkills = dto.filters?.skills?.length
+          ? dto.filters.skills
+          : (PLANNING_ROLE_SKILLS[run.targetRoleKey!] ?? []);
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
           targetRoleKey: run.targetRoleKey!,
           limit,
-          project: projectSnapshot,
+          project: { ...projectSnapshot, requiredSkills: roleSkills },
           brief: briefSnapshot,
           candidates,
         });
@@ -527,7 +593,7 @@ export class MatchingService {
   private async transitionProject(
     manager: EntityManager,
     project: Project,
-    adminUserId: string,
+    adminUserId: string | null,
     change: {
       status: ProjectStatus;
       planningStatus: string;
@@ -555,14 +621,29 @@ export class MatchingService {
           oldStatus,
           newStatus: change.status,
           changedBy: adminUserId,
-          changedByType: 'admin',
+          changedByType: adminUserId ? 'admin' : 'system',
           reason: change.reason,
         }),
       );
     }
   }
 
-  private async buildCandidatePool(dto: StartPlanningMatchingDto) {
+  // Max hourly rate the budget can afford for a planning role. Returns null if
+  // the project has no usable budget (then no budget cap is applied).
+  private affordablePlanningRate(project: Project): number | null {
+    const budgetMax =
+      project.budgetMax != null ? Number(project.budgetMax) : null;
+    if (!budgetMax || budgetMax <= 0) return null;
+    const perRoleBudget =
+      (budgetMax * PLANNING_BUDGET_SHARE) / PLANNING_ROLES.length;
+    return Math.round(perRoleBudget / PLANNING_HOURS_PER_ROLE);
+  }
+
+  private async buildCandidatePool(
+    dto: StartPlanningMatchingDto,
+    brief: Brief | null,
+    project: Project,
+  ) {
     const filters = dto.filters;
     const qb = this.profileRepo
       .createQueryBuilder('p')
@@ -572,11 +653,6 @@ export class MatchingService {
       .andWhere('p.deletedAt IS NULL')
       .andWhere('p.isAvailable = true');
 
-    if (filters?.maxHourlyRate != null) {
-      qb.andWhere('(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)', {
-        maxRate: filters.maxHourlyRate,
-      });
-    }
     if (filters?.minAvailabilityHours != null) {
       qb.andWhere('COALESCE(p.availabilityHoursPerWeek, 0) >= :minAvail', {
         minAvail: filters.minAvailabilityHours,
@@ -593,8 +669,39 @@ export class MatchingService {
       });
     }
 
+    // Budget-aware rate cap: only match freelancers the budget can afford. An
+    // explicit admin maxHourlyRate wins; otherwise derive one from the budget.
+    const maxRate = filters?.maxHourlyRate ?? this.affordablePlanningRate(project);
+    const cappedQb = qb.clone();
+    if (maxRate != null) {
+      cappedQb.andWhere('(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)', {
+        maxRate,
+      });
+    }
+
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
-    const profiles = await qb.take(poolCap).getMany();
+    let profiles = await cappedQb.take(poolCap).getMany();
+
+    // If the budget cap left too few options, relax it — never return an empty
+    // pool just because rates are high; the admin still needs candidates.
+    if (
+      maxRate != null &&
+      filters?.maxHourlyRate == null &&
+      profiles.length < MIN_AFFORDABLE_POOL
+    ) {
+      this.logger.warn(
+        `Budget rate cap (${maxRate}) matched only ${profiles.length} freelancers for project ${project.id}; relaxing.`,
+      );
+      profiles = await qb.take(poolCap).getMany();
+    }
+
+    // Dense retrieval signal: cosine of the brief embedding vs. each freelancer
+    // profile embedding (pgvector). Best-effort — if it fails, matching still
+    // works on lexical + structured signals.
+    const similarity = await this.computeBriefSimilarity(
+      brief,
+      profiles.map((profile) => profile.id),
+    );
 
     const candidates: MatchCandidateInputDto[] = profiles.map((profile) => {
       const scores = (profile.skillScores ?? []).map((entry) => ({
@@ -613,6 +720,8 @@ export class MatchingService {
       return {
         freelancerProfileId: profile.id,
         name: this.fullName(profile.user) ?? undefined,
+        headline: profile.headline ?? undefined,
+        profileSummary: profile.bio ?? undefined,
         skills: profile.skills ?? [],
         skillScores: scores,
         hourlyRate:
@@ -620,10 +729,62 @@ export class MatchingService {
         availabilityHours: profile.availabilityHoursPerWeek ?? null,
         yearsExperience: profile.yearsExperience ?? null,
         averageSkillScore,
+        embeddingSimilarity: similarity.get(profile.id) ?? null,
       };
     });
 
     return { candidates };
+  }
+
+  /**
+   * Cosine similarity of the brief embedding vs. each freelancer profile
+   * embedding, via pgvector. Returns an empty map (lexical-only fallback) if the
+   * brief has no text, the embedding call fails, or no profile has an embedding.
+   */
+  private async computeBriefSimilarity(
+    brief: Brief | null,
+    profileIds: string[],
+  ): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (!brief || !profileIds.length) return map;
+
+    const text = [brief.summary, brief.briefText]
+      .filter((part): part is string => Boolean(part && part.trim()))
+      .join('\n')
+      .trim();
+    if (!text) return map;
+
+    try {
+      const result = await this.aiService.generateEmbedding({
+        text,
+        dimensions: 1024,
+      });
+      const embedding = result.embedding;
+      if (!embedding?.length) return map;
+
+      const vectorLiteral = `[${embedding.join(',')}]`;
+      const rows = await this.dataSource.query<
+        { freelancer_profile_id: string; similarity: string }[]
+      >(
+        `SELECT DISTINCT ON (freelancer_profile_id)
+                freelancer_profile_id,
+                1 - (embedding <=> $1::vector) AS similarity
+         FROM freelancer_profile_embeddings
+         WHERE freelancer_profile_id = ANY($2::uuid[])
+         ORDER BY freelancer_profile_id, created_at DESC`,
+        [vectorLiteral, profileIds],
+      );
+
+      for (const row of rows) {
+        map.set(row.freelancer_profile_id, Number(row.similarity));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `Brief similarity unavailable; matching falls back to lexical relevance: ${message}`,
+      );
+    }
+    return map;
   }
 
   private buildProjectSnapshot(

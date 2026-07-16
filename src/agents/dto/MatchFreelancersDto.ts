@@ -22,6 +22,14 @@ export class MatchCandidateInputDto {
   name?: string;
 
   @IsOptional()
+  @IsString()
+  headline?: string;
+
+  @IsOptional()
+  @IsString()
+  profileSummary?: string;
+
+  @IsOptional()
   @IsArray()
   @IsString({ each: true })
   skills?: string[];
@@ -45,6 +53,10 @@ export class MatchCandidateInputDto {
   @IsOptional()
   @IsNumber()
   averageSkillScore?: number | null;
+
+  @IsOptional()
+  @IsNumber()
+  embeddingSimilarity?: number | null;
 }
 
 export class MatchFreelancersDto {

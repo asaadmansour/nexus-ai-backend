@@ -4,8 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
+import { MatchingService } from 'src/matching/matching.service';
 import { CreateBriefMessageDto } from './dtos/create-brief-message.dto';
 import { UpdateBriefDto } from './dtos/update-brief.dto';
 import { BriefMessage } from './entities/brief-message.entity';
@@ -68,7 +70,22 @@ export class BriefService {
     private readonly projectRepo: Repository<Project>,
     private readonly aiService: AiService,
     private readonly dataSource: DataSource,
+    private readonly moduleRef: ModuleRef,
   ) {}
+
+  // Kick off planning matching automatically once a brief is complete.
+  // Lazily resolved (avoids a circular module dependency) and best-effort —
+  // MatchingService.autoStartPlanningRoles is idempotent and never throws.
+  private triggerAutoMatching(projectId: string) {
+    try {
+      const matchingService = this.moduleRef.get(MatchingService, {
+        strict: false,
+      });
+      void matchingService.autoStartPlanningRoles(projectId);
+    } catch {
+      // Matching not available in this context; ignore.
+    }
+  }
 
   async getBrief(projectId: string, userId: string, isAdmin: boolean) {
     const project = await this.findAuthorizedProject(
@@ -180,7 +197,7 @@ export class BriefService {
     brief.aiDecided = this.buildAiDiagnostics(brief.aiDecided, aiResult);
     this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
 
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const savedCustomerMessage = await manager.save(
         BriefMessage,
         customerMessage,
@@ -203,6 +220,8 @@ export class BriefService {
         ai: aiResult,
       };
     });
+    this.triggerAutoMatching(project.id);
+    return result;
   }
 
   async updateBrief(
@@ -250,7 +269,7 @@ export class BriefService {
       manuallyEditedAt: new Date().toISOString(),
     });
 
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
 
       if (
@@ -263,6 +282,8 @@ export class BriefService {
 
       return updatedBrief;
     });
+    this.triggerAutoMatching(project.id);
+    return result;
   }
 
   async reopenAiHelp(projectId: string, userId: string, isAdmin: boolean) {
@@ -358,7 +379,7 @@ export class BriefService {
     });
     brief.aiDecided = this.stripWorkflowStateFromAiDecided(brief.aiDecided);
 
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
 
       if (project.status !== ProjectStatus.BRIEF_COMPLETE) {
@@ -368,6 +389,8 @@ export class BriefService {
 
       return updatedBrief;
     });
+    this.triggerAutoMatching(project.id);
+    return result;
   }
 
   private resolveAgentReply(
