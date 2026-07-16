@@ -268,6 +268,50 @@ export class PlanningSubmissionsService {
   }
 
   // ---------------------------------------------------------------------------
+  // Admin queue (all projects)
+  // ---------------------------------------------------------------------------
+
+  async adminListAll(query: {
+    status?: string;
+    submissionType?: string;
+    page: number;
+    limit: number;
+  }) {
+    const where: Record<string, unknown> = {};
+    if (query.status) where.status = query.status;
+    if (query.submissionType) where.submissionType = query.submissionType;
+
+    const [submissions, total] = await this.submissionRepo.findAndCount({
+      where,
+      order: { createdAt: 'DESC' },
+      skip: (query.page - 1) * query.limit,
+      take: query.limit,
+      relations: ['freelancerProfile', 'freelancerProfile.user'],
+    });
+
+    const titles = await this.getProjectTitles(
+      submissions.map((s) => s.projectId),
+    );
+
+    const data = submissions.map((submission) => ({
+      ...this.toListItem(submission, submission.freelancerProfile),
+      projectTitle: titles.get(submission.projectId) ?? null,
+    }));
+    return { data, total };
+  }
+
+  private async getProjectTitles(projectIds: string[]) {
+    const titles = new Map<string, string>();
+    if (!projectIds.length) return titles;
+    const projects = await this.projectRepo.find({
+      where: projectIds.map((id) => ({ id })),
+      select: { id: true, title: true },
+    });
+    for (const project of projects) titles.set(project.id, project.title);
+    return titles;
+  }
+
+  // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
 

@@ -10,6 +10,7 @@ import {
   MatchingController,
   ProjectMatchingController,
 } from './matching.controller';
+import { AdminMatchingController } from './admin-matching.controller';
 import { MatchingService } from './matching.service';
 
 @Module({
@@ -20,7 +21,11 @@ import { MatchingService } from './matching.service';
     NotificationsModule,
     TypeOrmModule.forFeature([MatchingRun, MatchingCandidate]),
   ],
-  controllers: [ProjectMatchingController, MatchingController],
+  controllers: [
+    ProjectMatchingController,
+    MatchingController,
+    AdminMatchingController,
+  ],
   providers: [MatchingService],
   exports: [TypeOrmModule, MatchingService],
 })

@@ -229,6 +229,37 @@ export class MatchingService {
     return { data, total };
   }
 
+  async adminListRuns(query: { status?: string; page: number; limit: number }) {
+    const where: Record<string, unknown> = {};
+    if (query.status) where.status = query.status;
+
+    const [runs, total] = await this.runRepo.findAndCount({
+      where,
+      order: { createdAt: 'DESC' },
+      skip: (query.page - 1) * query.limit,
+      take: query.limit,
+      relations: ['project'],
+    });
+
+    const counts = await this.getCandidateCounts(runs.map((run) => run.id));
+
+    const data = runs.map((run) => ({
+      id: run.id,
+      projectId: run.projectId,
+      projectTitle: run.project?.title ?? null,
+      targetType: run.targetType,
+      targetRoleKey: run.targetRoleKey,
+      status: run.status,
+      summary: run.summary,
+      candidateCount: counts.get(run.id) ?? 0,
+      reviewedAt: run.reviewedAt,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+      createdAt: run.createdAt,
+    }));
+    return { data, total };
+  }
+
   async getRun(runId: string) {
     const run = await this.runRepo.findOne({ where: { id: runId } });
     if (!run) throw new NotFoundException('Matching run not found');

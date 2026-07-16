@@ -9,6 +9,7 @@ import {
   ProjectPlanningController,
   ProjectTaskController,
 } from './planning.controller';
+import { AdminPlanningController } from './admin-planning.controller';
 import { PlanningSubmissionsService } from './planning-submissions.service';
 import { ProjectPlansService } from './project-plans.service';
 
@@ -24,6 +25,7 @@ import { ProjectPlansService } from './project-plans.service';
     PlanningSubmissionDetailController,
     ProjectPlanDetailController,
     ProjectTaskController,
+    AdminPlanningController,
   ],
   providers: [PlanningSubmissionsService, ProjectPlansService],
   exports: [PlanningSubmissionsService, ProjectPlansService],
