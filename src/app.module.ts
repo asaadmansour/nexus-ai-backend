@@ -16,6 +16,7 @@ import { AdminModule } from './admin/admin.module';
 import { SearchModule } from './search/search.module';
 import { MatchingModule } from './matching/matching.module';
 import { AssignmentsModule } from './assignments/assignments.module';
+import { PlanningModule } from './planning/planning.module';
 import { PaymentsModule } from './payments/payments.module';
 
 @Module({
@@ -37,6 +38,7 @@ import { PaymentsModule } from './payments/payments.module';
     SearchModule,
     MatchingModule,
     AssignmentsModule,
+    PlanningModule,
     PaymentsModule,
   ],
   controllers: [AppController],
