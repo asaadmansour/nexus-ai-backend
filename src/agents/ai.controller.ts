@@ -6,6 +6,7 @@ import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
 import { MatchFreelancersDto } from './dto/MatchFreelancersDto';
+import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { AuthGuard } from 'src/common/guards/auth.guard';
@@ -46,5 +47,10 @@ export class AiController {
   @Post('match-freelancers')
   matchFreelancers(@Body() matchDto: MatchFreelancersDto) {
     return this.aiService.matchFreelancers(matchDto);
+  }
+
+  @Post('generate-project-plan')
+  generateProjectPlan(@Body() planDto: GenerateProjectPlanDto) {
+    return this.aiService.generateProjectPlan(planDto);
   }
 }

@@ -10,6 +10,7 @@ import {
   MatchCandidateInputDto,
   MatchFreelancersDto,
 } from './dto/MatchFreelancersDto';
+import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -75,6 +76,41 @@ export type MatchFreelancersResult = {
   targetRoleKey: string;
   summary: string;
   candidates: MatchFreelancersResultCandidate[];
+  source: 'fastapi' | 'local_mock';
+};
+
+export type ProjectPlanMilestone = {
+  key: string;
+  title: string;
+  description?: string;
+  orderIndex: number;
+  budgetAmount?: number | null;
+  currency?: string | null;
+  acceptanceCriteria?: string[];
+};
+
+export type ProjectPlanTask = {
+  key: string;
+  milestoneKey: string;
+  title: string;
+  description?: string;
+  priority?: string;
+  roleKey?: string;
+  requiredSkills?: string[];
+  estimatedHours?: number | null;
+  orderIndex: number;
+  acceptanceCriteria?: string[];
+  dependsOn?: string[];
+};
+
+export type ProjectPlanResult = {
+  summary: string;
+  assumptions: string[];
+  timeline: Record<string, unknown>;
+  milestones: ProjectPlanMilestone[];
+  tasks: ProjectPlanTask[];
+  teamPlan: Record<string, unknown>;
+  riskRegister: Record<string, unknown>[];
   source: 'fastapi' | 'local_mock';
 };
 
@@ -374,6 +410,137 @@ export class AiService {
     return typeof parsed === 'number' && Number.isFinite(parsed)
       ? parsed
       : null;
+  }
+
+  async generateProjectPlan(
+    dto: GenerateProjectPlanDto,
+  ): Promise<ProjectPlanResult> {
+    if (this.isMockMode()) {
+      return this.getMockProjectPlanResult(dto);
+    }
+
+    const result = await this.postToFastApi<Partial<ProjectPlanResult>>(
+      '/agents/generate-project-plan',
+      {
+        projectId: dto.projectId,
+        project: dto.project,
+        brief: dto.brief,
+        architectureSubmission: dto.architectureSubmission,
+        uiuxSubmission: dto.uiuxSubmission,
+        team: dto.team,
+        notes: dto.notes,
+      },
+      'generate-project-plan',
+    );
+
+    return {
+      summary: result.summary ?? 'Generated implementation plan.',
+      assumptions: result.assumptions ?? [],
+      timeline: result.timeline ?? {},
+      milestones: result.milestones ?? [],
+      tasks: result.tasks ?? [],
+      teamPlan: result.teamPlan ?? {},
+      riskRegister: result.riskRegister ?? [],
+      source: 'fastapi',
+    };
+  }
+
+  private getMockProjectPlanResult(
+    dto: GenerateProjectPlanDto,
+  ): ProjectPlanResult {
+    const currency =
+      typeof dto.project?.currency === 'string' ? dto.project.currency : 'EGP';
+
+    const milestones: ProjectPlanMilestone[] = [
+      {
+        key: 'm1',
+        title: 'Foundation and core setup',
+        description:
+          'Auth, data model, and base API from the architecture plan.',
+        orderIndex: 1,
+        budgetAmount: 3000,
+        currency,
+        acceptanceCriteria: [
+          'Auth and roles work',
+          'Core entities and migrations exist',
+        ],
+      },
+      {
+        key: 'm2',
+        title: 'Primary product flow',
+        description: 'Main user-facing screens and their supporting endpoints.',
+        orderIndex: 2,
+        budgetAmount: 4000,
+        currency,
+        acceptanceCriteria: [
+          'Main flow works end to end',
+          'UI matches the approved UI/UX plan',
+        ],
+      },
+    ];
+
+    const tasks: ProjectPlanTask[] = [
+      {
+        key: 't1',
+        milestoneKey: 'm1',
+        title: 'Set up backend project and data model',
+        description: 'Scaffold the backend, entities, and migrations.',
+        priority: 'high',
+        roleKey: 'backend',
+        requiredSkills: ['NestJS', 'PostgreSQL'],
+        estimatedHours: 12,
+        orderIndex: 1,
+        acceptanceCriteria: [
+          'Migrations run',
+          'Entities match the architecture',
+        ],
+        dependsOn: [],
+      },
+      {
+        key: 't2',
+        milestoneKey: 'm1',
+        title: 'Implement authentication and roles',
+        description: 'Auth guards and role-based access.',
+        priority: 'high',
+        roleKey: 'backend',
+        requiredSkills: ['NestJS', 'JWT'],
+        estimatedHours: 10,
+        orderIndex: 2,
+        acceptanceCriteria: ['Login works', 'Role guards enforced'],
+        dependsOn: ['t1'],
+      },
+      {
+        key: 't3',
+        milestoneKey: 'm2',
+        title: 'Build primary UI screens',
+        description: 'Implement the main screens from the UI/UX plan.',
+        priority: 'medium',
+        roleKey: 'frontend',
+        requiredSkills: ['React', 'TypeScript'],
+        estimatedHours: 16,
+        orderIndex: 1,
+        acceptanceCriteria: ['Screens responsive', 'Matches design system'],
+        dependsOn: ['t2'],
+      },
+    ];
+
+    return {
+      summary:
+        'Build the product in two milestones: foundation, then core flow.',
+      assumptions: ['Scope follows the approved architecture and UI/UX plans.'],
+      timeline: { totalWeeks: 4, milestones: milestones.length },
+      milestones,
+      tasks,
+      teamPlan: { backend: 1, frontend: 1 },
+      riskRegister: [
+        {
+          risk: 'Scope creep beyond the approved plan',
+          severity: 'medium',
+          mitigation: 'Lock scope to the materialized tasks.',
+        },
+      ],
+      source: 'local_mock',
+    };
   }
 
   private getMockExtractCvResult(dto: ExtractCvDto) {
