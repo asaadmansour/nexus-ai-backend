@@ -19,6 +19,8 @@
     "db:revert": "npm run typeorm -- migration:revert",
     "db:show": "npm run typeorm -- migration:show",
     "seed:admin": "ts-node -r tsconfig-paths/register src/database/seeds/seed-admin.ts",
+    "seed:demo": "ts-node -r tsconfig-paths/register src/database/seeds/seed-demo.ts",
+    "backfill:embeddings": "ts-node -r tsconfig-paths/register src/database/seeds/backfill-embeddings.ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
