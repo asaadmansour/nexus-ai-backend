@@ -418,7 +418,7 @@ export class PaymentsService {
     await this.paymentsRepository.update(savedPayment.id, {
       stripePaymentIntentId: paymentIntent.id,
       metadata: {
-        ...((savedPayment.metadata as Record<string, unknown> | null) ?? {}),
+        ...(savedPayment.metadata ?? {}),
         stripePaymentIntentStatus: paymentIntent.status,
       },
     });
@@ -513,7 +513,7 @@ export class PaymentsService {
     await this.paymentsRepository.update(savedPayment.id, {
       stripeCheckoutSessionId: session.id,
       metadata: {
-        ...((savedPayment.metadata as Record<string, unknown> | null) ?? {}),
+        ...(savedPayment.metadata ?? {}),
         checkoutSessionStatus: session.status ?? 'unknown',
       },
     });
@@ -530,6 +530,67 @@ export class PaymentsService {
         purpose: savedPayment.purpose,
         projectId,
       },
+    };
+  }
+
+  async syncEscrowCheckoutSession(
+    projectId: string,
+    userId: string,
+    sessionId: string,
+  ) {
+    const project = await this.getProjectOrThrow(projectId);
+
+    if (project.customerId !== userId) {
+      throw new ForbiddenException('Only the project customer can sync escrow');
+    }
+
+    const session = await this.stripeService.retrieveCheckoutSession(sessionId);
+    const sessionProjectId = session.metadata?.projectId;
+    const sessionCustomerId = session.metadata?.customerId;
+
+    if (sessionProjectId && sessionProjectId !== projectId) {
+      throw new ForbiddenException(
+        'This checkout session does not belong to the project',
+      );
+    }
+
+    if (sessionCustomerId && sessionCustomerId !== userId) {
+      throw new ForbiddenException(
+        'This checkout session does not belong to the customer',
+      );
+    }
+
+    const payment = await this.findPaymentForCheckoutSession(
+      projectId,
+      userId,
+      session,
+    );
+
+    if (!payment) {
+      throw new NotFoundException('Checkout payment was not found');
+    }
+
+    await this.handleCheckoutSessionCompleted(session);
+
+    const [updatedProject, payments, milestones] = await Promise.all([
+      this.getProjectOrThrow(projectId),
+      this.paymentsRepository.find({
+        where: { projectId },
+        order: { createdAt: 'DESC' },
+      }),
+      this.milestonesRepository.find({
+        where: { projectId },
+        order: { orderIndex: 'ASC' },
+      }),
+    ]);
+
+    return {
+      status: 'success',
+      data: this.buildProjectPaymentSummary(
+        updatedProject,
+        payments,
+        milestones,
+      ),
     };
   }
 
@@ -798,9 +859,35 @@ export class PaymentsService {
       stripeCheckoutSessionId: session.id,
       stripePaymentIntentId: payment.stripePaymentIntentId,
       metadata: {
-        ...((payment.metadata as Record<string, unknown> | null) ?? {}),
+        ...(payment.metadata ?? {}),
         checkoutSessionStatus: session.status ?? 'unknown',
         checkoutPaymentStatus: session.payment_status,
+      },
+    });
+  }
+
+  private async findPaymentForCheckoutSession(
+    projectId: string,
+    customerId: string,
+    session: Stripe.Checkout.Session,
+  ) {
+    const projectPaymentId = session.metadata?.projectPaymentId;
+
+    if (projectPaymentId) {
+      return this.paymentsRepository.findOne({
+        where: {
+          id: projectPaymentId,
+          projectId,
+          customerId,
+        },
+      });
+    }
+
+    return this.paymentsRepository.findOne({
+      where: {
+        stripeCheckoutSessionId: session.id,
+        projectId,
+        customerId,
       },
     });
   }
@@ -809,17 +896,20 @@ export class PaymentsService {
     payment: ProjectPayment,
     metadata: Record<string, unknown>,
   ) {
-    await this.paymentsRepository.update(payment.id, {
-      status: 'succeeded',
-      paidAt: payment.paidAt ?? new Date(),
-      failedAt: null,
-      stripeCheckoutSessionId: payment.stripeCheckoutSessionId,
-      stripePaymentIntentId: payment.stripePaymentIntentId,
-      metadata: {
-        ...((payment.metadata as Record<string, unknown> | null) ?? {}),
-        ...metadata,
-      },
-    } as any);
+    await this.paymentsRepository.save(
+      this.paymentsRepository.create({
+        id: payment.id,
+        status: 'succeeded',
+        paidAt: payment.paidAt ?? new Date(),
+        failedAt: null,
+        stripeCheckoutSessionId: payment.stripeCheckoutSessionId,
+        stripePaymentIntentId: payment.stripePaymentIntentId,
+        metadata: {
+          ...(payment.metadata ?? {}),
+          ...metadata,
+        },
+      }),
+    );
 
     const existingHold = await this.ledgerRepository.findOne({
       where: {
@@ -849,7 +939,7 @@ export class PaymentsService {
         .set({
           heldAmount: () => '"held_amount" + :amount',
           quoteStatus: 'accepted',
-        } as any)
+        })
         .where('id = :projectId', { projectId: payment.projectId })
         .setParameter('amount', payment.amount)
         .execute();
@@ -975,7 +1065,10 @@ export class PaymentsService {
         ),
         suggestedPaymentAmount: remainingAmount,
         suggestedPaymentPurpose: 'full_project_deposit',
-        payButtonLabel: 'Fund project escrow',
+        payButtonLabel:
+          remainingAmount !== null && remainingAmount <= 0
+            ? 'Escrow funded'
+            : 'Fund project escrow',
       },
       milestones: milestones.map((milestone) => {
         const milestonePayments = payments.filter(

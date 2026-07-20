@@ -492,6 +492,10 @@ export class ProjectPlansService {
         await manager.delete(ProjectSpec, { projectId: plan.projectId });
       }
 
+      const assignmentsByRole = await this.activePlanningAssignmentsByRole(
+        manager,
+        plan.projectId,
+      );
       const milestoneIdByKey = new Map<string, string>();
       let quotedAmount = 0;
       let quotedCurrency: string | null = null;
@@ -530,12 +534,19 @@ export class ProjectPlansService {
 
       const taskIdByKey = new Map<string, string>();
       for (const task of tasks) {
+        const assignment = this.assignmentForTaskRole(
+          task.roleKey,
+          assignmentsByRole,
+        );
         const saved = await manager.save(
           ProjectTask,
           manager.create(ProjectTask, {
             projectId: plan.projectId,
             projectPlanId: plan.id,
             milestoneId: milestoneIdByKey.get(task.milestoneKey) ?? null,
+            assignmentId: assignment?.id ?? null,
+            assignedFreelancerProfileId:
+              assignment?.freelancerProfileId ?? null,
             title: task.title,
             description: task.description ?? null,
             status: 'todo',
@@ -789,6 +800,49 @@ export class ProjectPlansService {
       },
       order: { createdAt: 'DESC' },
     });
+  }
+
+  private async activePlanningAssignmentsByRole(
+    manager: EntityManager,
+    projectId: string,
+  ) {
+    const assignments = await manager.find(ProjectRoleAssignment, {
+      where: {
+        projectId,
+        phase: 'planning',
+        status: In(['assigned', 'accepted', 'in_progress', 'completed']),
+      },
+    });
+
+    return new Map(
+      assignments.map((assignment) => [
+        this.normalizeRoleKey(assignment.roleKey),
+        assignment,
+      ]),
+    );
+  }
+
+  private assignmentForTaskRole(
+    roleKey: string | null | undefined,
+    assignmentsByRole: Map<string, ProjectRoleAssignment>,
+  ) {
+    if (!roleKey) return null;
+    return assignmentsByRole.get(this.normalizeRoleKey(roleKey)) ?? null;
+  }
+
+  private normalizeRoleKey(roleKey: string) {
+    const normalized = roleKey.trim().toLowerCase().replace(/[-\s]+/g, '_');
+    if (
+      ['architecture', 'system_architect', 'solution_architect'].includes(
+        normalized,
+      )
+    ) {
+      return 'architect';
+    }
+    if (['uiux', 'ui_ux_designer', 'ux_ui', 'design'].includes(normalized)) {
+      return 'ui_ux';
+    }
+    return normalized;
   }
 
   private async markPlanJobRunning(

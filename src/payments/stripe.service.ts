@@ -71,13 +71,21 @@ export class StripeService {
     return this.stripe.checkout.sessions.create(params);
   }
 
+  retrieveCheckoutSession(sessionId: string) {
+    return this.stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent'],
+    });
+  }
+
   constructWebhookEvent(payload: Buffer | string, signature: string) {
     const webhookSecret = this.configService.get<string>(
       'STRIPE_WEBHOOK_SECRET',
     );
 
     if (!webhookSecret) {
-      throw new InternalServerErrorException('STRIPE_WEBHOOK_SECRET is not set');
+      throw new InternalServerErrorException(
+        'STRIPE_WEBHOOK_SECRET is not set',
+      );
     }
 
     return this.stripe.webhooks.constructEvent(

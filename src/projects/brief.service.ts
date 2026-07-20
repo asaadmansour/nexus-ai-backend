@@ -141,18 +141,36 @@ export class BriefService {
       currentBrief,
       recentMessages,
     });
+    const sanitizedAiFields = this.sanitizeExtractedFields(
+      aiResult.extractedFields,
+      dto.content,
+      this.getPendingField(brief),
+    );
     const extractedFields = this.mergeExtractedFields(
       projectDefaultFields,
-      aiResult.extractedFields ?? this.getStoredExtractedFields(brief),
+      this.buildKnownFieldsFromBrief(brief),
+      sanitizedAiFields,
     );
-    const visibleMissingFields = this.removeProjectDerivedMissingFields(
-      aiResult.missingFields,
+    const visibleMissingFields =
+      this.getVisibleMissingFieldsFromFields(extractedFields);
+    const nextQuestionField = this.resolveNextQuestionField(
+      aiResult.nextQuestionField,
+      visibleMissingFields,
     );
+    const completionPercentage =
+      this.getCompletionPercentageFromMissingFields(visibleMissingFields);
+    const isComplete = visibleMissingFields.length === 0;
+    aiResult.missingFields = visibleMissingFields;
+    aiResult.completionPercentage = completionPercentage;
+    aiResult.isComplete = isComplete;
+    aiResult.nextQuestionField = nextQuestionField;
     aiResult.suggestedReply = this.resolveAgentReply(
       aiResult.suggestedReply,
       aiResult.assistantReply,
       visibleMissingFields,
       recentMessages,
+      dto.content,
+      nextQuestionField,
     );
 
     const agentMessage = this.briefMessageRepo.create({
@@ -162,8 +180,6 @@ export class BriefService {
       metadata: aiResult,
     });
 
-    const isComplete =
-      wasComplete || aiResult.isComplete || visibleMissingFields.length === 0;
     const nextRevisionCount = wasComplete
       ? this.getRevisionCount(brief) + 1
       : this.getRevisionCount(brief);
@@ -171,15 +187,15 @@ export class BriefService {
     brief.completedAt = brief.completedAt ?? (isComplete ? new Date() : null);
     this.setBriefWorkflowState(brief, {
       missingFields: visibleMissingFields,
-      completionPercentage: aiResult.completionPercentage,
+      completionPercentage,
       extractedFields: extractedFields ?? null,
       aiRevisionOpen:
         wasComplete && nextRevisionCount < MAX_AI_REVISION_MESSAGES,
       revisionCount: nextRevisionCount,
       revisionLimit: MAX_AI_REVISION_MESSAGES,
       confirmedAt: wasComplete ? null : brief.confirmedAt,
-      pendingField: aiResult.nextQuestionField ?? null,
-      nextQuestionField: aiResult.nextQuestionField ?? null,
+      pendingField: nextQuestionField,
+      nextQuestionField,
       extractionSource: aiResult.extractionSource ?? aiResult.source,
       aiSource: aiResult.source,
     });
@@ -398,8 +414,29 @@ export class BriefService {
     assistantReply: string | null | undefined,
     missingFields: string[],
     recentMessages: Array<{ senderType: string; content: string }>,
+    latestMessage: string,
+    nextQuestionField: string | null,
   ) {
-    if (assistantReply) {
+    const lastAgentMessage = [...recentMessages]
+      .reverse()
+      .find((message) => message.senderType === 'agent');
+
+    if (
+      nextQuestionField &&
+      this.isAdviceRequest(latestMessage) &&
+      missingFields.includes(nextQuestionField)
+    ) {
+      return this.buildAdviceReply(nextQuestionField);
+    }
+
+    if (
+      assistantReply &&
+      !this.looksLikePrematureCompletionReply(assistantReply, missingFields) &&
+      !this.looksLikeAnsweredFieldQuestion(assistantReply, missingFields) &&
+      (!lastAgentMessage ||
+        this.normalizeComparableText(lastAgentMessage.content) !==
+          this.normalizeComparableText(assistantReply))
+    ) {
       return assistantReply;
     }
 
@@ -409,12 +446,9 @@ export class BriefService {
 
     const fallbackPrompt = this.buildNaturalFollowUpPrompt(missingFields[0]);
 
-    const lastAgentMessage = [...recentMessages]
-      .reverse()
-      .find((message) => message.senderType === 'agent');
-
     if (
       suggestedReply &&
+      !this.looksLikeAnsweredFieldQuestion(suggestedReply, missingFields) &&
       (!lastAgentMessage ||
         this.normalizeComparableText(lastAgentMessage.content) !==
           this.normalizeComparableText(suggestedReply))
@@ -427,6 +461,69 @@ export class BriefService {
 
   private normalizeComparableText(value: string) {
     return value.trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  private looksLikePrematureCompletionReply(
+    reply: string,
+    missingFields: string[],
+  ) {
+    if (missingFields.length === 0) return false;
+
+    const normalized = this.normalizeComparableText(reply);
+    return [
+      'brief is complete',
+      'requirements are complete',
+      'all requirements captured',
+      'enough detail to continue',
+      'ready to continue',
+      'ready for the next step',
+      'we have everything',
+      'have everything',
+    ].some((phrase) => normalized.includes(phrase));
+  }
+
+  private looksLikeAnsweredFieldQuestion(
+    reply: string,
+    missingFields: string[],
+  ) {
+    const normalized = this.normalizeComparableText(reply);
+    const missing = new Set(missingFields);
+    const markersByField: Record<string, string[]> = {
+      businessDomain: ['what kind of business', 'what domain'],
+      mainGoal: ['main outcome', 'main thing', 'want this project to achieve'],
+      targetUsers: ['who will use', 'who do you expect will use'],
+      coreFeatures: ['must-have features', 'core features'],
+      platforms: [
+        'where should this run',
+        'website, mobile app',
+        'web and mobile',
+      ],
+      deliverables: ['final deliverables', 'what final things', 'handed over'],
+      constraintsPreferences: [
+        'preferences or constraints',
+        'constraints we should',
+      ],
+      clientBackground: ['your background', 'what is your background'],
+      suggestedTeamSize: ['team size'],
+      experienceLevel: ['junior, mid, senior', 'experience level'],
+      experienceMinYears: ['minimum years', 'years-of-experience'],
+    };
+
+    return Object.entries(markersByField).some(([field, markers]) => {
+      if (missing.has(field)) return false;
+      return markers.some((marker) => normalized.includes(marker));
+    });
+  }
+
+  private resolveNextQuestionField(
+    modelField: string | null | undefined,
+    missingFields: string[],
+  ) {
+    if (modelField && missingFields.includes(modelField)) {
+      return modelField;
+    }
+
+    return missingFields[0] ?? null;
   }
 
   private humanizeFieldName(value: string) {
@@ -531,20 +628,35 @@ export class BriefService {
         currentBrief,
         recentMessages: [],
       });
+      const sanitizedAiFields = this.sanitizeExtractedFields(
+        aiResult.extractedFields,
+        INITIAL_GREETING_MESSAGE,
+        this.getPendingField(brief),
+      );
       const extractedFields = this.mergeExtractedFields(
         projectDefaultFields,
-        aiResult.extractedFields,
+        this.buildKnownFieldsFromBrief(brief),
+        sanitizedAiFields,
       );
-      const missingFields = this.removeProjectDerivedMissingFields(
-        aiResult.missingFields,
+      const missingFields =
+        this.getVisibleMissingFieldsFromFields(extractedFields);
+      const nextQuestionField = this.resolveNextQuestionField(
+        aiResult.nextQuestionField,
+        missingFields,
       );
+      const completionPercentage =
+        this.getCompletionPercentageFromMissingFields(missingFields);
+      aiResult.missingFields = missingFields;
+      aiResult.completionPercentage = completionPercentage;
+      aiResult.isComplete = missingFields.length === 0;
+      aiResult.nextQuestionField = nextQuestionField;
 
       this.setBriefWorkflowState(brief, {
         missingFields,
-        completionPercentage: aiResult.completionPercentage,
+        completionPercentage,
         extractedFields: extractedFields ?? null,
-        pendingField: aiResult.nextQuestionField ?? null,
-        nextQuestionField: aiResult.nextQuestionField ?? null,
+        pendingField: nextQuestionField,
+        nextQuestionField,
         extractionSource: aiResult.extractionSource ?? aiResult.source,
         aiSource: aiResult.source,
       });
@@ -557,6 +669,8 @@ export class BriefService {
         aiResult.assistantReply,
         missingFields,
         [],
+        INITIAL_GREETING_MESSAGE,
+        nextQuestionField,
       );
     } catch {
       return this.buildInitialFallbackMessage(project);
@@ -730,6 +844,96 @@ export class BriefService {
     return merged;
   }
 
+  private sanitizeExtractedFields(
+    fields: ExtractedBriefFields | undefined,
+    latestMessage: string,
+    pendingField: string | null,
+  ): ExtractedBriefFields {
+    const sanitized: ExtractedBriefFields = {};
+    const adviceRequest = this.isAdviceRequest(latestMessage);
+
+    for (const [field, value] of Object.entries(fields ?? {})) {
+      if (adviceRequest && this.isUncertainPlaceholder(value)) continue;
+      sanitized[field] = value;
+    }
+
+    if (
+      !adviceRequest &&
+      pendingField &&
+      !this.hasFieldValue(sanitized[pendingField])
+    ) {
+      const deterministicValue = this.extractPendingFieldAnswer(
+        pendingField,
+        latestMessage,
+      );
+      if (deterministicValue !== null) {
+        sanitized[pendingField] = deterministicValue;
+      }
+    }
+
+    return sanitized;
+  }
+
+  private extractPendingFieldAnswer(
+    pendingField: string,
+    latestMessage: string,
+  ): string | string[] | number | null {
+    const normalized = this.normalizeComparableText(latestMessage);
+
+    if (pendingField === 'platforms') {
+      const platforms = new Set<string>();
+
+      if (
+        /\bboth\b/.test(normalized) ||
+        /\bweb(site)?\b/.test(normalized) ||
+        /\bmobile\b/.test(normalized) ||
+        /\bapp\b/.test(normalized)
+      ) {
+        if (/\bboth\b/.test(normalized) || /\bweb(site)?\b/.test(normalized)) {
+          platforms.add('website');
+        }
+        if (
+          /\bboth\b/.test(normalized) ||
+          /\bmobile\b|\bapp\b/.test(normalized)
+        ) {
+          platforms.add('mobile app');
+        }
+      }
+
+      return platforms.size > 0 ? Array.from(platforms) : null;
+    }
+
+    if (
+      [
+        'businessDomain',
+        'mainGoal',
+        'targetUsers',
+        'coreFeatures',
+        'deliverables',
+        'constraintsPreferences',
+        'clientBackground',
+      ].includes(pendingField)
+    ) {
+      return this.toTextValue(latestMessage);
+    }
+
+    if (pendingField === 'suggestedTeamSize') {
+      return this.toPositiveInteger(latestMessage);
+    }
+
+    if (pendingField === 'experienceLevel') {
+      return this.normalizeExperienceLevel(
+        this.toSingleLineText(latestMessage, 40),
+      );
+    }
+
+    if (pendingField === 'experienceMinYears') {
+      return this.toPositiveInteger(latestMessage);
+    }
+
+    return null;
+  }
+
   private hasFieldValue(value: unknown): boolean {
     if (value === null || value === undefined) return false;
     if (typeof value === 'string') return value.trim().length > 0;
@@ -738,6 +942,56 @@ export class BriefService {
     }
     if (typeof value === 'object') return Object.keys(value).length > 0;
     return true;
+  }
+
+  private isAdviceRequest(value: string) {
+    const normalized = this.normalizeComparableText(value);
+    const adviceMarkers = [
+      'what do you suggest',
+      'what do u suggest',
+      'what should',
+      'what would you',
+      'what would u',
+      'recommend',
+      'suggest',
+      'help me choose',
+      'what do you mean',
+      'explain',
+    ];
+    const uncertaintyMarkers = [
+      'idk',
+      'i do not know',
+      "i don't know",
+      'i dont know',
+      'not sure',
+      'notsure',
+    ];
+
+    return (
+      adviceMarkers.some((marker) => normalized.includes(marker)) &&
+      (normalized.includes('?') ||
+        uncertaintyMarkers.some((marker) => normalized.includes(marker)))
+    );
+  }
+
+  private isUncertainPlaceholder(value: unknown): boolean {
+    if (typeof value !== 'string') return false;
+    const normalized = this.normalizeComparableText(
+      value.replace(/[_-]+/g, ' '),
+    );
+
+    return [
+      'idk',
+      'i do not know',
+      "i don't know",
+      'i dont know',
+      'not sure',
+      'not sure yet',
+      'notsure',
+      'no preference',
+      'no preferences',
+      'not decided',
+    ].includes(normalized);
   }
 
   private buildCurrentBriefContext(
@@ -1380,6 +1634,26 @@ export class BriefService {
     return (
       questions[nextField] ??
       'That helps. Can you share a little more detail so I can shape the brief properly?'
+    );
+  }
+
+  private buildAdviceReply(nextField: string) {
+    const replies: Record<string, string> = {
+      deliverables:
+        'No problem. For this project, I’d usually suggest a working website or app, an admin dashboard if you need to manage orders or stock, payment setup, deployment, and a short handover guide so you can run it without technical help. Does that feel right, or would you remove anything?',
+      suggestedTeamSize:
+        'Totally fine. For a first version, I’d usually keep the team lean: one UI/UX designer, one architect or senior backend/full-stack person, and one or two implementation freelancers depending on scope. Should I note a small team, or do you want a bigger team for faster delivery?',
+      experienceLevel:
+        'A rough preference is enough. For payments, dashboards, and customer-facing flows, I’d lean mid-to-senior so the project is reliable without overpaying for every task. Does mid-to-senior sound right?',
+      experienceMinYears:
+        'You do not need to know this exactly. For a project like this, I’d usually set the minimum around 3 years for core implementation, with stronger senior review for architecture and payments. Should I use 3 years, or keep it open and match by skill scores?',
+      platforms:
+        'If customers need to order easily, I’d usually start with a responsive website first, then add a mobile app if repeat ordering is important. If you already want both, I can capture website and mobile app. Which direction feels right?',
+    };
+
+    return (
+      replies[nextField] ??
+      'No problem. I can help you choose. Tell me what matters most here: speed, budget, quality, or ease of use, and I’ll suggest the best option for this project.'
     );
   }
 }

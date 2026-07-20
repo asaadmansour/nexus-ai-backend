@@ -5,6 +5,7 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
+import { MatchingService } from 'src/matching/matching.service';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
@@ -51,6 +52,7 @@ describe('PaymentsService', () => {
         },
         { provide: StripeService, useValue: {} },
         { provide: ConfigService, useValue: { get: jest.fn() } },
+        { provide: MatchingService, useValue: {} },
       ],
     }).compile();
 

@@ -67,7 +67,11 @@ export class PaymentsController {
     @CurrentUser() user: JwtPayload,
     @Body() payload: CreateEscrowIntentDto,
   ) {
-    return this.paymentsService.createEscrowIntent(projectId, user.sub, payload);
+    return this.paymentsService.createEscrowIntent(
+      projectId,
+      user.sub,
+      payload,
+    );
   }
 
   @Post('projects/:projectId/payments/checkout-session')
@@ -81,6 +85,20 @@ export class PaymentsController {
       projectId,
       user.sub,
       payload,
+    );
+  }
+
+  @Post('projects/:projectId/payments/checkout-session/:sessionId/sync')
+  @Roles(UserRole.CUSTOMER)
+  syncEscrowCheckoutSession(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Param('sessionId') sessionId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.paymentsService.syncEscrowCheckoutSession(
+      projectId,
+      user.sub,
+      sessionId,
     );
   }
 

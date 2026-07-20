@@ -29,9 +29,6 @@ export class StripeWebhookController {
       throw new BadRequestException('Missing Stripe raw body');
     }
 
-    return this.paymentsService.handleStripeWebhook(
-      request.rawBody,
-      signature,
-    );
+    return this.paymentsService.handleStripeWebhook(request.rawBody, signature);
   }
 }
