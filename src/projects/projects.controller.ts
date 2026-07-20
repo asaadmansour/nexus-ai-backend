@@ -36,46 +36,40 @@ export class ProjectsController {
   }
 
   @Get()
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   async getProjects(@CurrentUser() user: JwtPayload) {
-    const data =
-      user.role === UserRole.ADMIN
-        ? await this.projectsService.findAll()
-        : await this.projectsService.findAllForCustomer(user.sub);
+    const data = await this.projectsService.findAllForCustomer(user.sub);
     return { status: 'success', data };
   }
 
   @Get(':id')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   async getProject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    const isAdmin = user.role === UserRole.ADMIN;
-    const data = await this.projectsService.findOne(id, user.sub, isAdmin);
+    const data = await this.projectsService.findOne(id, user.sub, false);
     return { status: 'success', data };
   }
 
   @Patch(':id')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   async updateProject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: JwtPayload,
     @Body() dto: UpdateProjectDto,
   ) {
-    const isAdmin = user.role === UserRole.ADMIN;
-    const data = await this.projectsService.update(id, user.sub, isAdmin, dto);
+    const data = await this.projectsService.update(id, user.sub, false, dto);
     return { status: 'success', data };
   }
 
   @Delete(':id')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   async deleteProject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    const isAdmin = user.role === UserRole.ADMIN;
-    await this.projectsService.remove(id, user.sub, isAdmin);
+    await this.projectsService.remove(id, user.sub, false);
     return { status: 'success' };
   }
 }

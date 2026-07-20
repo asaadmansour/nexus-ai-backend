@@ -4,16 +4,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
-import { MatchingService } from 'src/matching/matching.service';
 import { CreateBriefMessageDto } from './dtos/create-brief-message.dto';
 import { UpdateBriefDto } from './dtos/update-brief.dto';
 import { BriefMessage } from './entities/brief-message.entity';
 import { Brief } from './entities/brief.entity';
 import { Project } from './entities/project.entity';
-import { AiService } from 'src/agents/ai.service';
+import { AiService, type ProjectQuoteResult } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
@@ -56,6 +54,12 @@ const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.DISPUTED,
   ProjectStatus.CANCELLED,
 ]);
+const BRIEF_CONFIRM_ALLOWED_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.PLANNING_MATCHING,
+  ProjectStatus.PLANNING_ASSIGNED,
+  ProjectStatus.PLANNING_IN_PROGRESS,
+  ProjectStatus.PLANNING_REVIEW,
+]);
 
 type ExtractedBriefFields = Record<string, unknown>;
 
@@ -70,22 +74,7 @@ export class BriefService {
     private readonly projectRepo: Repository<Project>,
     private readonly aiService: AiService,
     private readonly dataSource: DataSource,
-    private readonly moduleRef: ModuleRef,
   ) {}
-
-  // Kick off planning matching automatically once a brief is complete.
-  // Lazily resolved (avoids a circular module dependency) and best-effort —
-  // MatchingService.autoStartPlanningRoles is idempotent and never throws.
-  private triggerAutoMatching(projectId: string) {
-    try {
-      const matchingService = this.moduleRef.get(MatchingService, {
-        strict: false,
-      });
-      void matchingService.autoStartPlanningRoles(projectId);
-    } catch {
-      // Matching not available in this context; ignore.
-    }
-  }
 
   async getBrief(projectId: string, userId: string, isAdmin: boolean) {
     const project = await this.findAuthorizedProject(
@@ -220,7 +209,6 @@ export class BriefService {
         ai: aiResult,
       };
     });
-    this.triggerAutoMatching(project.id);
     return result;
   }
 
@@ -282,7 +270,6 @@ export class BriefService {
 
       return updatedBrief;
     });
-    this.triggerAutoMatching(project.id);
     return result;
   }
 
@@ -348,7 +335,7 @@ export class BriefService {
       userId,
       isAdmin,
     );
-    this.assertBriefCanChange(project);
+    this.assertBriefCanConfirm(project);
 
     const brief = await this.getOrCreateBrief(projectId);
     const missingFields = this.getVisibleMissingFieldsFromFields(
@@ -363,6 +350,11 @@ export class BriefService {
         'Please complete the required brief details before confirming.',
       );
     }
+
+    const projectQuote = await this.aiService.estimateProjectQuote({
+      project: this.buildProjectQuoteContext(project),
+      brief: this.buildBriefQuoteContext(brief),
+    });
 
     brief.isComplete = true;
     brief.completedAt = brief.completedAt ?? new Date();
@@ -382,14 +374,22 @@ export class BriefService {
     const result = await this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
 
-      if (project.status !== ProjectStatus.BRIEF_COMPLETE) {
-        project.status = ProjectStatus.BRIEF_COMPLETE;
-        await manager.save(Project, project);
+      if (project.quoteStatus !== 'accepted') {
+        project.quotedAmount = projectQuote.amount.toFixed(2);
+        project.quotedCurrency = projectQuote.currency;
+        project.quoteStatus = projectQuote.quoteStatus;
+        project.quoteGeneratedAt = new Date();
+        project.quoteNotes = this.buildProjectQuoteNotes(projectQuote);
       }
+
+      if (this.shouldMarkBriefComplete(project)) {
+        project.status = ProjectStatus.BRIEF_COMPLETE;
+      }
+
+      await manager.save(Project, project);
 
       return updatedBrief;
     });
-    this.triggerAutoMatching(project.id);
     return result;
   }
 
@@ -604,6 +604,19 @@ export class BriefService {
     }
   }
 
+  private assertBriefCanConfirm(project: Project) {
+    if (BRIEF_CONFIRM_ALLOWED_LOCKED_PROJECT_STATUSES.has(project.status)) {
+      return;
+    }
+    this.assertBriefCanChange(project);
+  }
+
+  private shouldMarkBriefComplete(project: Project) {
+    return [ProjectStatus.DRAFT, ProjectStatus.IN_PROGRESS].includes(
+      project.status,
+    );
+  }
+
   private extractProjectDefaultFields(project: Project): ExtractedBriefFields {
     const fields: ExtractedBriefFields = {};
     const budget = this.formatProjectBudget(project);
@@ -638,6 +651,65 @@ export class BriefService {
       deadline: project.deadline?.toISOString().slice(0, 10) ?? null,
       isDeadlineFlexible: project.isDeadlineFlexible,
     };
+  }
+
+  private buildProjectQuoteContext(project: Project) {
+    return {
+      id: project.id,
+      title: project.title,
+      name: project.title,
+      description: project.description,
+      status: project.status,
+      budgetMin: this.toDecimalNumber(project.budgetMin),
+      budgetMax: this.toDecimalNumber(project.budgetMax),
+      currency: project.currency,
+      deadline: project.deadline?.toISOString() ?? null,
+      isDeadlineFlexible: project.isDeadlineFlexible,
+    };
+  }
+
+  private buildBriefQuoteContext(brief: Brief) {
+    const knownFields = this.buildKnownFieldsFromBrief(brief) ?? {};
+
+    return this.cleanJsonSection({
+      ...knownFields,
+      summary: brief.summary,
+      briefText: brief.briefText,
+      businessDomain: brief.domain ?? knownFields.businessDomain,
+      projectType: brief.projectType ?? knownFields.projectType,
+      mainGoal: brief.mainGoal ?? knownFields.mainGoal,
+      targetUsers: brief.targetUsers ?? knownFields.targetUsers,
+      coreFeatures: brief.coreFeatures ?? knownFields.coreFeatures,
+      platforms: brief.platforms ?? knownFields.platforms,
+      deliverables: brief.deliverablesText ?? knownFields.deliverables,
+      constraintsPreferences:
+        brief.constraintsPreferences ?? knownFields.constraintsPreferences,
+      clientBackground: brief.clientBackground ?? knownFields.clientBackground,
+      suggestedTeamSize:
+        brief.suggestedTeamSize ?? knownFields.suggestedTeamSize,
+      experienceLevel: brief.experienceLevel ?? knownFields.experienceLevel,
+      experienceMinYears:
+        brief.experienceMinYears ?? knownFields.experienceMinYears,
+      requiredSkills: brief.requiredSkills,
+      preferredSkills: brief.preferredSkills,
+      acceptanceCriteria: brief.acceptanceCriteria,
+    });
+  }
+
+  private buildProjectQuoteNotes(quote: ProjectQuoteResult) {
+    const sections = [
+      quote.rationale,
+      quote.assumptions.length
+        ? `Assumptions: ${quote.assumptions.join(' ')}`
+        : null,
+      quote.pricingSignals.length
+        ? `Pricing signals: ${quote.pricingSignals.join(' ')}`
+        : null,
+      quote.sources.length ? `Sources: ${quote.sources.join(', ')}` : null,
+      `Confidence: ${Math.round(quote.confidence * 100)}%. Complexity: ${quote.complexity}.`,
+    ];
+
+    return this.truncate(sections.filter(Boolean).join('\n\n'), 4000);
   }
 
   private mergeExtractedFields(
@@ -988,6 +1060,13 @@ export class BriefService {
     if (!text) return null;
 
     return this.truncate(text.replace(/\s+/g, ' ').trim(), maxLength);
+  }
+
+  private toDecimalNumber(value: unknown): number | null {
+    const parsed = typeof value === 'string' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed)
+      ? parsed
+      : null;
   }
 
   private toPositiveInteger(value: unknown): number | null {

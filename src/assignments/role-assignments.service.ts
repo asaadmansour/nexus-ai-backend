@@ -3,10 +3,12 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import { AiService } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
@@ -41,6 +43,8 @@ const ASSIGNMENT_TRANSITIONS: Record<string, string[]> = {
 
 @Injectable()
 export class RoleAssignmentsService {
+  private readonly logger = new Logger(RoleAssignmentsService.name);
+
   constructor(
     @InjectRepository(ProjectRoleAssignment)
     private readonly assignmentRepo: Repository<ProjectRoleAssignment>,
@@ -52,6 +56,7 @@ export class RoleAssignmentsService {
     private readonly candidateRepo: Repository<MatchingCandidate>,
     @InjectRepository(Brief)
     private readonly briefRepo: Repository<Brief>,
+    private readonly aiService: AiService,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
   ) {}
@@ -77,6 +82,7 @@ export class RoleAssignmentsService {
     }
 
     const project = await this.getProject(projectId);
+    const brief = await this.briefRepo.findOne({ where: { projectId } });
 
     let candidate: MatchingCandidate | null = null;
     let freelancerProfileId = dto.freelancerProfileId ?? null;
@@ -92,6 +98,7 @@ export class RoleAssignmentsService {
 
     const profile = await this.profileRepo.findOne({
       where: { id: freelancerProfileId! },
+      relations: ['user', 'skillScores'],
     });
     if (!profile) throw new NotFoundException('Freelancer profile not found');
     if (profile.verificationStatus !== 'approved') {
@@ -124,6 +131,9 @@ export class RoleAssignmentsService {
             : null,
           decisionReason: dto.decisionReason ?? null,
           notes: dto.notes ?? null,
+          roleBrief: this.buildLocalRoleBrief(dto.roleKey, project, brief),
+          roleBriefStatus: 'fallback',
+          roleBriefGeneratedAt: new Date(),
           assignedAt: new Date(),
         }),
       );
@@ -142,6 +152,8 @@ export class RoleAssignmentsService {
       body: `You were assigned as ${dto.roleKey} for a project.`,
     });
 
+    void this.generateAndPersistAiRoleBrief(assignment.id);
+
     return this.toAssignmentDto(assignment, profile);
   }
 
@@ -156,7 +168,11 @@ export class RoleAssignmentsService {
     const assignments = await this.assignmentRepo.find({
       where: { projectId },
       order: { createdAt: 'ASC' },
-      relations: ['freelancerProfile', 'freelancerProfile.user'],
+      relations: [
+        'freelancerProfile',
+        'freelancerProfile.user',
+        'freelancerProfile.skillScores',
+      ],
     });
 
     const requesterProfileId =
@@ -259,7 +275,11 @@ export class RoleAssignmentsService {
     const assignments = await this.assignmentRepo.find({
       where: { projectId },
       order: { createdAt: 'ASC' },
-      relations: ['freelancerProfile', 'freelancerProfile.user'],
+      relations: [
+        'freelancerProfile',
+        'freelancerProfile.user',
+        'freelancerProfile.skillScores',
+      ],
     });
 
     const planningTeam = assignments
@@ -327,6 +347,8 @@ export class RoleAssignmentsService {
         currency: project?.currency ?? null,
         deadline: project?.deadline ?? null,
         briefSummary: briefs.get(assignment.projectId) ?? null,
+        roleBriefSummary: this.assignmentRoleBriefSummary(assignment),
+        roleBriefStatus: assignment.roleBriefStatus,
         nextAction: this.assignmentNextAction(
           assignment.status,
           assignment.roleKey,
@@ -335,6 +357,72 @@ export class RoleAssignmentsService {
     });
 
     return { data, total };
+  }
+
+  async freelancerProjectAssignment(userId: string, projectId: string) {
+    const profile = await this.getProfileByUser(userId);
+    if (!profile) {
+      throw new NotFoundException('Freelancer profile not found');
+    }
+
+    const assignments = await this.assignmentRepo.find({
+      where: {
+        projectId,
+        freelancerProfileId: profile.id,
+        phase: 'planning',
+        status: In(['assigned', 'accepted', 'in_progress', 'completed']),
+      },
+      order: { createdAt: 'DESC' },
+      relations: ['project', 'freelancerProfile', 'freelancerProfile.user'],
+    });
+    if (!assignments.length) {
+      throw new NotFoundException('Assigned project not found');
+    }
+
+    const brief = await this.briefRepo.findOne({ where: { projectId } });
+    for (const assignment of assignments) {
+      if (!assignment.roleBrief) {
+        assignment.roleBrief = this.buildLocalRoleBrief(
+          assignment.roleKey,
+          assignment.project,
+          brief,
+        );
+        assignment.roleBriefStatus = 'fallback';
+        assignment.roleBriefGeneratedAt = new Date();
+        await this.assignmentRepo.save(assignment);
+        void this.generateAndPersistAiRoleBrief(assignment.id);
+      }
+    }
+
+    const project = assignments[0].project;
+
+    return {
+      project: {
+        id: project.id,
+        title: project.title,
+        description: project.description,
+        status: project.status,
+        planningStatus: project.planningStatus,
+        budgetMin: Number(project.budgetMin),
+        budgetMax: Number(project.budgetMax),
+        currency: project.currency,
+        deadline: project.deadline,
+        isDeadlineFlexible: project.isDeadlineFlexible,
+      },
+      brief: {
+        summary: brief?.summary ?? null,
+        briefText: brief?.briefText ?? null,
+        businessDomain: brief?.domain ?? null,
+        mainGoal: brief?.mainGoal ?? null,
+        targetUsers: brief?.targetUsers ?? null,
+        coreFeatures: brief?.coreFeatures ?? null,
+        platforms: brief?.platforms ?? null,
+        constraintsPreferences: brief?.constraintsPreferences ?? null,
+      },
+      assignments: assignments.map((assignment) =>
+        this.toAssignmentDto(assignment, assignment.freelancerProfile),
+      ),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -518,6 +606,217 @@ export class RoleAssignmentsService {
     return summaries;
   }
 
+  private async generateAndPersistAiRoleBrief(assignmentId: string) {
+    try {
+      const assignment = await this.assignmentRepo.findOne({
+        where: { id: assignmentId },
+        relations: ['project', 'freelancerProfile', 'freelancerProfile.user'],
+      });
+      if (!assignment || !assignment.project) return;
+
+      const brief = await this.briefRepo.findOne({
+        where: { projectId: assignment.projectId },
+      });
+      const result = await this.aiService.generateRoleBrief({
+        assignmentId: assignment.id,
+        roleKey: assignment.roleKey,
+        project: this.projectRoleBriefInput(assignment.project),
+        brief: this.briefRoleBriefInput(brief),
+        standardExpectations: this.standardRoleExpectations(assignment.roleKey),
+        freelancer: assignment.freelancerProfile
+          ? {
+              id: assignment.freelancerProfile.id,
+              headline: assignment.freelancerProfile.headline,
+              skills: assignment.freelancerProfile.skills ?? [],
+              yearsExperience: assignment.freelancerProfile.yearsExperience,
+            }
+          : null,
+      });
+
+      await this.assignmentRepo.update(assignment.id, {
+        roleBrief: result as unknown as Record<string, unknown>,
+        roleBriefStatus: result.source === 'fastapi' ? 'generated' : 'fallback',
+        roleBriefGeneratedAt: new Date(),
+        roleBriefError: null,
+      } as any);
+    } catch (error) {
+      await this.assignmentRepo.update(assignmentId, {
+        roleBriefStatus: 'fallback',
+        roleBriefError:
+          error instanceof Error ? error.message : 'Role brief generation failed',
+      });
+      this.logger.warn(
+        `Role brief AI enrichment failed for assignment ${assignmentId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  private buildLocalRoleBrief(
+    roleKey: string,
+    project: Project,
+    brief: Brief | null,
+  ) {
+    const roleLabel = this.roleLabel(roleKey);
+    const projectName = project.title || 'this project';
+    const domain = brief?.domain ? ` in ${brief.domain}` : '';
+    const commonInputs = [
+      'Confirmed requirements brief',
+      'Project goal, users, core features, target platforms, budget, and deadline',
+      'Customer constraints, preferences, and any open assumptions',
+    ];
+
+    return {
+      title: `${roleLabel} planning brief for ${projectName}`,
+      summary: [
+        `${roleLabel} assignment for ${projectName}${domain}.`,
+        project.description ? `Project description: ${project.description}.` : null,
+        brief?.summary ? `Brief summary: ${brief.summary}.` : null,
+        brief?.mainGoal ? `Main goal: ${brief.mainGoal}.` : null,
+      ]
+        .filter(Boolean)
+        .join(' '),
+      objectives:
+        roleKey === 'ui_ux'
+          ? [
+              'Turn the requirements into clear user journeys and screens.',
+              'Define the first-version UX, responsive behavior, and visual direction.',
+              'Prepare a handoff that lets frontend developers build without guessing layout or interaction details.',
+            ]
+          : [
+              'Turn the requirements into a practical technical architecture.',
+              'Define system boundaries, data model, APIs, integrations, and major trade-offs.',
+              'Prepare a handoff that lets the Scrum Master split implementation into dependency-aware work.',
+            ],
+      responsibilities: this.standardRoleExpectations(roleKey),
+      requiredInputs: commonInputs,
+      expectedDeliverables:
+        roleKey === 'ui_ux'
+          ? [
+              'User flow map for the main journeys',
+              'Screen list and wireframe-level layout notes',
+              'Design system direction: colors, typography, spacing, components, forms, and states',
+              'Responsive behavior for desktop and mobile',
+              'UX risks, accessibility notes, and open questions',
+            ]
+          : [
+              'Architecture overview and recommended stack',
+              'Module/service boundaries',
+              'Database entities and relationships',
+              'API contract outline',
+              'Security, performance, integrations, deployment, and risk notes',
+            ],
+      acceptanceCriteria: [
+        'The deliverable is specific to this project, not a generic template.',
+        'Confirmed decisions and assumptions are clearly separated.',
+        'The Scrum Master can create milestones/tasks from it without inventing major missing pieces.',
+      ],
+      handoffChecklist: [
+        'Confirmed decisions',
+        'Open questions',
+        'Risks and mitigations',
+        'Dependencies that affect implementation order',
+      ],
+      collaborationNotes:
+        'Ask focused questions if something is ambiguous. Keep the language clear enough for the customer and concrete enough for engineering handoff.',
+      suggestedQuestions: [
+        'What decision needs customer/admin confirmation before this deliverable can be final?',
+      ],
+      constraints: this.textToList(brief?.constraintsPreferences),
+      source: 'local_fallback',
+    };
+  }
+
+  private projectRoleBriefInput(project: Project) {
+    return {
+      id: project.id,
+      title: project.title,
+      description: project.description,
+      status: project.status,
+      planningStatus: project.planningStatus,
+      budgetMin: Number(project.budgetMin),
+      budgetMax: Number(project.budgetMax),
+      currency: project.currency,
+      deadline: project.deadline,
+      isDeadlineFlexible: project.isDeadlineFlexible,
+    };
+  }
+
+  private briefRoleBriefInput(brief: Brief | null) {
+    if (!brief) return null;
+    return {
+      id: brief.id,
+      summary: brief.summary,
+      briefText: brief.briefText,
+      projectType: brief.projectType,
+      businessDomain: brief.domain,
+      mainGoal: brief.mainGoal,
+      targetUsers: brief.targetUsers,
+      coreFeatures: this.textToList(brief.coreFeatures),
+      platforms: this.textToList(brief.platforms),
+      deliverables: this.textToList(brief.deliverablesText),
+      constraintsPreferences: this.textToList(brief.constraintsPreferences),
+      clientBackground: brief.clientBackground,
+      requiredSkills: brief.requiredSkills,
+      preferredSkills: brief.preferredSkills,
+      technical: brief.technical,
+      nonFunctional: brief.nonFunctional,
+      acceptanceCriteria: brief.acceptanceCriteria,
+    };
+  }
+
+  private standardRoleExpectations(roleKey: string) {
+    if (roleKey === 'ui_ux') {
+      return [
+        'Map the primary user journeys and admin/staff journeys.',
+        'Define screens, states, edge cases, empty states, and validation behavior.',
+        'Choose a clean design direction aligned with the customer preferences and project domain.',
+        'Document reusable components and responsive rules.',
+        'Call out UX risks and unresolved product decisions.',
+      ];
+    }
+
+    return [
+      'Define the system architecture and major technical decisions.',
+      'Describe modules, data ownership, API boundaries, and third-party integrations.',
+      'Identify security, performance, reliability, deployment, and observability concerns.',
+      'List implementation dependencies and risky unknowns.',
+      'Provide a handoff that the Scrum Master can convert into milestones and tasks.',
+    ];
+  }
+
+  private assignmentRoleBriefSummary(assignment: ProjectRoleAssignment) {
+    const roleBrief = assignment.roleBrief as
+      | { summary?: unknown; title?: unknown }
+      | null;
+    return (
+      this.optionalString(roleBrief?.summary) ??
+      this.optionalString(roleBrief?.title) ??
+      null
+    );
+  }
+
+  private roleLabel(roleKey: string) {
+    if (roleKey === 'ui_ux' || roleKey === 'uiux') return 'UI/UX';
+    if (roleKey === 'architect' || roleKey === 'architecture') {
+      return 'Architecture';
+    }
+    return roleKey.replace(/_/g, ' ');
+  }
+
+  private textToList(value?: string | null) {
+    if (!value) return [];
+    return value
+      .split(/[\n,;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  private optionalString(value: unknown) {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
   private async notify(
     userId: string,
     projectId: string,
@@ -546,10 +845,14 @@ export class RoleAssignmentsService {
       freelancer: this.buildPublicFreelancer(profile ?? null),
       assignedAt: assignment.assignedAt,
       acceptedAt: assignment.acceptedAt,
+      roleBriefStatus: assignment.roleBriefStatus,
     };
     if (options?.publicOnly) return base;
     return {
       ...base,
+      roleBrief: assignment.roleBrief,
+      roleBriefGeneratedAt: assignment.roleBriefGeneratedAt,
+      roleBriefError: assignment.roleBriefError,
       hourlyRateSnapshot: assignment.hourlyRateSnapshot,
       availabilityHoursSnapshot: assignment.availabilityHoursSnapshot,
       scoreSnapshot: assignment.scoreSnapshot,
@@ -562,11 +865,24 @@ export class RoleAssignmentsService {
 
   private buildPublicFreelancer(profile?: FreelancerProfile | null) {
     if (!profile) return null;
+    const scoredSkills = (profile.skillScores ?? [])
+      .map((entry) => ({
+        skill: entry.skill,
+        score: Number(entry.score),
+      }))
+      .filter((entry) => entry.skill && Number.isFinite(entry.score))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+    const fallbackSkills = (profile.skills ?? []).slice(0, 6).map((skill) => ({
+      skill,
+      score: null,
+    }));
+
     return {
       id: profile.id,
       name: this.fullName(profile.user),
       headline: profile.headline,
-      topSkills: profile.skills ?? [],
+      topSkills: scoredSkills.length ? scoredSkills : fallbackSkills,
     };
   }
 

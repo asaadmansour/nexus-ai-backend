@@ -107,6 +107,23 @@ export class ProjectRoleAssignment {
   @Column({ type: 'text', nullable: true })
   notes!: string | null;
 
+  @Column({ name: 'role_brief', type: 'jsonb', nullable: true })
+  roleBrief!: Record<string, unknown> | null;
+
+  @Column({
+    name: 'role_brief_status',
+    type: 'varchar',
+    length: 40,
+    default: 'pending',
+  })
+  roleBriefStatus!: string;
+
+  @Column({ name: 'role_brief_generated_at', type: 'timestamptz', nullable: true })
+  roleBriefGeneratedAt!: Date | null;
+
+  @Column({ name: 'role_brief_error', type: 'text', nullable: true })
+  roleBriefError!: string | null;
+
   @Column({ name: 'assigned_at', type: 'timestamptz', nullable: true })
   assignedAt!: Date | null;
 

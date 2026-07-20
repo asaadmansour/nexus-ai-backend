@@ -32,6 +32,7 @@ export class AdminService {
     'assessment_generation',
     'assessment_grading',
     'matching',
+    'project_plan_generation',
     'evaluation',
   ];
   private readonly warningEventTypes = [
@@ -285,11 +286,7 @@ export class AdminService {
       emailVerified,
       emailPending,
       totalProjects,
-      draftProjects,
-      briefCompleteProjects,
-      assignedProjects,
-      activeProjects,
-      completedProjects,
+      projectStatusRows,
       freelancerStatuses,
       totalFreelancers,
       totalAssessments,
@@ -311,17 +308,12 @@ export class AdminService {
       this.userRepository.count({ where: { isEmailVerified: true } }),
       this.userRepository.count({ where: { isEmailVerified: false } }),
       this.projectRepository.count(),
-      this.projectRepository.count({ where: { status: ProjectStatus.DRAFT } }),
-      this.projectRepository.count({
-        where: { status: ProjectStatus.BRIEF_COMPLETE },
-      }),
-      this.projectRepository.count({
-        where: { status: ProjectStatus.ASSIGNED },
-      }),
-      this.projectRepository.count({ where: { status: ProjectStatus.ACTIVE } }),
-      this.projectRepository.count({
-        where: { status: ProjectStatus.COMPLETED },
-      }),
+      this.projectRepository
+        .createQueryBuilder('project')
+        .select('project.status', 'status')
+        .addSelect('COUNT(*)', 'count')
+        .groupBy('project.status')
+        .getRawMany<{ status: ProjectStatus; count: string }>(),
       this.freelancerProfileRepository
         .createQueryBuilder('fp')
         .select('fp.verificationStatus', 'verificationStatus')
@@ -384,13 +376,43 @@ export class AdminService {
       emailPending,
     };
 
+    const projectStatusCounts = Object.values(ProjectStatus).reduce(
+      (counts, status) => {
+        counts[status] = 0;
+        return counts;
+      },
+      {} as Record<ProjectStatus, number>,
+    );
+
+    projectStatusRows.forEach((row) => {
+      projectStatusCounts[row.status] = parseInt(row.count, 10) || 0;
+    });
+
     const projectStats = {
       total: totalProjects,
-      draft: draftProjects,
-      briefComplete: briefCompleteProjects,
-      assigned: assignedProjects,
-      active: activeProjects,
-      completed: completedProjects,
+      draft: projectStatusCounts[ProjectStatus.DRAFT],
+      inProgress: projectStatusCounts[ProjectStatus.IN_PROGRESS],
+      briefComplete: projectStatusCounts[ProjectStatus.BRIEF_COMPLETE],
+      planningMatching: projectStatusCounts[ProjectStatus.PLANNING_MATCHING],
+      planningAssigned: projectStatusCounts[ProjectStatus.PLANNING_ASSIGNED],
+      planningInProgress:
+        projectStatusCounts[ProjectStatus.PLANNING_IN_PROGRESS],
+      planningReview: projectStatusCounts[ProjectStatus.PLANNING_REVIEW],
+      implementationReady:
+        projectStatusCounts[ProjectStatus.IMPLEMENTATION_READY],
+      matching: projectStatusCounts[ProjectStatus.MATCHING],
+      matched: projectStatusCounts[ProjectStatus.MATCHED],
+      specInProgress: projectStatusCounts[ProjectStatus.SPEC_IN_PROGRESS],
+      specUnderReview: projectStatusCounts[ProjectStatus.SPEC_UNDER_REVIEW],
+      specComplete: projectStatusCounts[ProjectStatus.SPEC_COMPLETE],
+      scoped: projectStatusCounts[ProjectStatus.SCOPED],
+      assigned: projectStatusCounts[ProjectStatus.ASSIGNED],
+      active: projectStatusCounts[ProjectStatus.ACTIVE],
+      underReview: projectStatusCounts[ProjectStatus.UNDER_REVIEW],
+      completed: projectStatusCounts[ProjectStatus.COMPLETED],
+      cancelled: projectStatusCounts[ProjectStatus.CANCELLED],
+      disputed: projectStatusCounts[ProjectStatus.DISPUTED],
+      byStatus: projectStatusCounts,
     };
 
     const freelancerStats = {

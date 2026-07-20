@@ -35,12 +35,40 @@ export class StripeService {
     return this.stripe.accountLinks.create(params);
   }
 
+  createAccountLoginLink(accountId: string) {
+    return this.stripe.accounts.createLoginLink(accountId);
+  }
+
+  createConnectedRecipientAccount(
+    params: Stripe.V2.Core.AccountCreateParams,
+    options?: Stripe.RequestOptions,
+  ) {
+    return this.stripe.v2.core.accounts.create(params, options);
+  }
+
+  createConnectedAccountLink(
+    params: Stripe.V2.Core.AccountLinkCreateParams,
+    options?: Stripe.RequestOptions,
+  ) {
+    return this.stripe.v2.core.accountLinks.create(params, options);
+  }
+
+  retrieveConnectedAccount(accountId: string) {
+    return this.stripe.v2.core.accounts.retrieve(accountId, {
+      include: ['configuration.recipient', 'requirements'],
+    });
+  }
+
   retrieveAccount(accountId: string) {
     return this.stripe.accounts.retrieve(accountId);
   }
 
   createPaymentIntent(params: Stripe.PaymentIntentCreateParams) {
     return this.stripe.paymentIntents.create(params);
+  }
+
+  createCheckoutSession(params: Stripe.Checkout.SessionCreateParams) {
+    return this.stripe.checkout.sessions.create(params);
   }
 
   constructWebhookEvent(payload: Buffer | string, signature: string) {

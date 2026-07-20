@@ -50,6 +50,9 @@ export class AgentJob {
   @Column({ name: 'submission_id', type: 'uuid', nullable: true })
   submissionId!: string | null;
 
+  @Column({ name: 'project_submission_id', type: 'uuid', nullable: true })
+  projectSubmissionId!: string | null;
+
   @Column({ name: 'matching_run_id', type: 'uuid', nullable: true })
   matchingRunId!: string | null;
 

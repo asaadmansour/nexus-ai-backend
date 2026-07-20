@@ -4,10 +4,11 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import Stripe from 'stripe';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
@@ -15,12 +16,20 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
+import { MatchingService } from 'src/matching/matching.service';
 import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
 import { StripeService } from './stripe.service';
+
+type ConnectedStripeAccount = Stripe.Account | Stripe.V2.Core.Account;
+type StripeConnectOnboardingUrls = {
+  refreshUrl?: string;
+  returnUrl?: string;
+  country?: string;
+};
 
 @Injectable()
 export class PaymentsService {
@@ -41,6 +50,7 @@ export class PaymentsService {
     private readonly webhookEventsRepository: Repository<StripeWebhookEvent>,
     private readonly stripeService: StripeService,
     private readonly configService: ConfigService,
+    private readonly matchingService: MatchingService,
   ) {}
 
   async createCustomerSetupIntent(userId: string) {
@@ -58,54 +68,102 @@ export class PaymentsService {
     };
   }
 
-  async createFreelancerOnboardingLink(userId: string) {
+  async createFreelancerOnboardingLink(
+    userId: string,
+    urls?: StripeConnectOnboardingUrls,
+  ) {
     const profile = await this.getFreelancerProfileOrThrow(userId);
     let stripeAccountId = profile.stripeAccountId;
+    const accountCountry = this.stripeConnectCountry(urls?.country);
 
     if (!stripeAccountId) {
-      const account = await this.stripeService.createConnectAccount({
-        type: 'express',
-        email: profile.user.email,
-        metadata: {
-          userId,
-          freelancerProfileId: profile.id,
-        },
-      });
+      let account: Stripe.V2.Core.Account;
+
+      try {
+        account = await this.stripeService.createConnectedRecipientAccount(
+          {
+            contact_email: profile.user.email,
+            display_name:
+              `${profile.user.firstName} ${profile.user.lastName}`.trim() ||
+              profile.user.email,
+            dashboard: 'express',
+            identity: {
+              country: accountCountry,
+              entity_type: 'individual',
+              individual: {
+                email: profile.user.email,
+                given_name: profile.user.firstName,
+                surname: profile.user.lastName,
+              },
+            },
+            configuration: {
+              recipient: {
+                capabilities: {
+                  stripe_balance: {
+                    stripe_transfers: {
+                      requested: true,
+                    },
+                  },
+                },
+              },
+            },
+            defaults: {
+              currency: this.stripeDefaultCurrency(),
+              profile: {
+                product_description:
+                  'Freelance software, product design, and project delivery services for Nexus AI customers.',
+              },
+              responsibilities: {
+                fees_collector: 'application',
+                losses_collector: 'application',
+              },
+            },
+            include: ['configuration.recipient', 'requirements'],
+            metadata: {
+              userId,
+              freelancerProfileId: profile.id,
+            },
+          },
+          {
+            idempotencyKey: `freelancer-connect-account-${profile.id}-${accountCountry}`,
+          },
+        );
+      } catch (error) {
+        if (this.isStripeConnectSetupError(error)) {
+          throw new ServiceUnavailableException(
+            'Stripe Connect is not enabled for this Stripe account. Enable Connect in the Stripe dashboard, then retry freelancer onboarding.',
+          );
+        }
+
+        throw error;
+      }
 
       stripeAccountId = account.id;
 
-      await this.freelancerProfilesRepository.update(
-        profile.id,
-        {
-          stripeAccountId,
-          stripeOnboardingStatus: 'pending',
-          stripeChargesEnabled: account.charges_enabled,
-          stripePayoutsEnabled: account.payouts_enabled,
-          stripeRequirementsDue: this.accountRequirements(account),
-          stripeOnboardedAt: this.isAccountOnboarded(account)
-            ? new Date()
-            : null,
-        } as any,
-      );
+      await this.freelancerProfilesRepository.update(profile.id, {
+        stripeAccountId,
+        stripeOnboardingStatus: 'link_created',
+        stripeChargesEnabled: this.isAccountOnboarded(account),
+        stripePayoutsEnabled: this.isAccountOnboarded(account),
+        stripeRequirementsDue: this.accountRequirements(account),
+        stripeOnboardedAt: this.isAccountOnboarded(account) ? new Date() : null,
+      } as any);
     }
 
-    const returnUrl = this.configService.get<string>(
+    const returnUrl = this.resolveStripeConnectUrl(
+      urls?.returnUrl,
       'STRIPE_CONNECT_RETURN_URL',
     );
-    const refreshUrl = this.configService.get<string>(
+    const refreshUrl = this.resolveStripeConnectUrl(
+      urls?.refreshUrl,
       'STRIPE_CONNECT_REFRESH_URL',
     );
 
-    if (!returnUrl || !refreshUrl) {
-      throw new BadRequestException('Stripe Connect return URLs are not set');
-    }
-
-    const accountLink = await this.stripeService.createAccountLink({
-      account: stripeAccountId,
-      refresh_url: refreshUrl,
-      return_url: returnUrl,
-      type: 'account_onboarding',
-    });
+    const accountLink = await this.createOnboardingAccountLink(
+      stripeAccountId,
+      refreshUrl,
+      returnUrl,
+    );
 
     return {
       status: 'success',
@@ -114,6 +172,117 @@ export class PaymentsService {
         url: accountLink.url,
       },
     };
+  }
+
+  async createFreelancerDashboardLink(userId: string) {
+    const profile = await this.getFreelancerProfileOrThrow(userId);
+
+    if (!profile.stripeAccountId) {
+      throw new BadRequestException('Set up Stripe payouts first');
+    }
+
+    const account = await this.retrieveConnectedAccount(
+      profile.stripeAccountId,
+    );
+    const onboardingStatus = this.accountOnboardingStatus(account);
+    const onboarded = this.isAccountOnboarded(account);
+    const onboardedAt = onboarded
+      ? (profile.stripeOnboardedAt ?? new Date())
+      : null;
+
+    await this.freelancerProfilesRepository.update(profile.id, {
+      stripeOnboardingStatus: onboardingStatus,
+      stripeChargesEnabled: onboarded,
+      stripePayoutsEnabled: onboarded,
+      stripeRequirementsDue: this.accountRequirements(account),
+      stripeOnboardedAt: onboardedAt,
+    } as any);
+
+    if (!onboarded) {
+      throw new BadRequestException(
+        'Complete Stripe onboarding before opening the Express Dashboard',
+      );
+    }
+
+    const loginLink = await this.stripeService.createAccountLoginLink(
+      profile.stripeAccountId,
+    );
+
+    return {
+      status: 'success',
+      data: {
+        accountId: profile.stripeAccountId,
+        url: loginLink.url,
+      },
+    };
+  }
+
+  private isStripeConnectSetupError(error: unknown) {
+    if (!(error instanceof Stripe.errors.StripeInvalidRequestError)) {
+      return false;
+    }
+
+    return (
+      error.message?.toLowerCase().includes('signed up for connect') ?? false
+    );
+  }
+
+  private async createOnboardingAccountLink(
+    stripeAccountId: string,
+    refreshUrl: string,
+    returnUrl: string,
+  ) {
+    try {
+      return await this.stripeService.createConnectedAccountLink({
+        account: stripeAccountId,
+        use_case: {
+          type: 'account_onboarding',
+          account_onboarding: {
+            configurations: ['recipient'],
+            refresh_url: refreshUrl,
+            return_url: returnUrl,
+            collection_options: {
+              fields: 'currently_due',
+              future_requirements: 'omit',
+            },
+          },
+        },
+      });
+    } catch (error) {
+      if (!this.isStripeV1AccountCompatibilityError(error)) {
+        throw error;
+      }
+
+      return this.stripeService.createAccountLink({
+        account: stripeAccountId,
+        refresh_url: refreshUrl,
+        return_url: returnUrl,
+        type: 'account_onboarding',
+      });
+    }
+  }
+
+  private async retrieveConnectedAccount(stripeAccountId: string) {
+    try {
+      return await this.stripeService.retrieveConnectedAccount(stripeAccountId);
+    } catch (error) {
+      if (!this.isStripeV1AccountCompatibilityError(error)) {
+        throw error;
+      }
+
+      return this.stripeService.retrieveAccount(stripeAccountId);
+    }
+  }
+
+  private isStripeV1AccountCompatibilityError(error: unknown) {
+    if (!(error instanceof Stripe.errors.StripeInvalidRequestError)) {
+      return false;
+    }
+
+    return (
+      error.code === 'v1_account_instead_of_v2_account' ||
+      error.message?.toLowerCase().includes('v1 account') === true
+    );
   }
 
   async getFreelancerAccount(userId: string) {
@@ -133,34 +302,66 @@ export class PaymentsService {
       };
     }
 
-    const account = await this.stripeService.retrieveAccount(
+    const account = await this.retrieveConnectedAccount(
       profile.stripeAccountId,
     );
     const onboardingStatus = this.accountOnboardingStatus(account);
+    const onboarded = this.isAccountOnboarded(account);
+    const onboardedAt = onboarded
+      ? (profile.stripeOnboardedAt ?? new Date())
+      : null;
 
-    await this.freelancerProfilesRepository.update(
-      profile.id,
-      {
-        stripeOnboardingStatus: onboardingStatus,
-        stripeChargesEnabled: account.charges_enabled,
-        stripePayoutsEnabled: account.payouts_enabled,
-        stripeRequirementsDue: this.accountRequirements(account),
-        stripeOnboardedAt: this.isAccountOnboarded(account)
-          ? (profile.stripeOnboardedAt ?? new Date())
-          : null,
-      } as any,
-    );
+    await this.freelancerProfilesRepository.update(profile.id, {
+      stripeOnboardingStatus: onboardingStatus,
+      stripeChargesEnabled: onboarded,
+      stripePayoutsEnabled: onboarded,
+      stripeRequirementsDue: this.accountRequirements(account),
+      stripeOnboardedAt: onboardedAt,
+    } as any);
 
     return {
       status: 'success',
       data: {
         accountId: account.id,
         onboardingStatus,
-        chargesEnabled: account.charges_enabled,
-        payoutsEnabled: account.payouts_enabled,
+        chargesEnabled: onboarded,
+        payoutsEnabled: onboarded,
         requirementsDue: this.accountRequirements(account),
-        onboardedAt: profile.stripeOnboardedAt,
+        onboardedAt,
       },
+    };
+  }
+
+  async getCustomerPaymentProjects(userId: string) {
+    const projects = await this.projectsRepository.find({
+      where: { customerId: userId },
+      order: { updatedAt: 'DESC' },
+    });
+    const projectIds = projects.map((project) => project.id);
+    const payments = projectIds.length
+      ? await this.paymentsRepository.find({
+          where: { projectId: In(projectIds) },
+          order: { createdAt: 'DESC' },
+        })
+      : [];
+    const milestones = projectIds.length
+      ? await this.milestonesRepository.find({
+          where: { projectId: In(projectIds) },
+          order: { orderIndex: 'ASC' },
+        })
+      : [];
+    const paymentsByProject = this.groupByProject(payments);
+    const milestonesByProject = this.groupByProject(milestones);
+
+    return {
+      status: 'success',
+      data: projects.map((project) =>
+        this.buildProjectPaymentSummary(
+          project,
+          paymentsByProject.get(project.id) ?? [],
+          milestonesByProject.get(project.id) ?? [],
+        ),
+      ),
     };
   }
 
@@ -180,9 +381,10 @@ export class PaymentsService {
       await this.assertMilestoneBelongsToProject(dto.milestoneId, projectId);
     }
 
+    const allowedAmount = await this.assertEscrowCheckoutAmount(project, dto);
     const stripeCustomerId = await this.ensureStripeCustomer(user);
-    const currency = dto.currency.toUpperCase();
-    const amount = dto.amount.toFixed(2);
+    const currency = this.normalizedCurrency(dto.currency || project.currency);
+    const amount = allowedAmount.toFixed(2);
     const payment = this.paymentsRepository.create({
       projectId,
       milestoneId: dto.milestoneId ?? null,
@@ -198,7 +400,7 @@ export class PaymentsService {
 
     const savedPayment = await this.paymentsRepository.save(payment);
     const paymentIntent = await this.stripeService.createPaymentIntent({
-      amount: this.toMinorUnits(dto.amount, currency),
+      amount: this.toMinorUnits(allowedAmount, currency),
       currency: currency.toLowerCase(),
       customer: stripeCustomerId,
       automatic_payment_methods: {
@@ -227,11 +429,132 @@ export class PaymentsService {
         paymentId: savedPayment.id,
         stripePaymentIntentId: paymentIntent.id,
         clientSecret: paymentIntent.client_secret,
-        amount: dto.amount,
+        amount: allowedAmount,
         currency,
         status: savedPayment.status,
         projectId: project.id,
       },
+    };
+  }
+
+  async createEscrowCheckoutSession(
+    projectId: string,
+    userId: string,
+    dto: CreateEscrowIntentDto,
+  ) {
+    const user = await this.getUserOrThrow(userId);
+    const project = await this.getProjectOrThrow(projectId);
+
+    if (project.customerId !== userId) {
+      throw new ForbiddenException('Only the project customer can pay escrow');
+    }
+
+    if (dto.milestoneId) {
+      await this.assertMilestoneBelongsToProject(dto.milestoneId, projectId);
+    }
+
+    const amount = await this.assertEscrowCheckoutAmount(project, dto);
+    const currency = this.normalizedCurrency(dto.currency || project.currency);
+    const stripeCustomerId = await this.ensureStripeCustomer(user);
+    const frontendUrl = this.requiredFrontendUrl();
+
+    const payment = this.paymentsRepository.create({
+      projectId,
+      milestoneId: dto.milestoneId ?? null,
+      customerId: userId,
+      amount: amount.toFixed(2),
+      currency,
+      status: 'requires_payment',
+      purpose: dto.purpose,
+      metadata: {
+        source: 'stripe_checkout_session',
+        quoteStatus: project.quoteStatus,
+        quotedAmount: project.quotedAmount,
+      },
+    });
+    const savedPayment = await this.paymentsRepository.save(payment);
+
+    const session = await this.stripeService.createCheckoutSession({
+      mode: 'payment',
+      customer: stripeCustomerId,
+      success_url: `${frontendUrl}/projects/${projectId}/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/projects/${projectId}/payments?payment=cancelled`,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: currency.toLowerCase(),
+            unit_amount: this.toMinorUnits(amount, currency),
+            product_data: {
+              name: `Escrow funding for ${project.title}`,
+              description: this.checkoutDescription(project, dto.purpose),
+            },
+          },
+        },
+      ],
+      payment_intent_data: {
+        metadata: {
+          projectPaymentId: savedPayment.id,
+          projectId,
+          customerId: userId,
+          milestoneId: dto.milestoneId ?? '',
+          purpose: dto.purpose,
+        },
+      },
+      metadata: {
+        projectPaymentId: savedPayment.id,
+        projectId,
+        customerId: userId,
+        milestoneId: dto.milestoneId ?? '',
+        purpose: dto.purpose,
+      },
+    });
+
+    await this.paymentsRepository.update(savedPayment.id, {
+      stripeCheckoutSessionId: session.id,
+      metadata: {
+        ...((savedPayment.metadata as Record<string, unknown> | null) ?? {}),
+        checkoutSessionStatus: session.status ?? 'unknown',
+      },
+    });
+
+    return {
+      status: 'success',
+      data: {
+        paymentId: savedPayment.id,
+        checkoutSessionId: session.id,
+        checkoutUrl: session.url,
+        amount,
+        currency,
+        status: savedPayment.status,
+        purpose: savedPayment.purpose,
+        projectId,
+      },
+    };
+  }
+
+  async getProjectPaymentSummary(projectId: string, user: JwtPayload) {
+    const project = await this.getProjectOrThrow(projectId);
+    const isAdmin = user.role === UserRole.ADMIN;
+
+    if (!isAdmin && project.customerId !== user.sub) {
+      throw new ForbiddenException('You cannot view payments for this project');
+    }
+
+    const [payments, milestones] = await Promise.all([
+      this.paymentsRepository.find({
+        where: { projectId },
+        order: { createdAt: 'DESC' },
+      }),
+      this.milestonesRepository.find({
+        where: { projectId },
+        order: { orderIndex: 'ASC' },
+      }),
+    ]);
+
+    return {
+      status: 'success',
+      data: this.buildProjectPaymentSummary(project, payments, milestones),
     };
   }
 
@@ -383,7 +706,9 @@ export class PaymentsService {
   }
 
   private async processStripeEvent(event: Stripe.Event) {
-    switch (event.type) {
+    const eventType = event.type as string;
+
+    switch (eventType) {
       case 'payment_intent.succeeded':
         await this.handlePaymentIntentSucceeded(
           event.data.object as Stripe.PaymentIntent,
@@ -394,6 +719,11 @@ export class PaymentsService {
           event.data.object as Stripe.PaymentIntent,
         );
         break;
+      case 'checkout.session.completed':
+        await this.handleCheckoutSessionCompleted(
+          event.data.object as Stripe.Checkout.Session,
+        );
+        break;
       case 'setup_intent.succeeded':
         await this.handleSetupIntentSucceeded(
           event.data.object as Stripe.SetupIntent,
@@ -401,6 +731,11 @@ export class PaymentsService {
         break;
       case 'account.updated':
         await this.handleAccountUpdated(event.data.object as Stripe.Account);
+        break;
+      case 'v2.core.account[requirements].updated':
+        await this.handleAccountUpdated(
+          event.data.object as unknown as Stripe.V2.Core.Account,
+        );
         break;
       default:
         break;
@@ -416,22 +751,75 @@ export class PaymentsService {
       return;
     }
 
-    await this.paymentsRepository.update(
-      payment.id,
-      {
-        status: 'succeeded',
-        paidAt: new Date(),
-        failedAt: null,
-        metadata: {
-          ...((payment.metadata as Record<string, unknown> | null) ?? {}),
-          stripePaymentIntentStatus: intent.status,
-          latestCharge:
-            typeof intent.latest_charge === 'string'
-              ? intent.latest_charge
-              : (intent.latest_charge?.id ?? null),
-        },
-      } as any,
-    );
+    await this.markPaymentSucceeded(payment, {
+      stripePaymentIntentStatus: intent.status,
+      latestCharge:
+        typeof intent.latest_charge === 'string'
+          ? intent.latest_charge
+          : (intent.latest_charge?.id ?? null),
+    });
+  }
+
+  private async handleCheckoutSessionCompleted(
+    session: Stripe.Checkout.Session,
+  ) {
+    const projectPaymentId = session.metadata?.projectPaymentId;
+    const payment = projectPaymentId
+      ? await this.paymentsRepository.findOne({
+          where: { id: projectPaymentId },
+        })
+      : await this.paymentsRepository.findOne({
+          where: { stripeCheckoutSessionId: session.id },
+        });
+
+    if (!payment) {
+      return;
+    }
+
+    const paymentIntentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : (session.payment_intent?.id ?? null);
+
+    payment.stripeCheckoutSessionId = session.id;
+    payment.stripePaymentIntentId =
+      payment.stripePaymentIntentId ?? paymentIntentId;
+
+    if (session.payment_status === 'paid') {
+      await this.markPaymentSucceeded(payment, {
+        checkoutSessionStatus: session.status,
+        checkoutPaymentStatus: session.payment_status,
+        stripePaymentIntentId: paymentIntentId,
+      });
+      return;
+    }
+
+    await this.paymentsRepository.update(payment.id, {
+      stripeCheckoutSessionId: session.id,
+      stripePaymentIntentId: payment.stripePaymentIntentId,
+      metadata: {
+        ...((payment.metadata as Record<string, unknown> | null) ?? {}),
+        checkoutSessionStatus: session.status ?? 'unknown',
+        checkoutPaymentStatus: session.payment_status,
+      },
+    });
+  }
+
+  private async markPaymentSucceeded(
+    payment: ProjectPayment,
+    metadata: Record<string, unknown>,
+  ) {
+    await this.paymentsRepository.update(payment.id, {
+      status: 'succeeded',
+      paidAt: payment.paidAt ?? new Date(),
+      failedAt: null,
+      stripeCheckoutSessionId: payment.stripeCheckoutSessionId,
+      stripePaymentIntentId: payment.stripePaymentIntentId,
+      metadata: {
+        ...((payment.metadata as Record<string, unknown> | null) ?? {}),
+        ...metadata,
+      },
+    } as any);
 
     const existingHold = await this.ledgerRepository.findOne({
       where: {
@@ -455,26 +843,39 @@ export class PaymentsService {
           postedAt: new Date(),
         }),
       );
+      await this.projectsRepository
+        .createQueryBuilder()
+        .update(Project)
+        .set({
+          heldAmount: () => '"held_amount" + :amount',
+          quoteStatus: 'accepted',
+        } as any)
+        .where('id = :projectId', { projectId: payment.projectId })
+        .setParameter('amount', payment.amount)
+        .execute();
+    }
+
+    if (payment.purpose === 'full_project_deposit') {
+      await this.matchingService.autoStartPlanningRoles(payment.projectId);
     }
   }
 
   private async handlePaymentIntentFailed(intent: Stripe.PaymentIntent) {
-    await this.paymentsRepository.update(
-      { stripePaymentIntentId: intent.id },
-      {
-        status: 'failed',
-        failedAt: new Date(),
-        metadata: {
-          stripePaymentIntentStatus: intent.status,
-          lastPaymentError: intent.last_payment_error ?? null,
-        },
-      } as any,
-    );
+    await this.paymentsRepository.update({ stripePaymentIntentId: intent.id }, {
+      status: 'failed',
+      failedAt: new Date(),
+      metadata: {
+        stripePaymentIntentStatus: intent.status,
+        lastPaymentError: intent.last_payment_error ?? null,
+      },
+    } as any);
   }
 
   private async handleSetupIntentSucceeded(intent: Stripe.SetupIntent) {
     const customerId =
-      typeof intent.customer === 'string' ? intent.customer : intent.customer?.id;
+      typeof intent.customer === 'string'
+        ? intent.customer
+        : intent.customer?.id;
     const paymentMethodId =
       typeof intent.payment_method === 'string'
         ? intent.payment_method
@@ -490,7 +891,7 @@ export class PaymentsService {
     );
   }
 
-  private async handleAccountUpdated(account: Stripe.Account) {
+  private async handleAccountUpdated(account: ConnectedStripeAccount) {
     const profile = await this.freelancerProfilesRepository.findOne({
       where: { stripeAccountId: account.id },
     });
@@ -499,18 +900,214 @@ export class PaymentsService {
       return;
     }
 
-    await this.freelancerProfilesRepository.update(
-      profile.id,
-      {
-        stripeOnboardingStatus: this.accountOnboardingStatus(account),
-        stripeChargesEnabled: account.charges_enabled,
-        stripePayoutsEnabled: account.payouts_enabled,
-        stripeRequirementsDue: this.accountRequirements(account),
-        stripeOnboardedAt: this.isAccountOnboarded(account)
-          ? (profile.stripeOnboardedAt ?? new Date())
-          : null,
-      } as any,
+    await this.freelancerProfilesRepository.update(profile.id, {
+      stripeOnboardingStatus: this.accountOnboardingStatus(account),
+      stripeChargesEnabled: this.isAccountOnboarded(account),
+      stripePayoutsEnabled: this.isAccountOnboarded(account),
+      stripeRequirementsDue: this.accountRequirements(account),
+      stripeOnboardedAt: this.isAccountOnboarded(account)
+        ? (profile.stripeOnboardedAt ?? new Date())
+        : null,
+    } as any);
+  }
+
+  private buildProjectPaymentSummary(
+    project: Project,
+    payments: ProjectPayment[],
+    milestones: ProjectMilestone[],
+  ) {
+    const quoteAmount = this.toNumber(project.quotedAmount);
+    const milestoneEstimate = this.sumMilestoneBudgets(milestones);
+    const finalAmount =
+      quoteAmount ?? (milestoneEstimate > 0 ? milestoneEstimate : null);
+    const currency =
+      project.quotedCurrency ??
+      milestones.find((milestone) => milestone.currency)?.currency ??
+      project.currency;
+    const paidAmount = this.sumPayments(payments, ['succeeded']);
+    const pendingAmount = this.sumPayments(payments, [
+      'requires_payment',
+      'processing',
+    ]);
+    const remainingAmount =
+      finalAmount !== null ? Math.max(finalAmount - paidAmount, 0) : null;
+    const quoteStatus = project.quoteStatus ?? 'not_ready';
+    const canPay =
+      finalAmount !== null &&
+      remainingAmount !== null &&
+      remainingAmount > 0 &&
+      quoteStatus !== 'not_ready' &&
+      quoteStatus !== 'out_of_budget';
+
+    return {
+      project: {
+        id: project.id,
+        title: project.title,
+        status: project.status,
+        budgetMin: this.toNumber(project.budgetMin),
+        budgetMax: this.toNumber(project.budgetMax),
+        currency: project.currency,
+        deadline: project.deadline,
+        createdAt: project.createdAt,
+      },
+      quote: {
+        amount: finalAmount,
+        currency: finalAmount !== null ? currency : null,
+        status: quoteStatus,
+        generatedAt: project.quoteGeneratedAt,
+        notes: project.quoteNotes,
+        isOutOfBudget: quoteStatus === 'out_of_budget',
+      },
+      totals: {
+        paidAmount,
+        pendingAmount,
+        remainingAmount,
+        heldAmount: this.toNumber(project.heldAmount) ?? paidAmount,
+        releasedAmount: this.toNumber(project.releasedAmount) ?? 0,
+        currency,
+      },
+      actions: {
+        canPay,
+        payBlockedReason: this.paymentBlockedReason(
+          quoteStatus,
+          finalAmount,
+          remainingAmount,
+        ),
+        suggestedPaymentAmount: remainingAmount,
+        suggestedPaymentPurpose: 'full_project_deposit',
+        payButtonLabel: 'Fund project escrow',
+      },
+      milestones: milestones.map((milestone) => {
+        const milestonePayments = payments.filter(
+          (payment) => payment.milestoneId === milestone.id,
+        );
+        const budgetAmount = this.toNumber(milestone.budgetAmount);
+        const fundedAmount = this.sumPayments(milestonePayments, ['succeeded']);
+        return {
+          id: milestone.id,
+          title: milestone.title,
+          status: milestone.status,
+          orderIndex: milestone.orderIndex,
+          budgetAmount,
+          currency: milestone.currency ?? currency,
+          fundedAmount,
+          remainingAmount:
+            budgetAmount !== null
+              ? Math.max(budgetAmount - fundedAmount, 0)
+              : null,
+          dueAt: milestone.dueAt,
+        };
+      }),
+      payments,
+    };
+  }
+
+  private async assertEscrowCheckoutAmount(
+    project: Project,
+    dto: CreateEscrowIntentDto,
+  ) {
+    const amount = Number(dto.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new BadRequestException('Payment amount must be greater than zero');
+    }
+
+    if (project.quoteStatus === 'out_of_budget') {
+      throw new BadRequestException(
+        'The final estimate is above the project budget. Please revise the budget before paying.',
+      );
+    }
+
+    const quoteAmount = this.toNumber(project.quotedAmount);
+    if (!quoteAmount || project.quoteStatus === 'not_ready') {
+      throw new BadRequestException(
+        'The final project price is not ready yet. Confirm the requirements brief first.',
+      );
+    }
+
+    const existingPayments = await this.paymentsRepository.find({
+      where: { projectId: project.id },
+    });
+    const paidAmount = this.sumPayments(existingPayments, ['succeeded']);
+    const remainingAmount = Math.max(quoteAmount - paidAmount, 0);
+
+    if (remainingAmount <= 0) {
+      throw new ConflictException('This project is already fully funded');
+    }
+
+    if (amount > remainingAmount) {
+      throw new BadRequestException(
+        `Payment amount cannot exceed the remaining escrow amount of ${remainingAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}`,
+      );
+    }
+
+    return amount;
+  }
+
+  private paymentBlockedReason(
+    quoteStatus: string,
+    finalAmount: number | null,
+    remainingAmount: number | null,
+  ) {
+    if (quoteStatus === 'out_of_budget') {
+      return 'The final estimate is above the project budget. Revise the budget range before funding escrow.';
+    }
+    if (quoteStatus === 'not_ready' || finalAmount === null) {
+      return 'The final price is not ready yet. Confirm the requirements brief first.';
+    }
+    if (remainingAmount !== null && remainingAmount <= 0) {
+      return 'Escrow is fully funded.';
+    }
+    return null;
+  }
+
+  private groupByProject<T extends { projectId: string }>(rows: T[]) {
+    const map = new Map<string, T[]>();
+    for (const row of rows) {
+      const list = map.get(row.projectId) ?? [];
+      list.push(row);
+      map.set(row.projectId, list);
+    }
+    return map;
+  }
+
+  private sumPayments(payments: ProjectPayment[], statuses: string[]) {
+    const statusSet = new Set(statuses);
+    return payments.reduce((sum, payment) => {
+      if (!statusSet.has(payment.status)) return sum;
+      return sum + (this.toNumber(payment.amount) ?? 0);
+    }, 0);
+  }
+
+  private sumMilestoneBudgets(milestones: ProjectMilestone[]) {
+    return milestones.reduce(
+      (sum, milestone) => sum + (this.toNumber(milestone.budgetAmount) ?? 0),
+      0,
     );
+  }
+
+  private checkoutDescription(project: Project, purpose: string) {
+    const quote = project.quotedAmount
+      ? `Final estimate: ${project.quotedAmount} ${project.quotedCurrency ?? project.currency}.`
+      : null;
+    return [purpose.replace(/_/g, ' '), quote].filter(Boolean).join(' ');
+  }
+
+  private requiredFrontendUrl() {
+    const frontendUrl = this.configService.get<string>('FRONTEND_URL');
+    if (!frontendUrl) {
+      throw new BadRequestException('FRONTEND_URL is not set');
+    }
+    return frontendUrl.replace(/\/+$/, '');
+  }
+
+  private normalizedCurrency(currency: string) {
+    return currency.trim().toUpperCase();
+  }
+
+  private toNumber(value: string | number | null | undefined) {
+    if (value === null || value === undefined) return null;
+    const number = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(number) ? number : null;
   }
 
   private async ensureStripeCustomer(user: User) {
@@ -594,7 +1191,15 @@ export class PaymentsService {
     return Math.round(amount * 100);
   }
 
-  private accountRequirements(account: Stripe.Account) {
+  private accountRequirements(account: ConnectedStripeAccount) {
+    if (this.isV2Account(account)) {
+      return {
+        entries: account.requirements?.entries ?? [],
+        summary: account.requirements?.summary ?? null,
+        recipientTransferStatus: this.recipientTransferStatus(account),
+      };
+    }
+
     return {
       currentlyDue: account.requirements?.currently_due ?? [],
       eventuallyDue: account.requirements?.eventually_due ?? [],
@@ -603,19 +1208,90 @@ export class PaymentsService {
     };
   }
 
-  private isAccountOnboarded(account: Stripe.Account) {
+  private isAccountOnboarded(account: ConnectedStripeAccount) {
+    if (this.isV2Account(account)) {
+      return this.recipientTransferStatus(account) === 'active';
+    }
+
     return account.details_submitted && account.charges_enabled;
   }
 
-  private accountOnboardingStatus(account: Stripe.Account) {
+  private accountOnboardingStatus(account: ConnectedStripeAccount) {
+    if (this.isV2Account(account)) {
+      const transferStatus = this.recipientTransferStatus(account);
+
+      if (transferStatus === 'active') {
+        return 'completed';
+      }
+
+      if (transferStatus === 'pending') {
+        return 'in_progress';
+      }
+
+      if (transferStatus === 'restricted') {
+        return 'restricted';
+      }
+
+      return 'disabled';
+    }
+
     if (this.isAccountOnboarded(account) && account.payouts_enabled) {
       return 'completed';
     }
 
     if (account.details_submitted) {
-      return 'submitted';
+      return 'in_progress';
     }
 
-    return 'pending';
+    return 'link_created';
+  }
+
+  private isV2Account(
+    account: ConnectedStripeAccount,
+  ): account is Stripe.V2.Core.Account {
+    return account.object === 'v2.core.account';
+  }
+
+  private recipientTransferStatus(account: Stripe.V2.Core.Account) {
+    return (
+      account.configuration?.recipient?.capabilities?.stripe_balance
+        ?.stripe_transfers?.status ?? 'pending'
+    );
+  }
+
+  private stripeConnectCountry(country?: string) {
+    return (
+      country ??
+      this.configService.get<string>('STRIPE_CONNECT_ACCOUNT_COUNTRY') ??
+      'US'
+    ).toUpperCase();
+  }
+
+  private stripeDefaultCurrency() {
+    return (
+      this.configService.get<string>('STRIPE_CONNECT_DEFAULT_CURRENCY') ?? 'usd'
+    ).toLowerCase();
+  }
+
+  private resolveStripeConnectUrl(value: string | undefined, envKey: string) {
+    const url = value ?? this.configService.get<string>(envKey);
+
+    if (!url) {
+      throw new BadRequestException('Stripe Connect return URLs are not set');
+    }
+
+    try {
+      const parsed = new URL(url);
+
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('Unsupported protocol');
+      }
+
+      return parsed.toString();
+    } catch {
+      throw new BadRequestException(
+        `${envKey} must be a valid http or https URL`,
+      );
+    }
   }
 }

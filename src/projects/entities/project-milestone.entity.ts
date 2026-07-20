@@ -11,6 +11,7 @@ import {
 } from 'typeorm';
 import { ProjectPayment } from '../../payments/entities/project-payment.entity';
 import { ProjectPlan } from './project-plan.entity';
+import { ProjectSubmission } from './project-submission.entity';
 import { ProjectTask } from './project-task.entity';
 import { Project } from './project.entity';
 
@@ -78,6 +79,9 @@ export class ProjectMilestone {
 
   @OneToMany(() => ProjectPayment, (payment) => payment.milestone)
   payments?: ProjectPayment[];
+
+  @OneToMany(() => ProjectSubmission, (submission) => submission.milestone)
+  submissions?: ProjectSubmission[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

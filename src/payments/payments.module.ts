@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
+import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
 import { PaymentsService } from './payments.service';
@@ -11,11 +12,14 @@ import { User } from 'src/users/entities/user.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { Project } from 'src/projects/entities/project.entity';
+import { MatchingModule } from 'src/matching/matching.module';
 
 @Module({
   imports: [
+    MatchingModule,
     TypeOrmModule.forFeature([
       ProjectPayment,
+      PaymentReleaseRequest,
       EscrowLedgerEntry,
       StripeWebhookEvent,
       User,

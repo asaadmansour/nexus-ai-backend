@@ -22,6 +22,15 @@ import { FreelancerAiJobsService } from './freelancer-ai-jobs.service';
 import { AssessmentGenerationProcessor } from './jobs/assessment-generation.processor';
 import { CvExtractionProcessor } from './jobs/cv-extraction.processor';
 import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
+import { areQueuesEnabled } from 'src/queues/queue-runtime';
+
+const queueProcessors = areQueuesEnabled()
+  ? [
+      CvExtractionProcessor,
+      AssessmentGenerationProcessor,
+      ProfileEmbeddingProcessor,
+    ]
+  : [];
 
 @Module({
   imports: [
@@ -50,9 +59,7 @@ import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
     FreelancersService,
     FreelancerAssessmentsService,
     FreelancerAiJobsService,
-    CvExtractionProcessor,
-    AssessmentGenerationProcessor,
-    ProfileEmbeddingProcessor,
+    ...queueProcessors,
   ],
   exports: [TypeOrmModule],
 })

@@ -308,6 +308,7 @@ export class MatchingService {
     });
 
     const counts = await this.getCandidateCounts(runs.map((run) => run.id));
+    const selected = await this.getSelectedCandidateIds(runs.map((r) => r.id));
 
     const data = runs.map((run) => ({
       id: run.id,
@@ -318,6 +319,7 @@ export class MatchingService {
       status: run.status,
       summary: run.summary,
       candidateCount: counts.get(run.id) ?? 0,
+      selectedCandidateId: selected.get(run.id) ?? null,
       reviewedAt: run.reviewedAt,
       startedAt: run.startedAt,
       completedAt: run.completedAt,
@@ -327,7 +329,10 @@ export class MatchingService {
   }
 
   async getRun(runId: string) {
-    const run = await this.runRepo.findOne({ where: { id: runId } });
+    const run = await this.runRepo.findOne({
+      where: { id: runId },
+      relations: ['project'],
+    });
     if (!run) throw new NotFoundException('Matching run not found');
 
     const candidates = await this.candidateRepo.find({
@@ -335,19 +340,29 @@ export class MatchingService {
       order: { rank: 'ASC' },
       relations: ['freelancerProfile', 'freelancerProfile.user'],
     });
+    const selectedCandidate =
+      candidates.find((candidate) =>
+        ['selected', 'assigned'].includes(candidate.status),
+      ) ?? null;
 
     return {
       id: run.id,
       projectId: run.projectId,
+      projectTitle: run.project?.title ?? null,
       targetType: run.targetType,
       targetRoleKey: run.targetRoleKey,
       status: run.status,
       filters: run.filters,
       inputSnapshot: run.inputSnapshot,
       summary: run.summary,
+      candidateCount: candidates.length,
+      selectedCandidateId: selectedCandidate?.id ?? null,
       error: run.error,
       reviewedBy: run.reviewedBy,
       reviewedAt: run.reviewedAt,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+      createdAt: run.createdAt,
       candidates: candidates.map((candidate) => ({
         id: candidate.id,
         matchingRunId: candidate.matchingRunId,

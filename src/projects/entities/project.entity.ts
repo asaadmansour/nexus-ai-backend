@@ -12,9 +12,14 @@ import {
 } from 'typeorm';
 import { ProjectStatus } from '../../common/enums/project-status.enum';
 import { User } from '../../users/entities/user.entity';
+import { EvaluationRun } from './evaluation-run.entity';
 import { ProjectMilestone } from './project-milestone.entity';
 import { ProjectPlan } from './project-plan.entity';
+import { ProjectRepository } from './project-repository.entity';
+import { ProjectRevisionRequest } from './project-revision-request.entity';
 import { ProjectRoleAssignment } from './project-role-assignment.entity';
+import { ProjectSubmissionReview } from './project-submission-review.entity';
+import { ProjectSubmission } from './project-submission.entity';
 import { ProjectTask } from './project-task.entity';
 
 @Entity('projects')
@@ -107,6 +112,28 @@ export class Project {
   @Column({ name: 'assigned_at', type: 'timestamptz', nullable: true })
   assignedAt: Date | null;
 
+  @Column({
+    name: 'quoted_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+  })
+  quotedAmount: string | null;
+
+  @Column({ name: 'quoted_currency', type: 'char', length: 3, nullable: true })
+  quotedCurrency: string | null;
+
+  @Index('projects_quote_status_idx')
+  @Column({ name: 'quote_status', type: 'varchar', length: 40, default: 'not_ready' })
+  quoteStatus: string;
+
+  @Column({ name: 'quote_generated_at', type: 'timestamptz', nullable: true })
+  quoteGeneratedAt: Date | null;
+
+  @Column({ name: 'quote_notes', type: 'text', nullable: true })
+  quoteNotes: string | null;
+
   @OneToMany(() => ProjectRoleAssignment, (assignment) => assignment.project)
   roleAssignments?: ProjectRoleAssignment[];
 
@@ -118,6 +145,21 @@ export class Project {
 
   @OneToMany(() => ProjectTask, (task) => task.project)
   tasks?: ProjectTask[];
+
+  @OneToMany(() => ProjectSubmission, (submission) => submission.project)
+  submissions?: ProjectSubmission[];
+
+  @OneToMany(() => ProjectSubmissionReview, (review) => review.project)
+  submissionReviews?: ProjectSubmissionReview[];
+
+  @OneToMany(() => ProjectRevisionRequest, (request) => request.project)
+  revisionRequests?: ProjectRevisionRequest[];
+
+  @OneToMany(() => EvaluationRun, (run) => run.project)
+  evaluationRuns?: EvaluationRun[];
+
+  @OneToMany(() => ProjectRepository, (repository) => repository.project)
+  repositories?: ProjectRepository[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;

@@ -2,10 +2,12 @@ import { createHash } from 'crypto';
 import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { BriefDto } from './dto/BriefDto';
+import { EstimateProjectQuoteDto } from './dto/EstimateProjectQuoteDto';
 import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
+import { GenerateRoleBriefDto } from './dto/GenerateRoleBriefDto';
 import {
   MatchCandidateInputDto,
   MatchFreelancersDto,
@@ -63,6 +65,18 @@ type FastApiGenerateEmbeddingResponse = {
   dimensions?: number;
 };
 
+type FastApiProjectQuoteResponse = {
+  amount?: unknown;
+  currency?: unknown;
+  quoteStatus?: unknown;
+  confidence?: unknown;
+  complexity?: unknown;
+  rationale?: unknown;
+  assumptions?: unknown;
+  pricingSignals?: unknown;
+  sources?: unknown;
+};
+
 export type MatchFreelancersResultCandidate = {
   freelancerProfileId: string;
   rank: number;
@@ -84,6 +98,7 @@ export type ProjectPlanMilestone = {
   title: string;
   description?: string;
   orderIndex: number;
+  estimatedDays?: number | null;
   budgetAmount?: number | null;
   currency?: string | null;
   acceptanceCriteria?: string[];
@@ -101,6 +116,48 @@ export type ProjectPlanTask = {
   orderIndex: number;
   acceptanceCriteria?: string[];
   dependsOn?: string[];
+  status?: string;
+};
+
+export type ProjectPlanDependency = {
+  taskKey: string;
+  dependsOnKey: string;
+  type: string;
+  notes?: string | null;
+};
+
+export type ProjectPlanSpec = {
+  architecture?: Record<string, unknown> | null;
+  designSystem?: Record<string, unknown> | null;
+  apiContract?: Record<string, unknown> | null;
+  dataModel?: Record<string, unknown> | null;
+  conventions?: Record<string, unknown> | null;
+};
+
+type FastApiProjectPlanResponse = {
+  summary?: unknown;
+  assumptions?: unknown;
+  timeline?: unknown;
+  milestones?: unknown;
+  tasks?: unknown;
+  dependencies?: unknown;
+  teamPlan?: unknown;
+  riskRegister?: unknown;
+  projectSpec?: unknown;
+};
+
+type FastApiRoleBriefResponse = {
+  title?: unknown;
+  summary?: unknown;
+  objectives?: unknown;
+  responsibilities?: unknown;
+  requiredInputs?: unknown;
+  expectedDeliverables?: unknown;
+  acceptanceCriteria?: unknown;
+  handoffChecklist?: unknown;
+  collaborationNotes?: unknown;
+  suggestedQuestions?: unknown;
+  constraints?: unknown;
 };
 
 export type ProjectPlanResult = {
@@ -109,9 +166,39 @@ export type ProjectPlanResult = {
   timeline: Record<string, unknown>;
   milestones: ProjectPlanMilestone[];
   tasks: ProjectPlanTask[];
+  dependencies: ProjectPlanDependency[];
   teamPlan: Record<string, unknown>;
   riskRegister: Record<string, unknown>[];
+  projectSpec: ProjectPlanSpec;
   source: 'fastapi' | 'local_mock';
+};
+
+export type RoleBriefResult = {
+  title: string;
+  summary: string;
+  objectives: string[];
+  responsibilities: string[];
+  requiredInputs: string[];
+  expectedDeliverables: string[];
+  acceptanceCriteria: string[];
+  handoffChecklist: string[];
+  collaborationNotes: string;
+  suggestedQuestions: string[];
+  constraints: string[];
+  source: 'fastapi' | 'local_fallback';
+};
+
+export type ProjectQuoteResult = {
+  amount: number;
+  currency: string;
+  quoteStatus: 'pending_customer' | 'out_of_budget';
+  confidence: number;
+  complexity: string;
+  rationale: string;
+  assumptions: string[];
+  pricingSignals: string[];
+  sources: string[];
+  source: 'fastapi' | 'local_mock' | 'local_fallback';
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -224,6 +311,32 @@ export class AiService {
       },
       'generate-embedding',
     );
+  }
+
+  async estimateProjectQuote(
+    dto: EstimateProjectQuoteDto,
+  ): Promise<ProjectQuoteResult> {
+    if (this.isMockMode()) {
+      return this.getFallbackProjectQuoteResult(dto, 'local_mock');
+    }
+
+    try {
+      const result = await this.postToFastApi<FastApiProjectQuoteResponse>(
+        '/agents/estimate-project-quote',
+        {
+          project: dto.project,
+          brief: dto.brief ?? {},
+        },
+        'estimate-project-quote',
+      );
+
+      return this.normalizeProjectQuoteResult(dto, result, 'fastapi');
+    } catch (error) {
+      this.logger.warn(
+        `Falling back to deterministic project quote: ${this.getErrorMessage(error)}`,
+      );
+      return this.getFallbackProjectQuoteResult(dto, 'local_fallback');
+    }
   }
 
   async matchFreelancers(
@@ -412,6 +525,142 @@ export class AiService {
       : null;
   }
 
+  private normalizeProjectQuoteResult(
+    dto: EstimateProjectQuoteDto,
+    result: FastApiProjectQuoteResponse,
+    source: ProjectQuoteResult['source'],
+  ): ProjectQuoteResult {
+    const fallback = this.getFallbackProjectQuoteResult(dto, source);
+    const { min, max } = this.getQuoteBudgetRange(dto.project);
+    const requestedAmount = this.toNumber(result.amount);
+    const amount = this.roundMoney(
+      this.clampQuoteAmount(requestedAmount ?? fallback.amount, min, max),
+    );
+
+    return {
+      amount,
+      currency:
+        this.optionalString(result.currency)?.toUpperCase().slice(0, 3) ??
+        fallback.currency,
+      quoteStatus: 'pending_customer',
+      confidence: this.clampQuoteConfidence(
+        this.toNumber(result.confidence) ?? fallback.confidence,
+      ),
+      complexity: this.optionalString(result.complexity) ?? fallback.complexity,
+      rationale: this.optionalString(result.rationale) ?? fallback.rationale,
+      assumptions: this.ensureStringArray(
+        result.assumptions,
+        fallback.assumptions,
+      ),
+      pricingSignals: this.ensureStringArray(
+        result.pricingSignals,
+        fallback.pricingSignals,
+      ),
+      sources: this.ensureStringArray(result.sources, fallback.sources),
+      source,
+    };
+  }
+
+  private getFallbackProjectQuoteResult(
+    dto: EstimateProjectQuoteDto,
+    source: ProjectQuoteResult['source'],
+  ): ProjectQuoteResult {
+    const { min, max } = this.getQuoteBudgetRange(dto.project);
+    const brief = this.asRecord(dto.brief);
+    const project = this.asRecord(dto.project);
+    const featureCount = this.countQuoteItems(brief.coreFeatures);
+    const platformCount = Math.max(1, this.countQuoteItems(brief.platforms));
+    const deliverableCount = this.countQuoteItems(brief.deliverables);
+    const teamSize = this.toNumber(brief.suggestedTeamSize) ?? 2;
+    const deadlinePressure = this.quoteDeadlinePressure(project.deadline);
+    const complexityScore = Math.min(
+      1,
+      0.2 +
+        Math.min(featureCount, 8) * 0.06 +
+        Math.min(platformCount, 3) * 0.08 +
+        Math.min(deliverableCount, 5) * 0.04 +
+        Math.min(teamSize, 8) * 0.025 +
+        deadlinePressure,
+    );
+    const factor = Math.min(
+      0.92,
+      Math.max(0.55, 0.52 + complexityScore * 0.35),
+    );
+    const amount = this.roundMoney(min + (max - min) * factor);
+    const complexity =
+      complexityScore >= 0.72
+        ? 'high'
+        : complexityScore >= 0.45
+          ? 'medium'
+          : 'low';
+
+    return {
+      amount,
+      currency:
+        this.optionalString(project.currency)?.toUpperCase().slice(0, 3) ??
+        'EGP',
+      quoteStatus: 'pending_customer',
+      confidence: source === 'fastapi' ? 0.75 : 0.58,
+      complexity,
+      rationale:
+        'Final price estimated from the confirmed requirements, platform count, feature breadth, delivery scope, and the customer budget range.',
+      assumptions: [
+        'The first release follows the confirmed brief without major scope expansion.',
+        'Architecture and UI/UX planning are included as mandatory planning work before implementation.',
+        'Escrow funding starts the matching and planning workflow.',
+      ],
+      pricingSignals: [
+        `${featureCount || 'Several'} core feature area(s) captured in the brief.`,
+        `${platformCount} platform target(s) included.`,
+        `Estimated complexity: ${complexity}.`,
+      ],
+      sources: ['Nexus deterministic project quote fallback'],
+      source,
+    };
+  }
+
+  private getQuoteBudgetRange(project: Record<string, unknown>) {
+    const min = Math.max(0, this.toNumber(project.budgetMin) ?? 0);
+    const rawMax = this.toNumber(project.budgetMax);
+    const max = Math.max(min, rawMax ?? min);
+    return { min, max };
+  }
+
+  private clampQuoteAmount(amount: number, min: number, max: number) {
+    if (max <= min) return min;
+    return Math.min(max, Math.max(min, amount));
+  }
+
+  private roundMoney(value: number) {
+    return Number(value.toFixed(2));
+  }
+
+  private clampQuoteConfidence(value: number) {
+    return Math.min(1, Math.max(0, value));
+  }
+
+  private countQuoteItems(value: unknown) {
+    if (Array.isArray(value)) {
+      return value.filter((item) => this.optionalString(item)).length;
+    }
+
+    const text = this.optionalString(value);
+    if (!text) return 0;
+    return text.split(/,|;|\n|\band\b/gi).filter((item) => item.trim()).length;
+  }
+
+  private quoteDeadlinePressure(value: unknown) {
+    const deadline = this.optionalString(value);
+    if (!deadline) return 0;
+    const timestamp = Date.parse(deadline);
+    if (!Number.isFinite(timestamp)) return 0;
+    const days = (timestamp - Date.now()) / (1000 * 60 * 60 * 24);
+    if (days <= 14) return 0.12;
+    if (days <= 30) return 0.07;
+    if (days <= 60) return 0.03;
+    return 0;
+  }
+
   async generateProjectPlan(
     dto: GenerateProjectPlanDto,
   ): Promise<ProjectPlanResult> {
@@ -419,30 +668,380 @@ export class AiService {
       return this.getMockProjectPlanResult(dto);
     }
 
-    const result = await this.postToFastApi<Partial<ProjectPlanResult>>(
+    const result = await this.postToFastApi<FastApiProjectPlanResponse>(
       '/agents/generate-project-plan',
       {
-        projectId: dto.projectId,
+        projectPlanJobId:
+          dto.projectPlanJobId ?? dto.projectId ?? 'project-plan-generation',
         project: dto.project,
-        brief: dto.brief,
+        brief: dto.brief ?? {},
         architectureSubmission: dto.architectureSubmission,
         uiuxSubmission: dto.uiuxSubmission,
-        team: dto.team,
+        planningTeam: dto.planningTeam ?? dto.team ?? [],
         notes: dto.notes,
       },
       'generate-project-plan',
     );
 
+    return this.normalizeProjectPlanResult(result);
+  }
+
+  async generateRoleBrief(dto: GenerateRoleBriefDto): Promise<RoleBriefResult> {
+    if (this.isMockMode()) {
+      return this.getFallbackRoleBrief(dto);
+    }
+
+    const result = await this.postToFastApi<FastApiRoleBriefResponse>(
+      '/agents/generate-role-brief',
+      {
+        assignmentId: dto.assignmentId,
+        roleKey: dto.roleKey,
+        project: dto.project,
+        brief: dto.brief ?? {},
+        standardExpectations: dto.standardExpectations,
+        freelancer: dto.freelancer ?? null,
+      },
+      'generate-role-brief',
+    );
+
+    return this.normalizeRoleBriefResult(dto, result, 'fastapi');
+  }
+
+  private normalizeProjectPlanResult(
+    result: FastApiProjectPlanResponse,
+  ): ProjectPlanResult {
+    const dependencies = this.normalizeProjectPlanDependencies(
+      result.dependencies,
+    );
+    const tasks = this.normalizeProjectPlanTasks(result.tasks, dependencies);
+
     return {
-      summary: result.summary ?? 'Generated implementation plan.',
-      assumptions: result.assumptions ?? [],
-      timeline: result.timeline ?? {},
-      milestones: result.milestones ?? [],
-      tasks: result.tasks ?? [],
-      teamPlan: result.teamPlan ?? {},
-      riskRegister: result.riskRegister ?? [],
+      summary:
+        this.optionalString(result.summary) ?? 'Generated implementation plan.',
+      assumptions: this.toStringArray(result.assumptions),
+      timeline: this.asRecord(result.timeline),
+      milestones: this.normalizeProjectPlanMilestones(result.milestones),
+      tasks,
+      dependencies,
+      teamPlan: this.asRecord(result.teamPlan),
+      riskRegister: this.toRecordArray(result.riskRegister),
+      projectSpec: this.normalizeProjectSpec(result.projectSpec),
       source: 'fastapi',
     };
+  }
+
+  getFallbackRoleBrief(dto: GenerateRoleBriefDto): RoleBriefResult {
+    return this.normalizeRoleBriefResult(
+      dto,
+      {
+        title: `${this.roleLabel(dto.roleKey)} planning brief`,
+        summary: this.buildFallbackRoleBriefSummary(dto),
+        objectives: [
+          `Translate the project brief into ${this.roleLabel(dto.roleKey).toLowerCase()} decisions the implementation team can execute.`,
+          'Identify assumptions, risks, and open questions early instead of burying them in the final handoff.',
+        ],
+        responsibilities: dto.standardExpectations,
+        requiredInputs: [
+          'Confirmed project brief',
+          'Customer goals, target users, platforms, budget, and timeline',
+          'Any constraints, preferences, or examples already captured',
+        ],
+        expectedDeliverables:
+          dto.roleKey === 'ui_ux'
+            ? [
+                'User flows for the core journeys',
+                'Screen map or wireframes for the first release',
+                'Design system notes: colors, typography, components, spacing, and responsive behavior',
+                'Implementation handoff notes for frontend developers',
+              ]
+            : [
+                'System architecture overview',
+                'Recommended stack and service boundaries',
+                'Database model and key API contracts',
+                'Security, scalability, and integration notes',
+                'Implementation risks and dependency order',
+              ],
+        acceptanceCriteria: [
+          'Deliverable is specific to this project and not a generic template.',
+          'The implementation team can create tasks from it without guessing major decisions.',
+          'Open questions are clearly separated from confirmed decisions.',
+        ],
+        handoffChecklist: [
+          'Summarize confirmed decisions',
+          'List assumptions',
+          'List risks and mitigations',
+          'Call out dependencies that affect Scrum planning',
+        ],
+        collaborationNotes:
+          'Keep language clear enough for a non-technical customer and detailed enough for the Scrum Master to plan implementation.',
+        suggestedQuestions: [
+          'What is the one decision you need the customer/admin to confirm before finalizing this deliverable?',
+        ],
+        constraints: this.toStringArray(dto.brief?.constraintsPreferences),
+      },
+      'local_fallback',
+    );
+  }
+
+  private normalizeRoleBriefResult(
+    dto: GenerateRoleBriefDto,
+    result: FastApiRoleBriefResponse,
+    source: RoleBriefResult['source'],
+  ): RoleBriefResult {
+    const fallback = this.getBasicRoleBriefStrings(dto);
+
+    return {
+      title:
+        this.optionalString(result.title) ??
+        `${this.roleLabel(dto.roleKey)} planning brief`,
+      summary: this.optionalString(result.summary) ?? fallback.summary,
+      objectives: this.ensureStringArray(
+        result.objectives,
+        fallback.objectives,
+      ),
+      responsibilities: this.ensureStringArray(
+        result.responsibilities,
+        dto.standardExpectations,
+      ),
+      requiredInputs: this.ensureStringArray(
+        result.requiredInputs,
+        fallback.requiredInputs,
+      ),
+      expectedDeliverables: this.ensureStringArray(
+        result.expectedDeliverables,
+        fallback.expectedDeliverables,
+      ),
+      acceptanceCriteria: this.ensureStringArray(
+        result.acceptanceCriteria,
+        fallback.acceptanceCriteria,
+      ),
+      handoffChecklist: this.ensureStringArray(
+        result.handoffChecklist,
+        fallback.handoffChecklist,
+      ),
+      collaborationNotes:
+        this.optionalString(result.collaborationNotes) ??
+        fallback.collaborationNotes,
+      suggestedQuestions: this.ensureStringArray(
+        result.suggestedQuestions,
+        fallback.suggestedQuestions,
+      ),
+      constraints: this.ensureStringArray(
+        result.constraints,
+        fallback.constraints,
+      ),
+      source,
+    };
+  }
+
+  private getBasicRoleBriefStrings(dto: GenerateRoleBriefDto) {
+    const projectTitle =
+      this.optionalString(dto.project.title) ?? 'this project';
+    const role = this.roleLabel(dto.roleKey);
+
+    return {
+      summary: `${role} assignment for ${projectTitle}. Use the confirmed requirements to produce a project-specific planning deliverable for the Scrum Master and implementation team.`,
+      objectives: [
+        `Create a ${role.toLowerCase()} deliverable tailored to ${projectTitle}.`,
+        'Make decisions clear, explain trade-offs, and separate unknowns from confirmed scope.',
+      ],
+      requiredInputs: [
+        'Confirmed project brief',
+        'Project description, budget, deadline, platforms, and customer preferences',
+      ],
+      expectedDeliverables:
+        dto.roleKey === 'ui_ux'
+          ? [
+              'User flows',
+              'Wireframes or screen structure',
+              'Design system notes',
+            ]
+          : ['Architecture overview', 'Technical stack', 'Data/API notes'],
+      acceptanceCriteria: [
+        'Specific to the project',
+        'Clear enough for admin review',
+        'Ready for Scrum Master planning',
+      ],
+      handoffChecklist: ['Confirmed decisions', 'Open questions', 'Risks'],
+      collaborationNotes:
+        'Ask focused clarifying questions when something is ambiguous.',
+      suggestedQuestions: ['What should be clarified before final handoff?'],
+      constraints: [],
+    };
+  }
+
+  private buildFallbackRoleBriefSummary(dto: GenerateRoleBriefDto) {
+    const projectTitle =
+      this.optionalString(dto.project.title) ?? 'this project';
+    const projectDescription = this.optionalString(dto.project.description);
+    const briefSummary =
+      this.optionalString(dto.brief?.summary) ??
+      this.optionalString(dto.brief?.briefText);
+    const domain =
+      this.optionalString(dto.brief?.businessDomain) ??
+      this.optionalString(dto.brief?.domain);
+
+    return [
+      `${this.roleLabel(dto.roleKey)} assignment for ${projectTitle}.`,
+      domain ? `Domain: ${domain}.` : null,
+      projectDescription ? `Project context: ${projectDescription}.` : null,
+      briefSummary ? `Confirmed brief: ${briefSummary}.` : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  private roleLabel(roleKey: string) {
+    if (roleKey === 'ui_ux' || roleKey === 'uiux') return 'UI/UX';
+    if (roleKey === 'architect' || roleKey === 'architecture') {
+      return 'Architecture';
+    }
+    return roleKey.replace(/_/g, ' ');
+  }
+
+  private ensureStringArray(value: unknown, fallback: string[]): string[] {
+    const strings = this.toStringArray(value);
+    return strings.length ? strings : fallback;
+  }
+
+  private normalizeProjectPlanMilestones(
+    value: unknown,
+  ): ProjectPlanMilestone[] {
+    return this.toRecordArray(value).map((item, index) => {
+      const key =
+        this.optionalString(item.key) ??
+        this.optionalString(item.clientKey) ??
+        `m${index + 1}`;
+      return {
+        key,
+        title: this.optionalString(item.title) ?? `Milestone ${index + 1}`,
+        description: this.optionalString(item.description) ?? undefined,
+        orderIndex: this.toNumber(item.orderIndex) ?? index + 1,
+        estimatedDays: this.toNumber(item.estimatedDays),
+        budgetAmount: this.toNumber(item.budgetAmount),
+        currency: this.optionalString(item.currency) ?? null,
+        acceptanceCriteria: this.toStringArray(item.acceptanceCriteria),
+      };
+    });
+  }
+
+  private normalizeProjectPlanTasks(
+    value: unknown,
+    dependencies: ProjectPlanDependency[],
+  ): ProjectPlanTask[] {
+    return this.toRecordArray(value).map((item, index) => {
+      const key =
+        this.optionalString(item.key) ??
+        this.optionalString(item.clientKey) ??
+        `t${index + 1}`;
+      const taskDeps = this.toStringArray(item.dependsOn);
+      const externalDeps = dependencies
+        .filter((dependency) => dependency.taskKey === key)
+        .map((dependency) => dependency.dependsOnKey);
+      const dependsOn = Array.from(new Set([...taskDeps, ...externalDeps]));
+
+      return {
+        key,
+        milestoneKey:
+          this.optionalString(item.milestoneKey) ??
+          this.optionalString(item.milestoneClientKey) ??
+          '',
+        title: this.optionalString(item.title) ?? `Task ${index + 1}`,
+        description: this.optionalString(item.description) ?? undefined,
+        priority: this.optionalString(item.priority) ?? 'medium',
+        roleKey: this.optionalString(item.roleKey) ?? undefined,
+        requiredSkills: this.toStringArray(item.requiredSkills),
+        estimatedHours: this.toNumber(item.estimatedHours),
+        orderIndex: this.toNumber(item.orderIndex) ?? index + 1,
+        acceptanceCriteria: this.toStringArray(item.acceptanceCriteria),
+        dependsOn,
+        status: this.optionalString(item.status) ?? 'todo',
+      };
+    });
+  }
+
+  private normalizeProjectPlanDependencies(
+    value: unknown,
+  ): ProjectPlanDependency[] {
+    const seen = new Set<string>();
+    const dependencies: ProjectPlanDependency[] = [];
+
+    for (const item of this.toRecordArray(value)) {
+      const taskKey =
+        this.optionalString(item.taskKey) ??
+        this.optionalString(item.taskClientKey);
+      const dependsOnKey =
+        this.optionalString(item.dependsOnKey) ??
+        this.optionalString(item.dependsOnTaskClientKey);
+      if (!taskKey || !dependsOnKey || taskKey === dependsOnKey) continue;
+
+      const type = this.allowedDependencyType(
+        this.optionalString(item.type) ??
+          this.optionalString(item.dependencyType) ??
+          'blocks',
+      );
+      const id = `${taskKey}:${dependsOnKey}:${type}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+
+      dependencies.push({
+        taskKey,
+        dependsOnKey,
+        type,
+        notes: this.optionalString(item.notes) ?? null,
+      });
+    }
+
+    return dependencies;
+  }
+
+  private normalizeProjectSpec(value: unknown): ProjectPlanSpec {
+    const spec = this.asRecord(value);
+    return {
+      architecture: this.asNullableRecord(spec.architecture),
+      designSystem: this.asNullableRecord(spec.designSystem),
+      apiContract: this.asNullableRecord(spec.apiContract),
+      dataModel: this.asNullableRecord(spec.dataModel),
+      conventions: this.asNullableRecord(spec.conventions),
+    };
+  }
+
+  private toStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => this.optionalString(item))
+        .filter((item): item is string => Boolean(item));
+    }
+    const single = this.optionalString(value);
+    return single ? [single] : [];
+  }
+
+  private toRecordArray(value: unknown): Record<string, unknown>[] {
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is Record<string, unknown> =>
+      this.isRecord(item),
+    );
+  }
+
+  private optionalString(value: unknown): string | null {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return this.isRecord(value) ? value : {};
+  }
+
+  private asNullableRecord(value: unknown): Record<string, unknown> | null {
+    const record = this.asRecord(value);
+    return Object.keys(record).length ? record : null;
+  }
+
+  private allowedDependencyType(value: string) {
+    return ['blocks', 'related', 'after'].includes(value) ? value : 'blocks';
   }
 
   private getMockProjectPlanResult(
@@ -531,6 +1130,10 @@ export class AiService {
       timeline: { totalWeeks: 4, milestones: milestones.length },
       milestones,
       tasks,
+      dependencies: this.normalizeProjectPlanDependencies([
+        { taskKey: 't2', dependsOnKey: 't1', type: 'blocks' },
+        { taskKey: 't3', dependsOnKey: 't2', type: 'blocks' },
+      ]),
       teamPlan: { backend: 1, frontend: 1 },
       riskRegister: [
         {
@@ -539,6 +1142,13 @@ export class AiService {
           mitigation: 'Lock scope to the materialized tasks.',
         },
       ],
+      projectSpec: {
+        architecture: { source: 'mock', style: 'modular monolith' },
+        designSystem: { source: 'mock' },
+        apiContract: { source: 'mock' },
+        dataModel: { source: 'mock' },
+        conventions: { source: 'mock' },
+      },
       source: 'local_mock',
     };
   }

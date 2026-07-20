@@ -117,4 +117,16 @@ export class FreelancerAssignmentsController {
     );
     return { status: 'success', data, total, page: pageNum, limit: limitNum };
   }
+
+  @Get(':projectId/assignment')
+  async projectAssignment(
+    @CurrentUser() user: JwtPayload,
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+  ) {
+    const data = await this.assignments.freelancerProjectAssignment(
+      user.sub,
+      projectId,
+    );
+    return { status: 'success', data };
+  }
 }

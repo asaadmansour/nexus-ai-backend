@@ -1,10 +1,12 @@
 import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { AiService } from './ai.service';
 import { BriefDto } from './dto/BriefDto';
+import { EstimateProjectQuoteDto } from './dto/EstimateProjectQuoteDto';
 import { ExtractCvDto } from './dto/ExtractCvDto';
 import { GenerateAssessmentDto } from './dto/GenerateAssessmentDto';
 import { GenerateEmbeddingDto } from './dto/GenerateEmbeddingDto';
 import { GradeAssessmentDto } from './dto/GradeAssessmentDto';
+import { GenerateRoleBriefDto } from './dto/GenerateRoleBriefDto';
 import { MatchFreelancersDto } from './dto/MatchFreelancersDto';
 import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 import { Roles } from 'src/common/decorators/roles.decorator';
@@ -44,6 +46,11 @@ export class AiController {
     return this.aiService.generateEmbedding(embeddingDto);
   }
 
+  @Post('estimate-project-quote')
+  estimateProjectQuote(@Body() quoteDto: EstimateProjectQuoteDto) {
+    return this.aiService.estimateProjectQuote(quoteDto);
+  }
+
   @Post('match-freelancers')
   matchFreelancers(@Body() matchDto: MatchFreelancersDto) {
     return this.aiService.matchFreelancers(matchDto);
@@ -52,5 +59,11 @@ export class AiController {
   @Post('generate-project-plan')
   generateProjectPlan(@Body() planDto: GenerateProjectPlanDto) {
     return this.aiService.generateProjectPlan(planDto);
+  }
+
+  @Post('generate-role-brief')
+  @Roles(UserRole.ADMIN)
+  generateRoleBrief(@Body() roleBriefDto: GenerateRoleBriefDto) {
+    return this.aiService.generateRoleBrief(roleBriefDto);
   }
 }

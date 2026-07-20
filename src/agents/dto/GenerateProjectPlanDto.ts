@@ -11,6 +11,10 @@ export class GenerateProjectPlanDto {
   @IsUUID()
   projectId?: string;
 
+  @IsOptional()
+  @IsString()
+  projectPlanJobId?: string;
+
   @IsObject()
   project!: Record<string, unknown>;
 
@@ -27,6 +31,10 @@ export class GenerateProjectPlanDto {
   @IsOptional()
   @IsArray()
   team?: Record<string, unknown>[];
+
+  @IsOptional()
+  @IsArray()
+  planningTeam?: Record<string, unknown>[];
 
   @IsOptional()
   @IsString()

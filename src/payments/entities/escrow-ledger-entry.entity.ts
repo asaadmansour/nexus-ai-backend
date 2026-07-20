@@ -9,8 +9,10 @@ import {
 } from 'typeorm';
 import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from '../../projects/entities/project-milestone.entity';
+import { ProjectSubmission } from '../../projects/entities/project-submission.entity';
 import { Project } from '../../projects/entities/project.entity';
 import { User } from '../../users/entities/user.entity';
+import { PaymentReleaseRequest } from './payment-release-request.entity';
 import { ProjectPayment } from './project-payment.entity';
 
 @Entity('escrow_ledger_entries')
@@ -48,6 +50,23 @@ export class EscrowLedgerEntry {
   @ManyToOne(() => ProjectMilestone, { nullable: true, onDelete: 'SET NULL' })
   @JoinColumn({ name: 'milestone_id' })
   milestone!: ProjectMilestone | null;
+
+  @Column({ name: 'approved_submission_id', type: 'uuid', nullable: true })
+  approvedSubmissionId!: string | null;
+
+  @ManyToOne(() => ProjectSubmission, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'approved_submission_id' })
+  approvedSubmission!: ProjectSubmission | null;
+
+  @Column({ name: 'release_request_id', type: 'uuid', nullable: true })
+  releaseRequestId!: string | null;
+
+  @ManyToOne(() => PaymentReleaseRequest, (request) => request.ledgerEntries, {
+    nullable: true,
+    onDelete: 'SET NULL',
+  })
+  @JoinColumn({ name: 'release_request_id' })
+  releaseRequest!: PaymentReleaseRequest | null;
 
   @Column({ name: 'freelancer_profile_id', type: 'uuid', nullable: true })
   freelancerProfileId!: string | null;

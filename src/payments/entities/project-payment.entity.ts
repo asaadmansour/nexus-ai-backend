@@ -13,6 +13,7 @@ import { ProjectMilestone } from '../../projects/entities/project-milestone.enti
 import { Project } from '../../projects/entities/project.entity';
 import { User } from '../../users/entities/user.entity';
 import { EscrowLedgerEntry } from './escrow-ledger-entry.entity';
+import { PaymentReleaseRequest } from './payment-release-request.entity';
 
 @Entity('project_payments')
 @Index('project_payments_project_status_idx', ['projectId', 'status'])
@@ -100,6 +101,9 @@ export class ProjectPayment {
 
   @OneToMany(() => EscrowLedgerEntry, (entry) => entry.payment)
   ledgerEntries?: EscrowLedgerEntry[];
+
+  @OneToMany(() => PaymentReleaseRequest, (request) => request.payment)
+  releaseRequests?: PaymentReleaseRequest[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

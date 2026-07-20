@@ -15,6 +15,7 @@ import { RolesGuard } from 'src/common/guards/roles.guards';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
+import { CreateFreelancerOnboardingLinkDto } from './dtos/create-freelancer-onboarding-link.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
 import { PaymentsService } from './payments.service';
 
@@ -31,14 +32,32 @@ export class PaymentsController {
 
   @Post('payments/freelancer/onboarding-link')
   @Roles(UserRole.FREELANCER)
-  createFreelancerOnboardingLink(@CurrentUser() user: JwtPayload) {
-    return this.paymentsService.createFreelancerOnboardingLink(user.sub);
+  createFreelancerOnboardingLink(
+    @CurrentUser() user: JwtPayload,
+    @Body() payload: CreateFreelancerOnboardingLinkDto,
+  ) {
+    return this.paymentsService.createFreelancerOnboardingLink(
+      user.sub,
+      payload,
+    );
+  }
+
+  @Post('payments/freelancer/dashboard-link')
+  @Roles(UserRole.FREELANCER)
+  createFreelancerDashboardLink(@CurrentUser() user: JwtPayload) {
+    return this.paymentsService.createFreelancerDashboardLink(user.sub);
   }
 
   @Get('payments/freelancer/account')
   @Roles(UserRole.FREELANCER)
   getFreelancerAccount(@CurrentUser() user: JwtPayload) {
     return this.paymentsService.getFreelancerAccount(user.sub);
+  }
+
+  @Get('payments/customer/projects')
+  @Roles(UserRole.CUSTOMER)
+  getCustomerPaymentProjects(@CurrentUser() user: JwtPayload) {
+    return this.paymentsService.getCustomerPaymentProjects(user.sub);
   }
 
   @Post('projects/:projectId/payments/escrow-intent')
@@ -51,8 +70,31 @@ export class PaymentsController {
     return this.paymentsService.createEscrowIntent(projectId, user.sub, payload);
   }
 
+  @Post('projects/:projectId/payments/checkout-session')
+  @Roles(UserRole.CUSTOMER)
+  createEscrowCheckoutSession(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+    @Body() payload: CreateEscrowIntentDto,
+  ) {
+    return this.paymentsService.createEscrowCheckoutSession(
+      projectId,
+      user.sub,
+      payload,
+    );
+  }
+
+  @Get('projects/:projectId/payments/summary')
+  @Roles(UserRole.CUSTOMER)
+  getProjectPaymentSummary(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.paymentsService.getProjectPaymentSummary(projectId, user);
+  }
+
   @Get('projects/:projectId/payments')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   getProjectPayments(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,

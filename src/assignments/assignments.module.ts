@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AgentsModule } from 'src/agents/agents.module';
 import { FreelancersModule } from 'src/freelancers/freelancers.module';
 import { MatchingModule } from 'src/matching/matching.module';
 import { NotificationsModule } from 'src/notifications/notifications.module';
@@ -12,6 +13,7 @@ import { RoleAssignmentsService } from './role-assignments.service';
 
 @Module({
   imports: [
+    AgentsModule,
     ProjectsModule,
     MatchingModule,
     FreelancersModule,

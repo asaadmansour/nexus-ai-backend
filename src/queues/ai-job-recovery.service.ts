@@ -3,6 +3,8 @@ import {
   ConflictException,
   Injectable,
   Logger,
+  Optional,
+  ServiceUnavailableException,
   NotFoundException,
   OnApplicationShutdown,
   OnModuleInit,
@@ -23,6 +25,7 @@ import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
   ProfileEmbeddingJobData,
+  ProjectPlanGenerationJobData,
 } from './queue.types';
 
 type RecoverableJobType = (typeof AI_JOB_TYPES)[keyof typeof AI_JOB_TYPES];
@@ -41,17 +44,30 @@ export class AiJobRecoveryService
   private scanRunning = false;
 
   constructor(
+    @Optional()
     @InjectQueue(QUEUES.CV_EXTRACTION)
-    private readonly cvExtractionQueue: Queue<CvExtractionJobData>,
+    private readonly cvExtractionQueue: Queue<CvExtractionJobData> | null,
+    @Optional()
     @InjectQueue(QUEUES.ASSESSMENT_GENERATION)
-    private readonly assessmentGenerationQueue: Queue<AssessmentGenerationJobData>,
+    private readonly assessmentGenerationQueue: Queue<AssessmentGenerationJobData> | null,
+    @Optional()
     @InjectQueue(QUEUES.PROFILE_EMBEDDING)
-    private readonly profileEmbeddingQueue: Queue<ProfileEmbeddingJobData>,
+    private readonly profileEmbeddingQueue: Queue<ProfileEmbeddingJobData> | null,
+    @Optional()
+    @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
+    private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
     @InjectRepository(AgentJob)
     private readonly agentJobRepository: Repository<AgentJob>,
   ) {}
 
   onModuleInit() {
+    if (!this.queuesAvailable()) {
+      this.logger.warn(
+        'AI job recovery is disabled because queues are disabled.',
+      );
+      return;
+    }
+
     this.startupTimer = setTimeout(() => {
       void this.recoverFailedJobs();
     }, AI_JOB_RECOVERY.STARTUP_DELAY_MS);
@@ -98,6 +114,10 @@ export class AiJobRecoveryService
   }
 
   async retryFailedJobNow(agentJobId: string) {
+    if (!this.queuesAvailable()) {
+      throw new ServiceUnavailableException('Queue system is disabled');
+    }
+
     const job = await this.agentJobRepository.findOne({
       where: { id: agentJobId },
     });
@@ -208,6 +228,15 @@ export class AiJobRecoveryService
     }
   }
 
+  private queuesAvailable() {
+    return Boolean(
+      this.cvExtractionQueue &&
+      this.assessmentGenerationQueue &&
+      this.profileEmbeddingQueue &&
+      this.projectPlanGenerationQueue,
+    );
+  }
+
   private toQueuePayload(job: AgentJob): {
     queueName: string;
     add: (queueJobId: string) => Promise<unknown>;
@@ -231,7 +260,7 @@ export class AiJobRecoveryService
         return {
           queueName: QUEUES.CV_EXTRACTION,
           add: (queueJobId) =>
-            this.cvExtractionQueue.add(JOBS.EXTRACT_CV, data, {
+            this.cvExtractionQueue!.add(JOBS.EXTRACT_CV, data, {
               ...AI_QUEUE_JOB_OPTIONS,
               jobId: queueJobId,
             }),
@@ -259,10 +288,14 @@ export class AiJobRecoveryService
         return {
           queueName: QUEUES.ASSESSMENT_GENERATION,
           add: (queueJobId) =>
-            this.assessmentGenerationQueue.add(JOBS.GENERATE_ASSESSMENT, data, {
-              ...AI_QUEUE_JOB_OPTIONS,
-              jobId: queueJobId,
-            }),
+            this.assessmentGenerationQueue!.add(
+              JOBS.GENERATE_ASSESSMENT,
+              data,
+              {
+                ...AI_QUEUE_JOB_OPTIONS,
+                jobId: queueJobId,
+              },
+            ),
         };
       }
       case AI_JOB_TYPES.PROFILE_EMBEDDING: {
@@ -286,8 +319,45 @@ export class AiJobRecoveryService
         return {
           queueName: QUEUES.PROFILE_EMBEDDING,
           add: (queueJobId) =>
-            this.profileEmbeddingQueue.add(
+            this.profileEmbeddingQueue!.add(
               JOBS.GENERATE_PROFILE_EMBEDDING,
+              data,
+              {
+                ...AI_QUEUE_JOB_OPTIONS,
+                jobId: queueJobId,
+              },
+            ),
+        };
+      }
+      case AI_JOB_TYPES.PROJECT_PLAN_GENERATION: {
+        const input = this.asRecord(job.input);
+        const architectureSubmissionId = input.architectureSubmissionId ?? null;
+        const uiuxSubmissionId = input.uiuxSubmissionId ?? null;
+        const requestedBy = input.requestedBy ?? null;
+        const notes = input.notes ?? null;
+        if (
+          !this.isString(input.projectId) ||
+          (architectureSubmissionId !== null &&
+            !this.isString(architectureSubmissionId)) ||
+          (uiuxSubmissionId !== null && !this.isString(uiuxSubmissionId)) ||
+          (requestedBy !== null && !this.isString(requestedBy)) ||
+          (notes !== null && !this.isString(notes))
+        ) {
+          return null;
+        }
+        const data: ProjectPlanGenerationJobData = {
+          agentJobId: job.id,
+          projectId: input.projectId,
+          architectureSubmissionId,
+          uiuxSubmissionId,
+          requestedBy,
+          notes,
+        };
+        return {
+          queueName: QUEUES.PROJECT_PLAN_GENERATION,
+          add: (queueJobId) =>
+            this.projectPlanGenerationQueue!.add(
+              JOBS.GENERATE_PROJECT_PLAN,
               data,
               {
                 ...AI_QUEUE_JOB_OPTIONS,

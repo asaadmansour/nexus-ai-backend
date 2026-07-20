@@ -94,6 +94,9 @@ export class ProjectPlan {
   @Column({ type: 'jsonb', nullable: true })
   dependencies!: Record<string, unknown> | null;
 
+  @Column({ name: 'project_spec', type: 'jsonb', nullable: true })
+  projectSpec!: Record<string, unknown> | null;
+
   @Column({ name: 'team_plan', type: 'jsonb', nullable: true })
   teamPlan!: Record<string, unknown> | null;
 

@@ -1,4 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import {
+  Injectable,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
@@ -15,17 +19,24 @@ import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
   ProfileEmbeddingJobData,
+  ProjectPlanGenerationJobData,
 } from './queue.types';
 
 @Injectable()
 export class AiJobsProducer {
   constructor(
+    @Optional()
     @InjectQueue(QUEUES.CV_EXTRACTION)
-    private readonly cvExtractionQueue: Queue<CvExtractionJobData>,
+    private readonly cvExtractionQueue: Queue<CvExtractionJobData> | null,
+    @Optional()
     @InjectQueue(QUEUES.ASSESSMENT_GENERATION)
-    private readonly assessmentGenerationQueue: Queue<AssessmentGenerationJobData>,
+    private readonly assessmentGenerationQueue: Queue<AssessmentGenerationJobData> | null,
+    @Optional()
     @InjectQueue(QUEUES.PROFILE_EMBEDDING)
-    private readonly profileEmbeddingQueue: Queue<ProfileEmbeddingJobData>,
+    private readonly profileEmbeddingQueue: Queue<ProfileEmbeddingJobData> | null,
+    @Optional()
+    @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
+    private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
     @InjectRepository(AgentJob)
     private readonly agentJobRepository: Repository<AgentJob>,
   ) {}
@@ -53,7 +64,7 @@ export class AiJobsProducer {
     );
 
     try {
-      await this.cvExtractionQueue.add(
+      await this.getQueue(this.cvExtractionQueue, QUEUES.CV_EXTRACTION).add(
         JOBS.EXTRACT_CV,
         {
           agentJobId: agentJob.id,
@@ -100,7 +111,10 @@ export class AiJobsProducer {
     );
 
     try {
-      await this.assessmentGenerationQueue.add(
+      await this.getQueue(
+        this.assessmentGenerationQueue,
+        QUEUES.ASSESSMENT_GENERATION,
+      ).add(
         JOBS.GENERATE_ASSESSMENT,
         {
           agentJobId: agentJob.id,
@@ -148,7 +162,10 @@ export class AiJobsProducer {
     );
 
     try {
-      await this.profileEmbeddingQueue.add(
+      await this.getQueue(
+        this.profileEmbeddingQueue,
+        QUEUES.PROFILE_EMBEDDING,
+      ).add(
         JOBS.GENERATE_PROFILE_EMBEDDING,
         {
           agentJobId: agentJob.id,
@@ -167,6 +184,67 @@ export class AiJobsProducer {
       await this.markQueueAddFailed(agentJob, error);
       throw error;
     }
+  }
+
+  async emitProjectPlanGenerationRequested(input: {
+    projectId: string;
+    architectureSubmissionId?: string | null;
+    uiuxSubmissionId?: string | null;
+    requestedBy?: string | null;
+    notes?: string | null;
+  }) {
+    const agentJob = await this.agentJobRepository.save(
+      this.agentJobRepository.create({
+        agentName: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+        jobType: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+        projectId: input.projectId,
+        status: 'queued',
+        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+        queueName: QUEUES.PROJECT_PLAN_GENERATION,
+        input: {
+          projectId: input.projectId,
+          architectureSubmissionId: input.architectureSubmissionId ?? null,
+          uiuxSubmissionId: input.uiuxSubmissionId ?? null,
+          requestedBy: input.requestedBy ?? null,
+          notes: input.notes ?? null,
+        },
+      }),
+    );
+
+    try {
+      await this.getQueue(
+        this.projectPlanGenerationQueue,
+        QUEUES.PROJECT_PLAN_GENERATION,
+      ).add(
+        JOBS.GENERATE_PROJECT_PLAN,
+        {
+          agentJobId: agentJob.id,
+          projectId: input.projectId,
+          architectureSubmissionId: input.architectureSubmissionId ?? null,
+          uiuxSubmissionId: input.uiuxSubmissionId ?? null,
+          requestedBy: input.requestedBy ?? null,
+          notes: input.notes ?? null,
+        },
+        { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
+      );
+
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
+      return agentJob;
+    } catch (error) {
+      await this.markQueueAddFailed(agentJob, error);
+      throw error;
+    }
+  }
+
+  private getQueue<T>(queue: Queue<T> | null, queueName: string): Queue<T> {
+    if (!queue) {
+      throw new ServiceUnavailableException(
+        `Queue system is disabled; cannot enqueue ${queueName}`,
+      );
+    }
+
+    return queue;
   }
 
   private async markQueueAddFailed(agentJob: AgentJob, error: unknown) {

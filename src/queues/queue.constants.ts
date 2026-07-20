@@ -3,6 +3,7 @@ export const QUEUES = {
   ASSESSMENT_GENERATION: 'assessment-generation',
   ASSESSMENT_GRADING: 'assessment-grading',
   PROFILE_EMBEDDING: 'profile-embedding',
+  PROJECT_PLAN_GENERATION: 'project-plan-generation',
 } as const;
 
 export const JOBS = {
@@ -10,12 +11,14 @@ export const JOBS = {
   GENERATE_ASSESSMENT: 'generate-assessment',
   GRADE_ASSESSMENT: 'grade-assessment',
   GENERATE_PROFILE_EMBEDDING: 'generate-profile-embedding',
+  GENERATE_PROJECT_PLAN: 'generate-project-plan',
 } as const;
 
 export const AI_JOB_TYPES = {
   CV_EXTRACTION: 'cv_extraction',
   ASSESSMENT_GENERATION: 'assessment_generation',
   PROFILE_EMBEDDING: 'profile_embedding',
+  PROJECT_PLAN_GENERATION: 'project_plan_generation',
 } as const;
 
 export const AI_JOB_RETRY = {

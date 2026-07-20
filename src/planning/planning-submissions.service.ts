@@ -16,6 +16,7 @@ import { ProjectStatusHistory } from 'src/projects/entities/project-status-histo
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { CreatePlanningSubmissionDto } from './dtos/create-planning-submission.dto';
 import { ReviewPlanningSubmissionDto } from './dtos/review-planning-submission.dto';
+import { ProjectPlansService } from './project-plans.service';
 
 interface Requester {
   userId: string;
@@ -39,6 +40,7 @@ export class PlanningSubmissionsService {
     @InjectRepository(FreelancerProfile)
     private readonly profileRepo: Repository<FreelancerProfile>,
     private readonly notificationsService: NotificationsService,
+    private readonly projectPlansService: ProjectPlansService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -146,11 +148,11 @@ export class PlanningSubmissionsService {
       .createQueryBuilder('s')
       .leftJoinAndSelect('s.freelancerProfile', 'p')
       .leftJoinAndSelect('p.user', 'u')
-      .where('s.project_id = :projectId', { projectId })
-      .orderBy('s.created_at', 'DESC');
+      .where('s.projectId = :projectId', { projectId })
+      .orderBy('s.createdAt', 'DESC');
 
     if (query.submissionType) {
-      qb.andWhere('s.submission_type = :type', { type: query.submissionType });
+      qb.andWhere('s.submissionType = :type', { type: query.submissionType });
     }
     if (query.status) {
       qb.andWhere('s.status = :status', { status: query.status });
@@ -160,7 +162,7 @@ export class PlanningSubmissionsService {
     }
     if (requester.role === UserRole.FREELANCER) {
       const profile = await this.getProfileByUser(requester.userId);
-      qb.andWhere('s.freelancer_profile_id = :profileId', {
+      qb.andWhere('s.freelancerProfileId = :profileId', {
         profileId: profile?.id ?? null,
       });
     }
@@ -258,12 +260,20 @@ export class PlanningSubmissionsService {
       });
     }
 
+    const planGenerationJob = result.planUnlocked
+      ? await this.enqueuePlanGenerationSafely(
+          result.submission.projectId,
+          adminUserId,
+        )
+      : null;
+
     return {
       id: result.submission.id,
       status: result.submission.status,
       reviewedBy: result.submission.reviewedBy,
       reviewedAt: result.submission.reviewedAt,
       planGenerationUnlocked: result.planUnlocked,
+      planGenerationJob,
     };
   }
 
@@ -314,6 +324,24 @@ export class PlanningSubmissionsService {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private async enqueuePlanGenerationSafely(
+    projectId: string,
+    adminUserId: string,
+  ) {
+    try {
+      return await this.projectPlansService.enqueueAutomaticGeneration(
+        projectId,
+        adminUserId,
+      );
+    } catch (error) {
+      return {
+        queued: false,
+        reason: 'queue_failed',
+        error: this.getErrorMessage(error),
+      };
+    }
+  }
 
   /** Returns true when both latest architecture and UI/UX submissions are approved. */
   private async maybeUnlockPlanGeneration(
@@ -390,6 +418,11 @@ export class PlanningSubmissionsService {
     ) {
       throw new ForbiddenException('You can only access your own project');
     }
+  }
+
+
+  private getErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error);
   }
 
   private async getProject(projectId: string) {

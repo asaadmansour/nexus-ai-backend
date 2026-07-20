@@ -21,3 +21,12 @@ export interface ProfileEmbeddingJobData {
   assessmentId?: string | null;
   reason: string;
 }
+
+export interface ProjectPlanGenerationJobData {
+  agentJobId: string;
+  projectId: string;
+  architectureSubmissionId?: string | null;
+  uiuxSubmissionId?: string | null;
+  requestedBy?: string | null;
+  notes?: string | null;
+}

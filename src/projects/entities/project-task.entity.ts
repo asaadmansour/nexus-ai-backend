@@ -13,6 +13,7 @@ import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile
 import { ProjectMilestone } from './project-milestone.entity';
 import { ProjectPlan } from './project-plan.entity';
 import { ProjectRoleAssignment } from './project-role-assignment.entity';
+import { ProjectSubmission } from './project-submission.entity';
 import { ProjectTaskDependency } from './project-task-dependency.entity';
 import { Project } from './project.entity';
 
@@ -135,6 +136,9 @@ export class ProjectTask {
     (dependency) => dependency.dependsOnTask,
   )
   dependents?: ProjectTaskDependency[];
+
+  @OneToMany(() => ProjectSubmission, (submission) => submission.task)
+  submissions?: ProjectSubmission[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

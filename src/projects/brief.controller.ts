@@ -25,7 +25,7 @@ export class BriefController {
   constructor(private readonly briefService: BriefService) {}
 
   @Get()
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   getBrief(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
@@ -33,12 +33,12 @@ export class BriefController {
     return this.briefService.getBrief(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
     );
   }
 
   @Get('messages')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   getMessages(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
@@ -46,12 +46,12 @@ export class BriefController {
     return this.briefService.getMessages(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
     );
   }
 
   @Post('messages')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   sendMessage(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() dto: CreateBriefMessageDto,
@@ -60,13 +60,13 @@ export class BriefController {
     return this.briefService.sendCustomerMessage(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
       dto,
     );
   }
 
   @Patch()
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   updateBrief(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() dto: UpdateBriefDto,
@@ -75,13 +75,13 @@ export class BriefController {
     return this.briefService.updateBrief(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
       dto,
     );
   }
 
   @Post('reopen')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   reopenAiHelp(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
@@ -89,12 +89,12 @@ export class BriefController {
     return this.briefService.reopenAiHelp(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
     );
   }
 
   @Post('confirm')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.CUSTOMER)
   confirmBrief(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
@@ -102,7 +102,7 @@ export class BriefController {
     return this.briefService.confirmBrief(
       projectId,
       user.sub,
-      user.role === UserRole.ADMIN,
+      false,
     );
   }
 }
