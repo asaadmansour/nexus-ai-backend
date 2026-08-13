@@ -9,9 +9,19 @@ import {
   Min,
   Max,
   ArrayMaxSize,
+  Matches,
 } from 'class-validator';
 
 export class UpdateFreelancerDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  @Matches(/^(?!.*--)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, {
+    message:
+      'githubUsername may contain only letters, numbers, and single hyphens, with no leading or trailing hyphen',
+  })
+  githubUsername?: string;
+
   @IsOptional()
   @IsString()
   @MaxLength(255)

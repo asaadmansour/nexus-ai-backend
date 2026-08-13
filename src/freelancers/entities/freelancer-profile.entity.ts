@@ -19,6 +19,9 @@ import { FreelancerSkillScore } from './freelancer-skill-score.entity';
   unique: true,
   where: '"stripe_account_id" IS NOT NULL',
 })
+@Index('freelancer_profiles_github_username_idx', ['githubUsername'], {
+  where: '"github_username" IS NOT NULL',
+})
 export class FreelancerProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -133,6 +136,14 @@ export class FreelancerProfile {
 
   @Column({ type: 'jsonb', nullable: true })
   summary: Record<string, unknown> | null;
+
+  @Column({
+    name: 'github_username',
+    type: 'varchar',
+    length: 120,
+    nullable: true,
+  })
+  githubUsername: string | null;
 
   @Column({
     name: 'hourly_rate',

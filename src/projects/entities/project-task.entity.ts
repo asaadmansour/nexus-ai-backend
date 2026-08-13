@@ -10,6 +10,9 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile.entity';
+import { MatchingCandidate } from '../../matching/entities/matching-candidate.entity';
+import { MatchingRun } from '../../matching/entities/matching-run.entity';
+import { User } from '../../users/entities/user.entity';
 import { ProjectMilestone } from './project-milestone.entity';
 import { ProjectPlan } from './project-plan.entity';
 import { ProjectRoleAssignment } from './project-role-assignment.entity';
@@ -29,6 +32,12 @@ import { Project } from './project.entity';
     where: '"assigned_freelancer_profile_id" IS NOT NULL',
   },
 )
+@Index('project_tasks_source_matching_run_idx', ['sourceMatchingRunId'], {
+  where: '"source_matching_run_id" IS NOT NULL',
+})
+@Index('project_tasks_assigned_at_idx', ['projectId', 'assignedAt'], {
+  where: '"assigned_at" IS NOT NULL',
+})
 export class ProjectTask {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -80,6 +89,30 @@ export class ProjectTask {
   @ManyToOne(() => FreelancerProfile, { nullable: true, onDelete: 'SET NULL' })
   @JoinColumn({ name: 'assigned_freelancer_profile_id' })
   assignedFreelancerProfile!: FreelancerProfile | null;
+
+  @Column({ name: 'source_matching_run_id', type: 'uuid', nullable: true })
+  sourceMatchingRunId!: string | null;
+
+  @ManyToOne(() => MatchingRun, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'source_matching_run_id' })
+  sourceMatchingRun!: MatchingRun | null;
+
+  @Column({ name: 'source_candidate_id', type: 'uuid', nullable: true })
+  sourceCandidateId!: string | null;
+
+  @ManyToOne(() => MatchingCandidate, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'source_candidate_id' })
+  sourceCandidate!: MatchingCandidate | null;
+
+  @Column({ name: 'assigned_by', type: 'uuid', nullable: true })
+  assignedBy!: string | null;
+
+  @ManyToOne(() => User, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'assigned_by' })
+  assignedByUser!: User | null;
+
+  @Column({ name: 'assigned_at', type: 'timestamptz', nullable: true })
+  assignedAt!: Date | null;
 
   @Column({ type: 'varchar', length: 255 })
   title!: string;

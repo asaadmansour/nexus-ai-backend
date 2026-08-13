@@ -22,6 +22,11 @@ import { Project } from './project.entity';
 @Index('evaluation_runs_task_status_idx', ['taskId', 'status'], {
   where: '"task_id" IS NOT NULL',
 })
+@Index('evaluation_runs_submission_active_uidx', ['submissionId'], {
+  unique: true,
+  where:
+    "\"submission_id\" IS NOT NULL AND \"status\" IN ('queued', 'running', 'completed')",
+})
 export class EvaluationRun {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

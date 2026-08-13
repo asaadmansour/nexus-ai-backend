@@ -605,16 +605,16 @@ export class ProjectPlansService {
       });
       if (project) {
         const oldStatus = project.status;
-        const quote = this.buildProjectQuote(
-          project,
-          quotedAmount,
-          quotedCurrency,
-        );
-        project.quotedAmount = quote.amount;
-        project.quotedCurrency = quote.currency;
-        project.quoteStatus = quote.status;
-        project.quoteGeneratedAt = quote.generatedAt;
-        project.quoteNotes = quote.notes;
+        const quote = this.shouldBackfillPlanQuote(project)
+          ? this.buildProjectQuote(project, quotedAmount, quotedCurrency)
+          : null;
+        if (quote) {
+          project.quotedAmount = quote.amount;
+          project.quotedCurrency = quote.currency;
+          project.quoteStatus = quote.status;
+          project.quoteGeneratedAt = quote.generatedAt;
+          project.quoteNotes = quote.notes;
+        }
         project.status = ProjectStatus.IMPLEMENTATION_READY;
         project.planningStatus = 'completed';
         project.planningCompletedAt = project.planningCompletedAt ?? new Date();
@@ -985,8 +985,16 @@ export class ProjectPlansService {
       generatedAt: new Date(),
       notes: isOutOfBudget
         ? `The final estimate is ${amount} ${currency}, which is above the customer's maximum budget of ${project.budgetMax} ${project.currency}. Ask the customer to revise the budget range before payment.`
-        : 'Final estimate generated from the approved Scrum Master milestone plan.',
+        : 'Legacy estimate backfilled from the approved Scrum Master milestone plan.',
     };
+  }
+
+  private shouldBackfillPlanQuote(project: Project) {
+    if (Number(project.heldAmount ?? 0) > 0) return false;
+    if (project.quoteStatus && project.quoteStatus !== 'not_ready') {
+      return false;
+    }
+    return !project.quotedAmount;
   }
 
   private async nextPlanVersion(manager: EntityManager, projectId: string) {

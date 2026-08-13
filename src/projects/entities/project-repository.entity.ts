@@ -16,6 +16,10 @@ import { Project } from './project.entity';
 
 @Entity('project_repositories')
 @Index('project_repositories_project_status_idx', ['projectId', 'status'])
+@Index('project_repositories_project_non_archived_uidx', ['projectId'], {
+  unique: true,
+  where: '"status" <> \'archived\'',
+})
 @Index(
   'project_repositories_provider_owner_repo_uidx',
   ['provider', 'owner', 'repoName'],

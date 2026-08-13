@@ -82,6 +82,8 @@ export class FreelancersService {
 
     const previousStatus = profile.verificationStatus ?? null;
 
+    if (dto.githubUsername !== undefined)
+      profile.githubUsername = dto.githubUsername;
     if (dto.headline !== undefined) profile.headline = dto.headline;
     if (dto.bio !== undefined) profile.bio = dto.bio;
     if (dto.skills !== undefined) profile.skills = dto.skills;

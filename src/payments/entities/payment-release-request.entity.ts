@@ -36,6 +36,15 @@ import { ProjectPayment } from './project-payment.entity';
       '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL AND "status" IN (\'pending\', \'approved\')',
   },
 )
+@Index(
+  'payment_release_requests_pending_submission_uidx',
+  ['submissionId', 'freelancerProfileId'],
+  {
+    unique: true,
+    where:
+      '"submission_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL AND "status" IN (\'pending\', \'approved\')',
+  },
+)
 export class PaymentReleaseRequest {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
