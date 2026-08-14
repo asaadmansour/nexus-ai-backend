@@ -18,6 +18,7 @@ import { MatchingModule } from './matching/matching.module';
 import { AssignmentsModule } from './assignments/assignments.module';
 import { PlanningModule } from './planning/planning.module';
 import { PaymentsModule } from './payments/payments.module';
+import { RepositoriesModule } from './repositories/repositories.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { PaymentsModule } from './payments/payments.module';
     AssignmentsModule,
     PlanningModule,
     PaymentsModule,
+    RepositoriesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -353,10 +353,13 @@ export class AiService {
       '/agents/match-freelancers',
       {
         matchingRunId: dto.matchingRunId,
+        targetType: dto.targetType,
         targetRoleKey: dto.targetRoleKey,
+        targetTaskId: dto.targetTaskId,
         limit: dto.limit,
         project: dto.project,
         brief: dto.brief,
+        task: dto.task,
         candidates: dto.candidates,
       },
       'match-freelancers',
@@ -465,6 +468,13 @@ export class AiService {
   }
 
   private getRoleRequiredSkills(dto: MatchFreelancersDto): string[] {
+    const taskSkills = Array.isArray(dto.task?.requiredSkills)
+      ? (dto.task.requiredSkills as unknown[]).filter(
+          (skill): skill is string => typeof skill === 'string',
+        )
+      : [];
+    if (taskSkills.length > 0) return taskSkills;
+
     const filterSkills = Array.isArray(dto.project?.requiredSkills)
       ? (dto.project.requiredSkills as unknown[]).filter(
           (skill): skill is string => typeof skill === 'string',

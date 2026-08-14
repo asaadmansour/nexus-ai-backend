@@ -9,6 +9,7 @@ import { MatchingRun } from './entities/matching-run.entity';
 import {
   MatchingController,
   ProjectMatchingController,
+  ProjectTaskAssignmentController,
 } from './matching.controller';
 import { AdminMatchingController } from './admin-matching.controller';
 import { MatchingService } from './matching.service';
@@ -24,6 +25,7 @@ import { MatchingService } from './matching.service';
   controllers: [
     ProjectMatchingController,
     MatchingController,
+    ProjectTaskAssignmentController,
     AdminMatchingController,
   ],
   providers: [MatchingService],

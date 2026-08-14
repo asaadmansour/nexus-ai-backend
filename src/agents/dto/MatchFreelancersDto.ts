@@ -57,6 +57,14 @@ export class MatchCandidateInputDto {
   @IsOptional()
   @IsNumber()
   embeddingSimilarity?: number | null;
+
+  @IsOptional()
+  @IsInt()
+  activeTaskCount?: number | null;
+
+  @IsOptional()
+  @IsInt()
+  activeProjectCount?: number | null;
 }
 
 export class MatchFreelancersDto {
@@ -64,8 +72,18 @@ export class MatchFreelancersDto {
   @IsUUID()
   matchingRunId?: string;
 
-  @IsIn(['architect', 'ui_ux'])
+  @IsOptional()
+  @IsIn(['planning_role', 'task'])
+  targetType?: 'planning_role' | 'task';
+
+  // Planning roles are 'architect' / 'ui_ux'; implementation tasks use the task
+  // role key ('frontend', 'backend', ...), so this is a free-form string.
+  @IsString()
   targetRoleKey!: string;
+
+  @IsOptional()
+  @IsUUID()
+  targetTaskId?: string;
 
   @IsOptional()
   @IsInt()
@@ -79,6 +97,10 @@ export class MatchFreelancersDto {
   @IsOptional()
   @IsObject()
   brief?: Record<string, unknown> | null;
+
+  @IsOptional()
+  @IsObject()
+  task?: Record<string, unknown> | null;
 
   @IsArray()
   @ValidateNested({ each: true })

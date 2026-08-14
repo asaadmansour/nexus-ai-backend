@@ -17,6 +17,8 @@ import { UserRole } from 'src/common/enums/user-role.enum';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { MatchingService } from './matching.service';
+import { AssignTaskDto } from './dtos/assign-task.dto';
+import { StartImplementationMatchingDto } from './dtos/start-implementation-matching.dto';
 import { StartPlanningMatchingDto } from './dtos/start-planning-matching.dto';
 import { UpdateCandidateStatusDto } from './dtos/update-candidate-status.dto';
 import { ReviewRunDto } from './dtos/review-run.dto';
@@ -41,11 +43,27 @@ export class ProjectMatchingController {
     return { status: 'success', data };
   }
 
+  @Post('implementation-tasks')
+  async startImplementationTasks(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() dto: StartImplementationMatchingDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const data = await this.matchingService.startImplementationTasks(
+      projectId,
+      dto,
+      user.sub,
+    );
+    return { status: 'success', data };
+  }
+
   @Get('runs')
   async listRuns(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Query('status') status?: string,
     @Query('targetRoleKey') targetRoleKey?: string,
+    @Query('targetType') targetType?: string,
+    @Query('targetTaskId') targetTaskId?: string,
     @Query('page') page = '1',
     @Query('limit') limit = '20',
   ) {
@@ -54,10 +72,29 @@ export class ProjectMatchingController {
     const { data, total } = await this.matchingService.listRuns(projectId, {
       status,
       targetRoleKey,
+      targetType,
+      targetTaskId,
       page: pageNum,
       limit: limitNum,
     });
     return { status: 'success', data, total, page: pageNum, limit: limitNum };
+  }
+}
+
+@Controller('project-tasks')
+@UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
+@Roles(UserRole.ADMIN)
+export class ProjectTaskAssignmentController {
+  constructor(private readonly matchingService: MatchingService) {}
+
+  @Post(':taskId/assignment')
+  async assignTask(
+    @Param('taskId', ParseUUIDPipe) taskId: string,
+    @Body() dto: AssignTaskDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const data = await this.matchingService.assignTask(taskId, dto, user.sub);
+    return { status: 'success', data };
   }
 }
 

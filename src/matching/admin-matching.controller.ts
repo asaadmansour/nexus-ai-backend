@@ -15,6 +15,7 @@ export class AdminMatchingController {
   @Get('runs')
   async runs(
     @Query('status') status?: string,
+    @Query('targetType') targetType?: string,
     @Query('page') page = '1',
     @Query('limit') limit = '20',
   ) {
@@ -22,6 +23,7 @@ export class AdminMatchingController {
     const limitNum = Math.max(1, Math.min(parseInt(limit, 10) || 20, 100));
     const { data, total } = await this.matchingService.adminListRuns({
       status,
+      targetType,
       page: pageNum,
       limit: limitNum,
     });

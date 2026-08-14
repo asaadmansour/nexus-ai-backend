@@ -7,8 +7,16 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  IsNull,
+  Not,
+  Repository,
+} from 'typeorm';
 import { AiService } from 'src/agents/ai.service';
+import type { MatchFreelancersResult } from 'src/agents/ai.service';
 import type { MatchCandidateInputDto } from 'src/agents/dto/MatchFreelancersDto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
@@ -16,10 +24,16 @@ import { Brief } from 'src/projects/entities/brief.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
+import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from './entities/matching-candidate.entity';
 import { MatchingRun } from './entities/matching-run.entity';
-import { StartPlanningMatchingDto } from './dtos/start-planning-matching.dto';
+import { AssignTaskDto } from './dtos/assign-task.dto';
+import { StartImplementationMatchingDto } from './dtos/start-implementation-matching.dto';
+import {
+  PlanningMatchingFiltersDto,
+  StartPlanningMatchingDto,
+} from './dtos/start-planning-matching.dto';
 import { UpdateCandidateStatusDto } from './dtos/update-candidate-status.dto';
 import { ReviewRunDto } from './dtos/review-run.dto';
 
@@ -69,6 +83,33 @@ const MATCH_START_ALLOWED_STATUSES = new Set<ProjectStatus>([
 ]);
 const ASSIGNMENT_ACTIVE_STATUSES = ['assigned', 'accepted', 'in_progress'];
 
+// --- Implementation-task matching -------------------------------------------
+
+// Implementation work takes the rest of the budget after planning. As with
+// planning, the lump sum is turned into an affordable hourly rate, here using
+// the total estimated hours of the project's implementation tasks.
+const IMPLEMENTATION_BUDGET_SHARE = 0.7;
+
+// A task can only be matched from these statuses (per the delivery contract).
+const MATCHABLE_TASK_STATUSES = ['todo', 'blocked', 'changes_requested'];
+
+// Tasks still counted as "someone's open work" for the workload signal.
+const ACTIVE_TASK_STATUSES = [
+  'todo',
+  'blocked',
+  'in_progress',
+  'review',
+  'changes_requested',
+];
+
+const IMPLEMENTATION_MATCH_ALLOWED_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.IMPLEMENTATION_READY,
+  ProjectStatus.MATCHING,
+  ProjectStatus.MATCHED,
+  ProjectStatus.ASSIGNED,
+  ProjectStatus.ACTIVE,
+]);
+
 @Injectable()
 export class MatchingService {
   private readonly logger = new Logger(MatchingService.name);
@@ -84,6 +125,8 @@ export class MatchingService {
     private readonly briefRepo: Repository<Brief>,
     @InjectRepository(FreelancerProfile)
     private readonly profileRepo: Repository<FreelancerProfile>,
+    @InjectRepository(ProjectTask)
+    private readonly taskRepo: Repository<ProjectTask>,
     private readonly aiService: AiService,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
@@ -101,14 +144,12 @@ export class MatchingService {
       const existingRuns = await this.runRepo.count({ where: { projectId } });
       if (existingRuns > 0) return;
 
-      const project = await this.projectRepo.findOne({ where: { id: projectId } });
+      const project = await this.projectRepo.findOne({
+        where: { id: projectId },
+      });
       if (!project || project.status !== ProjectStatus.BRIEF_COMPLETE) return;
 
-      await this.startPlanningRoles(
-        projectId,
-        {} as StartPlanningMatchingDto,
-        null,
-      );
+      await this.startPlanningRoles(projectId, {}, null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(
@@ -170,7 +211,6 @@ export class MatchingService {
       return created;
     });
 
-    const projectSnapshot = this.buildProjectSnapshot(project, dto);
     const briefSnapshot = this.buildBriefSnapshot(brief);
     const runResults: Record<string, unknown>[] = [];
 
@@ -182,38 +222,15 @@ export class MatchingService {
           : (PLANNING_ROLE_SKILLS[run.targetRoleKey!] ?? []);
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
+          targetType: 'planning_role',
           targetRoleKey: run.targetRoleKey!,
           limit,
-          project: { ...projectSnapshot, requiredSkills: roleSkills },
+          project: this.buildProjectSnapshot(project, roleSkills),
           brief: briefSnapshot,
           candidates,
         });
 
-        const candidateCount = await this.dataSource.transaction(
-          async (manager) => {
-            const rows = ai.candidates.map((candidate) =>
-              manager.create(MatchingCandidate, {
-                matchingRunId: run.id,
-                freelancerProfileId: candidate.freelancerProfileId,
-                rank: candidate.rank,
-                score: candidate.score.toFixed(2),
-                scoreBreakdown: candidate.scoreBreakdown,
-                rationale: candidate.rationale,
-                evidence: candidate.evidence,
-                status: 'recommended',
-              }),
-            );
-            if (rows.length) {
-              await manager.save(MatchingCandidate, rows);
-            }
-            run.status = 'completed';
-            run.completedAt = new Date();
-            run.summary = ai.summary;
-            await manager.save(MatchingRun, run);
-            return rows.length;
-          },
-        );
-
+        const candidateCount = await this.completeRun(run, ai);
         runResults.push({
           id: run.id,
           targetType: 'planning_role',
@@ -223,18 +240,13 @@ export class MatchingService {
           summary: ai.summary,
         });
       } catch (error) {
-        const message = this.errorMessage(error);
-        this.logger.error(`Matching run ${run.id} failed: ${message}`);
-        run.status = 'failed';
-        run.error = message;
-        await this.runRepo.save(run);
         runResults.push({
           id: run.id,
           targetType: 'planning_role',
           targetRoleKey: run.targetRoleKey,
           status: 'failed',
           candidateCount: 0,
-          error: message,
+          error: await this.failRun(run, error),
         });
       }
     }
@@ -247,6 +259,309 @@ export class MatchingService {
     };
   }
 
+  // Store the ranked candidates and mark the run completed.
+  private async completeRun(run: MatchingRun, ai: MatchFreelancersResult) {
+    return this.dataSource.transaction(async (manager) => {
+      const rows = ai.candidates.map((candidate) =>
+        manager.create(MatchingCandidate, {
+          matchingRunId: run.id,
+          freelancerProfileId: candidate.freelancerProfileId,
+          rank: candidate.rank,
+          score: candidate.score.toFixed(2),
+          scoreBreakdown: candidate.scoreBreakdown,
+          rationale: candidate.rationale,
+          evidence: candidate.evidence,
+          status: 'recommended',
+        }),
+      );
+      if (rows.length) {
+        await manager.save(MatchingCandidate, rows);
+      }
+      run.status = 'completed';
+      run.completedAt = new Date();
+      run.summary = ai.summary;
+      await manager.save(MatchingRun, run);
+      return rows.length;
+    });
+  }
+
+  // Persist the failure on the run so the admin UI can show and retry it.
+  private async failRun(run: MatchingRun, error: unknown) {
+    const message = this.errorMessage(error);
+    this.logger.error(`Matching run ${run.id} failed: ${message}`);
+    run.status = 'failed';
+    run.error = message;
+    await this.runRepo.save(run);
+    return message;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Start implementation-task matching
+  // ---------------------------------------------------------------------------
+
+  // One matching run per implementation task. Runs are created up front so the
+  // admin sees them immediately; the AI ranking then fills each one in turn.
+  async startImplementationTasks(
+    projectId: string,
+    dto: StartImplementationMatchingDto,
+    adminUserId: string,
+  ) {
+    const project = await this.getProject(projectId);
+    if (!IMPLEMENTATION_MATCH_ALLOWED_STATUSES.has(project.status)) {
+      throw new BadRequestException(
+        'Implementation matching can only start once the project plan is materialized',
+      );
+    }
+
+    const tasks = await this.resolveMatchableTasks(projectId, dto);
+    if (!tasks.length) {
+      throw new BadRequestException(
+        'No unassigned implementation tasks are available to match',
+      );
+    }
+
+    const brief = await this.briefRepo.findOne({ where: { projectId } });
+    const briefSnapshot = this.buildBriefSnapshot(brief);
+    const limit = dto.filters?.limit ?? DEFAULT_LIMIT;
+    const maxRate =
+      dto.filters?.maxHourlyRate ?? (await this.affordableTaskRate(project));
+
+    const runs = await this.dataSource.transaction(async (manager) => {
+      const created: MatchingRun[] = [];
+      for (const task of tasks) {
+        created.push(
+          await manager.save(
+            MatchingRun,
+            manager.create(MatchingRun, {
+              projectId,
+              targetType: 'task',
+              targetRoleKey: task.roleKey,
+              targetTaskId: task.id,
+              status: 'running',
+              requestedBy: adminUserId,
+              filters: dto.filters ? { ...dto.filters } : null,
+              inputSnapshot: {
+                taskTitle: task.title,
+                maxHourlyRate: maxRate,
+                filters: dto.filters ?? null,
+              },
+              startedAt: new Date(),
+            }),
+          ),
+        );
+      }
+      if (project.status !== ProjectStatus.MATCHING) {
+        await this.transitionProject(manager, project, adminUserId, {
+          status: ProjectStatus.MATCHING,
+          reason: 'Started implementation task matching.',
+        });
+      }
+      return created;
+    });
+
+    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    const runResults: Record<string, unknown>[] = [];
+
+    for (const run of runs) {
+      const task = tasksById.get(run.targetTaskId!)!;
+      try {
+        const skills = dto.filters?.skills?.length
+          ? dto.filters.skills
+          : (task.requiredSkills ?? []);
+        const candidates = await this.buildTaskCandidatePool(
+          task,
+          dto.filters,
+          maxRate,
+        );
+        const ai = await this.aiService.matchFreelancers({
+          matchingRunId: run.id,
+          targetType: 'task',
+          targetRoleKey: run.targetRoleKey ?? 'implementation',
+          targetTaskId: task.id,
+          limit,
+          project: this.buildProjectSnapshot(project, skills),
+          brief: briefSnapshot,
+          task: this.buildTaskSnapshot(task, skills),
+          candidates,
+        });
+
+        const candidateCount = await this.completeRun(run, ai);
+        runResults.push({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: task.id,
+          targetRoleKey: run.targetRoleKey,
+          taskTitle: task.title,
+          status: 'completed',
+          candidateCount,
+          summary: ai.summary,
+        });
+      } catch (error) {
+        runResults.push({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: task.id,
+          targetRoleKey: run.targetRoleKey,
+          taskTitle: task.title,
+          status: 'failed',
+          candidateCount: 0,
+          error: await this.failRun(run, error),
+        });
+      }
+    }
+
+    return {
+      projectId,
+      projectStatus: ProjectStatus.MATCHING,
+      runs: runResults,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Assign an implementation task
+  // ---------------------------------------------------------------------------
+
+  async assignTask(taskId: string, dto: AssignTaskDto, adminUserId: string) {
+    if (!dto.candidateId && !dto.freelancerProfileId) {
+      throw new BadRequestException(
+        'candidateId or freelancerProfileId is required',
+      );
+    }
+
+    const result = await this.dataSource.transaction(async (manager) => {
+      const task = await manager.findOne(ProjectTask, {
+        where: { id: taskId },
+      });
+      if (!task) throw new NotFoundException('Task not found');
+      if (task.assignedFreelancerProfileId) {
+        throw new ConflictException(
+          'This task already has an assigned freelancer',
+        );
+      }
+
+      // A candidate carries its own freelancer and matching run, so it wins.
+      let candidate: MatchingCandidate | null = null;
+      if (dto.candidateId) {
+        candidate = await manager.findOne(MatchingCandidate, {
+          where: { id: dto.candidateId },
+          relations: ['freelancerProfile'],
+        });
+        if (!candidate?.freelancerProfileId) {
+          throw new NotFoundException('Matching candidate not found');
+        }
+      }
+
+      const freelancerProfileId =
+        candidate?.freelancerProfileId ?? dto.freelancerProfileId!;
+      const profile =
+        candidate?.freelancerProfile ??
+        (await manager.findOne(FreelancerProfile, {
+          where: { id: freelancerProfileId },
+        }));
+      if (!profile) throw new NotFoundException('Freelancer profile not found');
+
+      task.assignedFreelancerProfileId = freelancerProfileId;
+      task.sourceMatchingRunId =
+        candidate?.matchingRunId ?? dto.sourceMatchingRunId ?? null;
+      task.sourceCandidateId = candidate?.id ?? null;
+      task.assignedBy = adminUserId;
+      task.assignedAt = new Date();
+      if (task.status !== 'in_progress') task.status = 'todo';
+      if (dto.notes) {
+        task.metadata = {
+          ...(task.metadata ?? {}),
+          assignmentNotes: dto.notes,
+        };
+      }
+      await manager.save(ProjectTask, task);
+
+      if (candidate) {
+        candidate.status = 'assigned';
+        candidate.selectedBy = adminUserId;
+        candidate.selectedAt = candidate.selectedAt ?? new Date();
+        await manager.save(MatchingCandidate, candidate);
+
+        const run = await manager.findOne(MatchingRun, {
+          where: { id: candidate.matchingRunId },
+        });
+        if (run) {
+          run.status = 'reviewed';
+          run.reviewedBy = adminUserId;
+          run.reviewedAt = new Date();
+          await manager.save(MatchingRun, run);
+        }
+      }
+
+      await this.advanceImplementationStatus(
+        manager,
+        task.projectId,
+        adminUserId,
+      );
+
+      return { task, notifyUserId: profile.userId ?? null };
+    });
+
+    if (result.notifyUserId) {
+      await this.notificationsService.createNotification({
+        userId: result.notifyUserId,
+        projectId: result.task.projectId,
+        title: 'New task assignment',
+        body: `You were assigned the task "${result.task.title}".`,
+      });
+    }
+
+    const { task } = result;
+    return {
+      id: task.id,
+      projectId: task.projectId,
+      milestoneId: task.milestoneId,
+      status: task.status,
+      assignedFreelancerProfileId: task.assignedFreelancerProfileId,
+      sourceMatchingRunId: task.sourceMatchingRunId,
+      sourceCandidateId: task.sourceCandidateId,
+      assignedBy: task.assignedBy,
+      assignedAt: task.assignedAt,
+    };
+  }
+
+  // `assigned` once every open task has an owner, otherwise `matched` while
+  // assignments are still being made.
+  private async advanceImplementationStatus(
+    manager: EntityManager,
+    projectId: string,
+    adminUserId: string,
+  ) {
+    const project = await manager.findOne(Project, {
+      where: { id: projectId },
+    });
+    if (!project) return;
+
+    const unassigned = await manager.count(ProjectTask, {
+      where: {
+        projectId,
+        assignedFreelancerProfileId: IsNull(),
+        status: Not(In(['done', 'cancelled'])),
+      },
+    });
+
+    if (unassigned === 0) {
+      if (project.status === ProjectStatus.ASSIGNED) return;
+      await this.transitionProject(manager, project, adminUserId, {
+        status: ProjectStatus.ASSIGNED,
+        reason: 'All implementation tasks have assigned freelancers.',
+        setAssignedAt: true,
+      });
+      return;
+    }
+
+    if (project.status === ProjectStatus.MATCHING) {
+      await this.transitionProject(manager, project, adminUserId, {
+        status: ProjectStatus.MATCHED,
+        reason: 'Implementation task assignment started.',
+      });
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // List / detail
   // ---------------------------------------------------------------------------
@@ -256,6 +571,8 @@ export class MatchingService {
     query: {
       status?: string;
       targetRoleKey?: string;
+      targetType?: string;
+      targetTaskId?: string;
       page: number;
       limit: number;
     },
@@ -265,6 +582,8 @@ export class MatchingService {
     const where: Record<string, unknown> = { projectId };
     if (query.status) where.status = query.status;
     if (query.targetRoleKey) where.targetRoleKey = query.targetRoleKey;
+    if (query.targetType) where.targetType = query.targetType;
+    if (query.targetTaskId) where.targetTaskId = query.targetTaskId;
 
     const [runs, total] = await this.runRepo.findAndCount({
       where,
@@ -281,6 +600,8 @@ export class MatchingService {
       projectId: run.projectId,
       targetType: run.targetType,
       targetRoleKey: run.targetRoleKey,
+      targetTaskId: run.targetTaskId,
+      taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
       status: run.status,
       summary: run.summary,
       candidateCount: counts.get(run.id) ?? 0,
@@ -295,9 +616,15 @@ export class MatchingService {
     return { data, total };
   }
 
-  async adminListRuns(query: { status?: string; page: number; limit: number }) {
+  async adminListRuns(query: {
+    status?: string;
+    targetType?: string;
+    page: number;
+    limit: number;
+  }) {
     const where: Record<string, unknown> = {};
     if (query.status) where.status = query.status;
+    if (query.targetType) where.targetType = query.targetType;
 
     const [runs, total] = await this.runRepo.findAndCount({
       where,
@@ -316,6 +643,8 @@ export class MatchingService {
       projectTitle: run.project?.title ?? null,
       targetType: run.targetType,
       targetRoleKey: run.targetRoleKey,
+      targetTaskId: run.targetTaskId,
+      taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
       status: run.status,
       summary: run.summary,
       candidateCount: counts.get(run.id) ?? 0,
@@ -351,6 +680,8 @@ export class MatchingService {
       projectTitle: run.project?.title ?? null,
       targetType: run.targetType,
       targetRoleKey: run.targetRoleKey,
+      targetTaskId: run.targetTaskId,
+      taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
       status: run.status,
       filters: run.filters,
       inputSnapshot: run.inputSnapshot,
@@ -611,7 +942,7 @@ export class MatchingService {
     adminUserId: string | null,
     change: {
       status: ProjectStatus;
-      planningStatus: string;
+      planningStatus?: string;
       reason: string;
       setPlanningStartedAt?: boolean;
       setAssignedAt?: boolean;
@@ -619,7 +950,7 @@ export class MatchingService {
   ) {
     const oldStatus = project.status;
     project.status = change.status;
-    project.planningStatus = change.planningStatus;
+    if (change.planningStatus) project.planningStatus = change.planningStatus;
     if (change.setPlanningStartedAt) {
       project.planningStartedAt = project.planningStartedAt ?? new Date();
     }
@@ -654,12 +985,8 @@ export class MatchingService {
     return Math.round(perRoleBudget / PLANNING_HOURS_PER_ROLE);
   }
 
-  private async buildCandidatePool(
-    dto: StartPlanningMatchingDto,
-    brief: Brief | null,
-    project: Project,
-  ) {
-    const filters = dto.filters;
+  // Approved, available freelancers, narrowed by the admin's explicit filters.
+  private buildProfileQuery(filters?: PlanningMatchingFiltersDto) {
     const qb = this.profileRepo
       .createQueryBuilder('p')
       .leftJoinAndSelect('p.skillScores', 's')
@@ -683,10 +1010,21 @@ export class MatchingService {
         exclude: filters.excludeFreelancerIds,
       });
     }
+    return qb;
+  }
+
+  private async buildCandidatePool(
+    dto: StartPlanningMatchingDto,
+    brief: Brief | null,
+    project: Project,
+  ) {
+    const filters = dto.filters;
+    const qb = this.buildProfileQuery(filters);
 
     // Budget-aware rate cap: only match freelancers the budget can afford. An
     // explicit admin maxHourlyRate wins; otherwise derive one from the budget.
-    const maxRate = filters?.maxHourlyRate ?? this.affordablePlanningRate(project);
+    const maxRate =
+      filters?.maxHourlyRate ?? this.affordablePlanningRate(project);
     const cappedQb = qb.clone();
     if (maxRate != null) {
       cappedQb.andWhere('(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)', {
@@ -713,12 +1051,70 @@ export class MatchingService {
     // Dense retrieval signal: cosine of the brief embedding vs. each freelancer
     // profile embedding (pgvector). Best-effort — if it fails, matching still
     // works on lexical + structured signals.
-    const similarity = await this.computeBriefSimilarity(
-      brief,
+    const similarity = await this.computeTextSimilarity(
+      this.briefText(brief),
       profiles.map((profile) => profile.id),
     );
 
-    const candidates: MatchCandidateInputDto[] = profiles.map((profile) => {
+    return { candidates: this.toCandidateInputs(profiles, similarity) };
+  }
+
+  // Same idea as the planning pool, but narrowed to one implementation task:
+  // rate is capped by what the implementation budget affords per hour, and the
+  // pool is prefiltered in SQL on the task's required skills.
+  private async buildTaskCandidatePool(
+    task: ProjectTask,
+    filters: PlanningMatchingFiltersDto | undefined,
+    maxRate: number | null,
+  ): Promise<MatchCandidateInputDto[]> {
+    const qb = this.buildProfileQuery(filters);
+    const skills = filters?.skills?.length
+      ? filters.skills
+      : (task.requiredSkills ?? []);
+
+    const narrowedQb = qb.clone();
+    if (maxRate != null) {
+      narrowedQb.andWhere(
+        '(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)',
+        {
+          maxRate,
+        },
+      );
+    }
+    if (skills.length) {
+      narrowedQb.andWhere(
+        `EXISTS (SELECT 1 FROM unnest(p.skills) sk WHERE lower(sk) = ANY(:taskSkills))`,
+        { taskSkills: skills.map((skill) => skill.toLowerCase()) },
+      );
+    }
+
+    const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
+    let profiles = await narrowedQb.take(poolCap).getMany();
+
+    // Never hand the admin an empty pool: if the skill/rate prefilter was too
+    // strict, fall back to the unnarrowed pool and let the reranker sort it out.
+    if (profiles.length < MIN_AFFORDABLE_POOL) {
+      this.logger.warn(
+        `Task ${task.id} prefilter matched only ${profiles.length} freelancers; relaxing.`,
+      );
+      profiles = await qb.take(poolCap).getMany();
+    }
+
+    const profileIds = profiles.map((profile) => profile.id);
+    const [similarity, workload] = await Promise.all([
+      this.computeTextSimilarity(this.taskText(task), profileIds),
+      this.getActiveWorkload(profileIds),
+    ]);
+
+    return this.toCandidateInputs(profiles, similarity, workload);
+  }
+
+  private toCandidateInputs(
+    profiles: FreelancerProfile[],
+    similarity: Map<string, number>,
+    workload?: Map<string, { tasks: number; projects: number }>,
+  ): MatchCandidateInputDto[] {
+    return profiles.map((profile) => {
       const scores = (profile.skillScores ?? []).map((entry) => ({
         skill: entry.skill,
         score: Number(entry.score),
@@ -731,6 +1127,7 @@ export class MatchingService {
             ).toFixed(2),
           )
         : null;
+      const active = workload?.get(profile.id);
 
       return {
         freelancerProfileId: profile.id,
@@ -745,29 +1142,136 @@ export class MatchingService {
         yearsExperience: profile.yearsExperience ?? null,
         averageSkillScore,
         embeddingSimilarity: similarity.get(profile.id) ?? null,
+        ...(workload
+          ? {
+              activeTaskCount: active?.tasks ?? 0,
+              activeProjectCount: active?.projects ?? 0,
+            }
+          : {}),
       };
     });
+  }
 
-    return { candidates };
+  // How much open implementation work each candidate already carries. Passed to
+  // the reranker as a signal; it does not remove anyone from the pool.
+  private async getActiveWorkload(profileIds: string[]) {
+    const map = new Map<string, { tasks: number; projects: number }>();
+    if (!profileIds.length) return map;
+
+    const rows = await this.taskRepo
+      .createQueryBuilder('t')
+      .select('t.assigned_freelancer_profile_id', 'profileId')
+      .addSelect('COUNT(*)', 'tasks')
+      .addSelect('COUNT(DISTINCT t.project_id)', 'projects')
+      .where('t.assigned_freelancer_profile_id IN (:...profileIds)', {
+        profileIds,
+      })
+      .andWhere('t.status IN (:...statuses)', {
+        statuses: ACTIVE_TASK_STATUSES,
+      })
+      .groupBy('t.assigned_freelancer_profile_id')
+      .getRawMany<{ profileId: string; tasks: string; projects: string }>();
+
+    for (const row of rows) {
+      map.set(row.profileId, {
+        tasks: Number(row.tasks),
+        projects: Number(row.projects),
+      });
+    }
+    return map;
+  }
+
+  // Tasks that may be matched now: unassigned, in a matchable status, and not
+  // already covered by an in-flight run.
+  private async resolveMatchableTasks(
+    projectId: string,
+    dto: StartImplementationMatchingDto,
+  ) {
+    const qb = this.taskRepo
+      .createQueryBuilder('t')
+      .where('t.project_id = :projectId', { projectId })
+      .andWhere('t.assigned_freelancer_profile_id IS NULL')
+      .andWhere('t.status IN (:...statuses)', {
+        statuses: MATCHABLE_TASK_STATUSES,
+      })
+      .orderBy('t.order_index', 'ASC');
+
+    if (dto.taskIds?.length) {
+      qb.andWhere('t.id IN (:...taskIds)', { taskIds: dto.taskIds });
+    } else if (dto.milestoneId) {
+      qb.andWhere('t.milestone_id = :milestoneId', {
+        milestoneId: dto.milestoneId,
+      });
+    }
+    const tasks = await qb.getMany();
+    if (!tasks.length) return tasks;
+
+    // Naming tasks explicitly is a deliberate rerun, so only a run that is still
+    // in flight blocks it. The bulk path also skips already-ranked tasks.
+    const blockingStatuses = dto.taskIds?.length
+      ? ['queued', 'running']
+      : ['queued', 'running', 'completed'];
+    const rows = await this.runRepo
+      .createQueryBuilder('r')
+      .select('r.target_task_id', 'taskId')
+      .where('r.project_id = :projectId', { projectId })
+      .andWhere('r.target_type = :targetType', { targetType: 'task' })
+      .andWhere('r.target_task_id IS NOT NULL')
+      .andWhere('r.status IN (:...statuses)', { statuses: blockingStatuses })
+      .getRawMany<{ taskId: string }>();
+
+    const busy = new Set(rows.map((row) => row.taskId));
+    return tasks.filter((task) => !busy.has(task.id));
+  }
+
+  // Max hourly rate the implementation budget affords, spread across the total
+  // estimated hours of the project's tasks. Null when either is unknown.
+  private async affordableTaskRate(project: Project): Promise<number | null> {
+    const budgetMax =
+      project.budgetMax != null ? Number(project.budgetMax) : null;
+    if (!budgetMax || budgetMax <= 0) return null;
+
+    const row = await this.taskRepo
+      .createQueryBuilder('t')
+      .select('COALESCE(SUM(t.estimated_hours), 0)', 'hours')
+      .where('t.project_id = :projectId', { projectId: project.id })
+      .getRawOne<{ hours: string }>();
+
+    const hours = Number(row?.hours ?? 0);
+    if (!hours) return null;
+    return Math.round((budgetMax * IMPLEMENTATION_BUDGET_SHARE) / hours);
+  }
+
+  private briefText(brief: Brief | null) {
+    if (!brief) return null;
+    return (
+      [brief.summary, brief.briefText]
+        .filter((part): part is string => Boolean(part && part.trim()))
+        .join('\n')
+        .trim() || null
+    );
+  }
+
+  private taskText(task: ProjectTask) {
+    return (
+      [task.title, task.description, (task.requiredSkills ?? []).join(', ')]
+        .filter((part): part is string => Boolean(part && part.trim()))
+        .join('\n')
+        .trim() || null
+    );
   }
 
   /**
-   * Cosine similarity of the brief embedding vs. each freelancer profile
-   * embedding, via pgvector. Returns an empty map (lexical-only fallback) if the
-   * brief has no text, the embedding call fails, or no profile has an embedding.
+   * Cosine similarity of the given text's embedding vs. each freelancer profile
+   * embedding, via pgvector. Returns an empty map (lexical-only fallback) if
+   * there is no text, the embedding call fails, or no profile has an embedding.
    */
-  private async computeBriefSimilarity(
-    brief: Brief | null,
+  private async computeTextSimilarity(
+    text: string | null,
     profileIds: string[],
   ): Promise<Map<string, number>> {
     const map = new Map<string, number>();
-    if (!brief || !profileIds.length) return map;
-
-    const text = [brief.summary, brief.briefText]
-      .filter((part): part is string => Boolean(part && part.trim()))
-      .join('\n')
-      .trim();
-    if (!text) return map;
+    if (!text || !profileIds.length) return map;
 
     try {
       const result = await this.aiService.generateEmbedding({
@@ -802,10 +1306,7 @@ export class MatchingService {
     return map;
   }
 
-  private buildProjectSnapshot(
-    project: Project,
-    dto: StartPlanningMatchingDto,
-  ) {
+  private buildProjectSnapshot(project: Project, requiredSkills: string[]) {
     return {
       id: project.id,
       title: project.title,
@@ -816,7 +1317,22 @@ export class MatchingService {
       currency: project.currency,
       deadline: project.deadline?.toISOString() ?? null,
       isDeadlineFlexible: project.isDeadlineFlexible,
-      requiredSkills: dto.filters?.skills ?? [],
+      requiredSkills,
+    };
+  }
+
+  private buildTaskSnapshot(task: ProjectTask, requiredSkills: string[]) {
+    const criteria = task.acceptanceCriteria;
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      roleKey: task.roleKey,
+      requiredSkills,
+      estimatedHours:
+        task.estimatedHours != null ? Number(task.estimatedHours) : null,
+      acceptanceCriteria: Array.isArray(criteria) ? criteria : [],
+      milestoneId: task.milestoneId,
     };
   }
 

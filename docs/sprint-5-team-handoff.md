@@ -1397,10 +1397,10 @@ fixed here.
 
 ### Add service constants
 
-Add `sprint5Endpoints` in `src/lib/api.ts`.
+Add `deliveryEndpoints` in `src/lib/api.ts`.
 
 ```ts
-export const sprint5Endpoints = {
+export const deliveryEndpoints = {
   repositories: {
     create: (projectId: string) => `/projects/${projectId}/repository`,
     projectRepository: (projectId: string) => `/projects/${projectId}/repository`,
