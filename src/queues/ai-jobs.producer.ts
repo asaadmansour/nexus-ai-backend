@@ -20,6 +20,7 @@ import {
   CvExtractionJobData,
   ProfileEmbeddingJobData,
   ProjectPlanGenerationJobData,
+  SubmissionEvaluationJobData,
 } from './queue.types';
 
 @Injectable()
@@ -37,9 +38,61 @@ export class AiJobsProducer {
     @Optional()
     @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
     private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
+    @Optional()
+    @InjectQueue(QUEUES.SUBMISSION_EVALUATION)
+    private readonly submissionEvaluationQueue: Queue<SubmissionEvaluationJobData> | null,
     @InjectRepository(AgentJob)
     private readonly agentJobRepository: Repository<AgentJob>,
   ) {}
+
+  async emitSubmissionEvaluationRequested(input: {
+    evaluationRunId: string;
+    submissionId: string;
+    projectId: string;
+    taskId?: string | null;
+  }) {
+    const agentJob = await this.agentJobRepository.save(
+      this.agentJobRepository.create({
+        agentName: AI_JOB_TYPES.SUBMISSION_EVALUATION,
+        jobType: AI_JOB_TYPES.SUBMISSION_EVALUATION,
+        projectId: input.projectId,
+        submissionId: input.submissionId,
+        status: 'queued',
+        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+        queueName: QUEUES.SUBMISSION_EVALUATION,
+        input: {
+          evaluationRunId: input.evaluationRunId,
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          taskId: input.taskId ?? null,
+        },
+      }),
+    );
+
+    try {
+      await this.getQueue(
+        this.submissionEvaluationQueue,
+        QUEUES.SUBMISSION_EVALUATION,
+      ).add(
+        JOBS.EVALUATE_SUBMISSION,
+        {
+          agentJobId: agentJob.id,
+          evaluationRunId: input.evaluationRunId,
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          taskId: input.taskId ?? null,
+        },
+        { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
+      );
+
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
+      return agentJob;
+    } catch (error) {
+      await this.markQueueAddFailed(agentJob, error);
+      throw error;
+    }
+  }
 
   async emitCvUploaded(input: {
     userId: string;

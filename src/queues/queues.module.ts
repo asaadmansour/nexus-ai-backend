@@ -41,6 +41,7 @@ const bullImports = queuesEnabled
         { name: QUEUES.ASSESSMENT_GRADING },
         { name: QUEUES.PROFILE_EMBEDDING },
         { name: QUEUES.PROJECT_PLAN_GENERATION },
+        { name: QUEUES.SUBMISSION_EVALUATION },
       ),
     ]
   : [];
