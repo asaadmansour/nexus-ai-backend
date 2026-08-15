@@ -35,7 +35,12 @@ export class ProjectTaskDependency {
   @JoinColumn({ name: 'depends_on_task_id' })
   dependsOnTask!: ProjectTask;
 
-  @Column({ type: 'varchar', length: 40, default: 'blocks' })
+  @Column({
+    name: 'dependency_type',
+    type: 'varchar',
+    length: 40,
+    default: 'blocks',
+  })
   dependencyType!: string;
 
   @Column({ type: 'text', nullable: true })

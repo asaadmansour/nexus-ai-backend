@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -17,6 +18,7 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { CreatePlanningSubmissionDto } from './dtos/create-planning-submission.dto';
 import { ReviewPlanningSubmissionDto } from './dtos/review-planning-submission.dto';
 import { ProjectPlansService } from './project-plans.service';
+import { PlanningEvaluationsService } from './planning-evaluations.service';
 
 interface Requester {
   userId: string;
@@ -41,6 +43,7 @@ export class PlanningSubmissionsService {
     private readonly profileRepo: Repository<FreelancerProfile>,
     private readonly notificationsService: NotificationsService,
     private readonly projectPlansService: ProjectPlansService,
+    private readonly planningEvaluationsService: PlanningEvaluationsService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -124,7 +127,18 @@ export class PlanningSubmissionsService {
       return created;
     });
 
-    return this.toDetail(submission, assignment.freelancerProfile);
+    const evaluationDispatch =
+      status === 'submitted'
+        ? await this.planningEvaluationsService.queueSubmissionEvaluation(
+            submission.id,
+            requester.userId,
+          )
+        : null;
+
+    return {
+      ...this.toDetail(submission, assignment.freelancerProfile),
+      evaluationDispatch,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -229,6 +243,22 @@ export class PlanningSubmissionsService {
       });
       if (!submission) throw new NotFoundException('Submission not found');
 
+      if (dto.status === 'approved' && submission.status !== 'submitted') {
+        throw new ConflictException(
+          'Only the current submitted version can be approved',
+        );
+      }
+
+      if (
+        dto.status === 'approved' &&
+        (submission.evaluationStatus !== 'completed' ||
+          submission.evaluationRecommendation !== 'approve')
+      ) {
+        throw new ConflictException(
+          'Admin approval requires a completed AI evaluation with an approve recommendation',
+        );
+      }
+
       submission.status = dto.status;
       submission.adminNotes = dto.adminNotes ?? submission.adminNotes ?? null;
       submission.reviewedBy = adminUserId;
@@ -266,6 +296,14 @@ export class PlanningSubmissionsService {
           adminUserId,
         )
       : null;
+    const uiuxEvaluationJob =
+      dto.status === 'approved' &&
+      result.submission.submissionType === 'architecture'
+        ? await this.planningEvaluationsService.queueLatestPendingUiux(
+            result.submission.projectId,
+            adminUserId,
+          )
+        : null;
 
     return {
       id: result.submission.id,
@@ -274,6 +312,7 @@ export class PlanningSubmissionsService {
       reviewedAt: result.submission.reviewedAt,
       planGenerationUnlocked: result.planUnlocked,
       planGenerationJob,
+      uiuxEvaluationJob,
     };
   }
 
@@ -452,6 +491,13 @@ export class PlanningSubmissionsService {
       freelancer: this.buildFreelancer(profile),
       submittedAt: submission.submittedAt,
       reviewedAt: submission.reviewedAt,
+      evaluationStatus: submission.evaluationStatus,
+      evaluationScore:
+        submission.evaluationScore === null
+          ? null
+          : Number(submission.evaluationScore),
+      evaluationRecommendation: submission.evaluationRecommendation,
+      evaluatedAt: submission.evaluatedAt,
     };
   }
 
@@ -466,6 +512,10 @@ export class PlanningSubmissionsService {
       fileUrls: submission.fileUrls,
       adminNotes: submission.adminNotes,
       reviewedBy: submission.reviewedBy,
+      evaluationRequirements: submission.evaluationRequirements,
+      evaluationResult: submission.evaluationResult,
+      evaluationError: submission.evaluationError,
+      evaluationAgentJobId: submission.evaluationAgentJobId,
     };
   }
 

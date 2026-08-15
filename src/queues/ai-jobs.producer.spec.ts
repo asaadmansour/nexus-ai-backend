@@ -22,6 +22,7 @@ describe('AiJobsProducer', () => {
       null,
       null,
       null,
+      null,
       queue,
       repository,
     );

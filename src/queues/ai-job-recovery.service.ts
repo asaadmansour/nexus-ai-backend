@@ -24,6 +24,7 @@ import {
 import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
+  PlanningSubmissionEvaluationJobData,
   ProfileEmbeddingJobData,
   ProjectPlanGenerationJobData,
   SubmissionEvaluationJobData,
@@ -57,6 +58,9 @@ export class AiJobRecoveryService
     @Optional()
     @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
     private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
+    @Optional()
+    @InjectQueue(QUEUES.PLANNING_SUBMISSION_EVALUATION)
+    private readonly planningSubmissionEvaluationQueue: Queue<PlanningSubmissionEvaluationJobData> | null,
     @Optional()
     @InjectQueue(QUEUES.SUBMISSION_EVALUATION)
     private readonly submissionEvaluationQueue: Queue<SubmissionEvaluationJobData> | null,
@@ -238,6 +242,7 @@ export class AiJobRecoveryService
       this.assessmentGenerationQueue &&
       this.profileEmbeddingQueue &&
       this.projectPlanGenerationQueue &&
+      this.planningSubmissionEvaluationQueue &&
       this.submissionEvaluationQueue,
     );
   }
@@ -394,6 +399,35 @@ export class AiJobRecoveryService
           add: (queueJobId) =>
             this.submissionEvaluationQueue!.add(
               JOBS.EVALUATE_SUBMISSION,
+              data,
+              {
+                ...AI_QUEUE_JOB_OPTIONS,
+                jobId: queueJobId,
+              },
+            ),
+        };
+      }
+      case AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION: {
+        const input = this.asRecord(job.input);
+        const requestedBy = input.requestedBy ?? null;
+        if (
+          !this.isString(input.submissionId) ||
+          !this.isString(input.projectId) ||
+          (requestedBy !== null && !this.isString(requestedBy))
+        ) {
+          return null;
+        }
+        const data: PlanningSubmissionEvaluationJobData = {
+          agentJobId: job.id,
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          requestedBy,
+        };
+        return {
+          queueName: QUEUES.PLANNING_SUBMISSION_EVALUATION,
+          add: (queueJobId) =>
+            this.planningSubmissionEvaluationQueue!.add(
+              JOBS.EVALUATE_PLANNING_SUBMISSION,
               data,
               {
                 ...AI_QUEUE_JOB_OPTIONS,

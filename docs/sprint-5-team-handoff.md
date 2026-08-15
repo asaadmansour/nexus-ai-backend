@@ -9,12 +9,13 @@ Sprint 4 ended with this flow:
 3. Customer funds escrow.
 4. Payment success starts planning-role matching.
 5. Admin chooses architect, then UI/UX.
-6. Architect and UI/UX submit planning deliverables.
-7. Admin approves both deliverables.
-8. Scrum Master generates the implementation plan.
-9. Admin approves and materializes the plan into milestones, tasks, dependencies, and the locked project spec.
+6. Architect and UI/UX submit project-specific evidence against their mandatory checklists.
+7. AI evaluates architecture first; UI/UX evaluation waits for approved architecture and then cross-checks its screens, states, fields, permissions, and endpoints against that contract.
+8. Failed checks return exact revision work and require a new immutable submission version. Admin approval is blocked until AI recommends approval; the admin still makes the final decision.
+9. After both admin approvals, Scrum Master generates the implementation plan.
+10. Admin approves and materializes the plan into scheduled milestones, tasks, dependencies, task-level contract references, ownership boundaries, integration checks, and the locked project spec.
 
-Sprint 5 starts after step 9.
+Sprint 5 starts after step 10.
 
 The goal is:
 
@@ -52,8 +53,9 @@ Important missing pieces before Sprint 5 is complete:
   with pgvector is working and fully migrated, but a new shared hosted database
   must be provisioned before staging/team integration.
 - Sprint 5 migrations `1785500000000-Sprint5Readiness.ts` and
-  `1785600000000-AddSprint5DeliveryContract.ts` are verified locally and must
-  be repeated on the replacement hosted database.
+  `1785600000000-AddSprint5DeliveryContract.ts`, plus planning-gate migration
+  `1785700000000-AddPlanningEvaluationContract.ts`, are verified locally and
+  must be repeated on the replacement hosted database.
 - Customer/freelancer delivery, submission, revision, and release-request pages
   and their typed frontend services still need to be implemented.
 
@@ -68,10 +70,10 @@ the verified migrations are applied there.
 What is ready:
 
 - NestJS production build passes.
-- All 7 Jest suites pass (19 tests).
+- All 9 Jest suites pass (22 tests).
 - Sprint 5 readiness migration, entity mappings, profile update persistence,
   and GitHub username validation are implemented locally.
-- PostgreSQL 17 with pgvector is running locally and all 22 migrations are
+- PostgreSQL 17 with pgvector is running locally and all 23 migrations are
   applied; post-migration inspection confirmed the Sprint 5 columns, foreign
   keys, status constraints, and required indexes.
 - A second clean disposable database passed the complete migration chain, a
@@ -80,7 +82,7 @@ What is ready:
 - Local Redis is running, the backend starts with BullMQ enabled, and
   `/api/health` returns `{ "status": "ok" }` against the migrated database.
 - The changed Sprint 5 backend files pass lint/format checks, the full backend
-  build and all 19 tests pass, frontend lint and production build pass, and the
+  build and all 22 tests pass, frontend lint and production build pass, and the
   AI service compiles and imports successfully from its virtual environment.
 - Implementation-task matching, task assignment, GitHub repository automation,
   and their frontend admin screens are present after synchronizing `dev`.
@@ -99,6 +101,16 @@ What is ready:
   evaluation, completed `evaluation_runs`/`agent_jobs` persistence, and admin
   detail/list reads. Its isolated database and Redis namespace were removed
   after verification.
+- Migration `1785700000000-AddPlanningEvaluationContract.ts` adds persistent
+  planning evaluation lifecycle, score, recommendation, result, requirement
+  snapshot, error, job link, and timestamp fields. A clean disposable database
+  applied all 23 migrations and verified all seven columns and three constraints.
+- A clean HTTP/BullMQ/mock-AI integration run verified the planning gate end to
+  end: UI/UX waited for architecture; missing architecture evidence returned
+  `changes_requested`; premature admin approval returned 409; complete
+  architecture and UI/UX passed; admin approval queued Scrum generation; and
+  materialization persisted three scheduled contract-aware tasks and two
+  dependencies. The isolated database and Redis DB were removed afterward.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.
@@ -110,7 +122,7 @@ Shared-environment database gate:
 
 - Ebrahim provisions a replacement hosted PostgreSQL/Supabase project and
   shares its secret connection values through the team's secret manager.
-- Ebrahim runs `npm run db:show`, applies all 22 migrations deliberately, and
+- Ebrahim runs `npm run db:show`, applies all 23 migrations deliberately, and
   repeats the schema verification used locally.
 - The team must not reuse or circulate the expired Supabase URL.
 
@@ -120,6 +132,94 @@ Blocking application work:
   services and workspaces are still pending.
 - A replacement shared hosted database is still required before staging or
   multi-developer integration testing.
+
+## Mandatory Planning Quality Gate
+
+This gate is part of the Sprint 5 implementation baseline. Implementation work
+must not start from informal architecture notes or design screenshots.
+
+### Ordering and decisions
+
+1. Architecture and UI/UX freelancers may prepare evidence in parallel.
+2. Architecture submission automatically queues AI evaluation.
+3. UI/UX submission is saved as `pending_architecture` until the latest
+   architecture submission passes AI and receives final admin approval.
+4. After architecture approval, the latest pending UI/UX submission queues
+   automatically and is cross-checked against the approved architecture.
+5. Any mandatory `partial`, `missing`, or `conflict` check forces
+   `changes_requested`, caps the score below 70, and returns actionable
+   `revisionItems`. The freelancer creates a new version; old versions remain
+   immutable and become `superseded`.
+6. A score of at least 80 with no blocker allows an AI `approve`
+   recommendation. It does not approve the deliverable.
+7. NestJS returns 409 if an admin tries to approve before a completed AI
+   `approve` recommendation.
+8. Final admin approval of both submissions queues Scrum plan generation.
+
+Planning evaluation statuses:
+
+- `pending`
+- `pending_architecture`
+- `queued`
+- `running`
+- `completed`
+- `failed`
+
+Routes:
+
+- `GET /api/projects/:projectId/planning-requirements/:submissionType`
+- `POST /api/projects/:projectId/planning-submissions`
+- `GET /api/planning-submissions/:submissionId`
+- `POST /api/planning-submissions/:submissionId/evaluation/retry` (admin)
+- `PATCH /api/planning-submissions/:submissionId/review` (admin)
+- FastAPI internal route: `POST /agents/evaluate-planning-submission`
+
+Every requirement is sent as:
+
+```json
+{
+  "key": "api_contract",
+  "title": "API and event contracts",
+  "description": "Methods, paths, auth, request, response, validation, and errors.",
+  "mandatory": true,
+  "requiresUrl": true
+}
+```
+
+Freelancer evidence is stored in
+`content.requirementEvidence[requirementKey] = { summary, urls }`. URL-required
+items cannot pass without a URL. The backend re-normalizes the AI response so a
+model cannot accidentally approve omitted evidence or omit a checklist row.
+
+Architecture base requirements cover system context, architecture diagram,
+technology decisions, module/data ownership, API/event contracts, data model,
+auth/security, integrations and failure behavior, non-functional requirements,
+deployment/observability, and implementation handoff.
+
+UI/UX base requirements cover Figma source, information architecture, full user
+flows, wireframes, high-fidelity responsive screens, clickable prototype, all
+screen/component states, accessibility, design system, screen-to-API/data
+mapping, and developer asset handoff.
+
+Both checklists add mandatory coverage rows for each project feature extracted
+from the confirmed brief. Do not hardcode one generic checklist in the frontend;
+always fetch it from NestJS.
+
+### Scrum output needed for independent parallel work
+
+The approved planning evidence, including evidence URLs, is passed to the Scrum
+Master. Each generated task must contain:
+
+- `startDay` and `durationDays` for the dependency-aware Gantt schedule.
+- `contractReferences` to approved architecture/design/API/data evidence.
+- `ownedPaths` defining the freelancer's primary code ownership boundary.
+- `integrationChecks` another freelancer or reviewer can run.
+- Project-specific acceptance criteria and explicit dependencies.
+
+Materialization stores schedule dates in `starts_at`/`due_at` and the three task
+contract arrays in `project_tasks.metadata`. The project plan is rejected by the
+AI service if tasks omit these fields or if any locked project-spec section is
+empty.
 
 ## Required Sprint 5 DB Additions
 

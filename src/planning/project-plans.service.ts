@@ -111,11 +111,13 @@ export class ProjectPlansService {
         id: architecture.id,
         summary: architecture.summary,
         content: architecture.content ?? {},
+        fileUrls: architecture.fileUrls ?? {},
       },
       uiuxSubmission: {
         id: uiux.id,
         summary: uiux.summary,
         content: uiux.content ?? {},
+        fileUrls: uiux.fileUrls ?? {},
       },
       planningTeam,
       notes: dto.notes,
@@ -525,6 +527,12 @@ export class ProjectPlansService {
             description: milestone.description ?? null,
             status: 'planned',
             orderIndex: milestone.orderIndex ?? 0,
+            startsAt: this.dateAtPlanDay(plan.createdAt, milestone.startDay),
+            dueAt: this.dateAtPlanDay(
+              plan.createdAt,
+              (milestone.startDay ?? 0) +
+                Math.max(1, milestone.estimatedDays ?? 1),
+            ),
             budgetAmount:
               milestoneBudgetAmount !== null &&
               Number.isFinite(milestoneBudgetAmount)
@@ -561,7 +569,17 @@ export class ProjectPlansService {
             estimatedHours:
               task.estimatedHours != null ? String(task.estimatedHours) : null,
             orderIndex: task.orderIndex ?? 0,
+            startsAt: this.dateAtPlanDay(plan.createdAt, task.startDay),
+            dueAt: this.dateAtPlanDay(
+              plan.createdAt,
+              (task.startDay ?? 0) + Math.max(1, task.durationDays ?? 1),
+            ),
             acceptanceCriteria: this.toJsonList(task.acceptanceCriteria),
+            metadata: {
+              contractReferences: task.contractReferences ?? [],
+              ownedPaths: task.ownedPaths ?? [],
+              integrationChecks: task.integrationChecks ?? [],
+            },
           }),
         );
         taskIdByKey.set(task.key, saved.id);
@@ -738,6 +756,7 @@ export class ProjectPlansService {
       startsAt: task.startsAt,
       dueAt: task.dueAt,
       acceptanceCriteria: task.acceptanceCriteria,
+      metadata: task.metadata,
       dependencies: (task.dependencies ?? []).map((dep) => ({
         taskId: dep.taskId,
         dependsOnTaskId: dep.dependsOnTaskId,
@@ -938,6 +957,12 @@ export class ProjectPlansService {
   private getErrorMessage(error: unknown) {
     if (error instanceof Error) return error.message.slice(0, 1000);
     return String(error).slice(0, 1000);
+  }
+
+  private dateAtPlanDay(planCreatedAt: Date, day = 0) {
+    const value = new Date(planCreatedAt);
+    value.setUTCDate(value.getUTCDate() + Math.max(0, Math.floor(day)));
+    return value;
   }
 
   private async resolveApprovedSubmission(
