@@ -11,6 +11,7 @@ import { ProjectSubmission } from 'src/projects/entities/project-submission.enti
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
+import { EvaluationsModule } from 'src/evaluations/evaluations.module';
 import {
   AdminSubmissionsController,
   FreelancerSubmissionsController,
@@ -25,6 +26,7 @@ import { DeliveryService } from './delivery.service';
   imports: [
     NotificationsModule,
     PaymentsModule,
+    EvaluationsModule,
     TypeOrmModule.forFeature([
       Project,
       ProjectMilestone,

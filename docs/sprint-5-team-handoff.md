@@ -51,14 +51,11 @@ Important missing pieces before Sprint 5 is complete:
 - The previous Supabase project reference no longer exists. Local PostgreSQL 17
   with pgvector is working and fully migrated, but a new shared hosted database
   must be provisioned before staging/team integration.
-- No product routes for `evaluation_runs` yet.
 - Sprint 5 migrations `1785500000000-Sprint5Readiness.ts` and
   `1785600000000-AddSprint5DeliveryContract.ts` are verified locally and must
   be repeated on the replacement hosted database.
-- No queue type for submission evaluation yet.
-- FastAPI `/agents/evaluate-submission` is still mock behavior.
-- Frontend delivery/submission/revision/evaluation/release-request pages and
-  typed delivery services still need to be implemented.
+- Customer/freelancer delivery, submission, revision, and release-request pages
+  and their typed frontend services still need to be implemented.
 
 ## Readiness Audit
 
@@ -90,9 +87,18 @@ What is ready:
 - Submission/versioning, review/revision, release-request, ledger-only release,
   authorization, pagination, and notification routes are implemented on
   `feature/sprint-5-asaad-delivery`.
+- Evaluation routes, queue producer/processor/recovery, admin evaluation pages,
+  and the real FastAPI evaluation agent are integrated on the same feature
+  branch. Submitted work now queues an evaluation automatically through the
+  shared dispatcher contract.
 - A disposable 22-migration database passed the full HTTP delivery flow:
   submission, revision, immutable replacement version, approval, release
   request, idempotent ledger-only posting, and final project completion.
+- A fresh disposable 22-migration database also passed the merged live
+  submission-evaluation flow: HTTP submission, BullMQ dispatch, FastAPI/Gemini
+  evaluation, completed `evaluation_runs`/`agent_jobs` persistence, and admin
+  detail/list reads. Its isolated database and Redis namespace were removed
+  after verification.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.
@@ -110,10 +116,10 @@ Shared-environment database gate:
 
 Blocking application work:
 
-- There is no `submission_evaluation` queue, producer, processor, or recovery
-  path.
-- FastAPI submission evaluation still returns mock output.
-- Sprint 5 delivery/review frontend services and workspaces do not exist yet.
+- Customer/freelancer delivery, submission, revision, and release frontend
+  services and workspaces are still pending.
+- A replacement shared hosted database is still required before staging or
+  multi-developer integration testing.
 
 ## Required Sprint 5 DB Additions
 
@@ -953,10 +959,7 @@ Payload:
   "title": "Fix checkout webhook tests",
   "description": "The implementation needs duplicate event handling tests.",
   "requestedChanges": {
-    "items": [
-      "Add duplicate webhook test",
-      "Show event id in logs"
-    ]
+    "items": ["Add duplicate webhook test", "Show event id in logs"]
   },
   "dueAt": "2026-07-27T00:00:00.000Z"
 }
@@ -1226,9 +1229,7 @@ Request:
       "name": "Mina",
       "headline": "Frontend engineer",
       "skills": ["React", "Next.js"],
-      "skillScores": [
-        { "skill": "React", "score": 4.6 }
-      ],
+      "skillScores": [{ "skill": "React", "score": 4.6 }],
       "averageSkillScore": 4.3,
       "availabilityHours": 20,
       "hourlyRate": 25,
@@ -1288,16 +1289,13 @@ Request:
     "summary": "Online bakery store with payments and stock dashboard.",
     "projectType": "ecommerce",
     "domain": "bakery",
-    "acceptanceCriteria": [
-      "Customers can buy online",
-      "Admin can track stock"
-    ]
+    "acceptanceCriteria": ["Customers can buy online", "Admin can track stock"]
   },
   "projectSpec": {
-    "projectSpecId": "uuid",
-    "status": "locked",
+    "architecture": {},
+    "designSystem": {},
     "apiContract": {},
-    "designTokens": {},
+    "dataModel": {},
     "conventions": {}
   },
   "task": {
@@ -1330,38 +1328,27 @@ Response:
 {
   "passed": false,
   "score": 72,
-  "recommendation": "request_revision",
-  "summary": "Checkout session creation is present, but webhook idempotency tests are missing.",
-  "findings": [
-    {
-      "severity": "major",
-      "area": "webhook",
-      "message": "Duplicate Stripe event handling is not proven.",
-      "evidence": "No test or code path found for duplicate event ids."
-    }
-  ],
-  "acceptanceCoverage": [
+  "revisionRequested": true,
+  "revisionNotes": "Add duplicate webhook event handling and tests.",
+  "requiresHumanReview": true,
+  "rubric": [
     {
       "criterion": "Endpoint creates checkout session",
-      "status": "met",
+      "met": true,
       "evidence": "API route exists and validates amount."
     },
     {
       "criterion": "Webhook is idempotent",
-      "status": "partial",
+      "met": false,
       "evidence": "Webhook stores events but lacks duplicate handling test."
     }
-  ],
-  "riskFlags": ["payment_integrity", "missing_tests"],
-  "revisionRequested": true,
-  "revisionNotes": "Add duplicate webhook event handling and tests.",
-  "requiresHumanReview": true,
-  "modelName": "gemini-...",
-  "promptVersion": "submission-evaluation-v1"
+  ]
 }
 ```
 
-Backend stores this in `evaluation_runs`.
+The backend normalizes this response and stores it in `evaluation_runs`. It
+derives the database recommendation as `approve`, `changes_requested`, or
+`manual_review`; `reject` remains available for an explicit product decision.
 
 ### `POST /agents/generate-task`
 
@@ -1373,7 +1360,7 @@ Do not replace the Scrum Master project-plan flow with this. The source of truth
 
 Owner: Ebrahim.
 
-Add queue constants:
+Integrated queue constants:
 
 - Queue: `submission-evaluation`
 - Job name: `evaluate-submission`
@@ -1402,15 +1389,15 @@ Integration seam already implemented by Asaad:
 - `DeliveryService` injects the optional
   `SUBMISSION_EVALUATION_DISPATCHER` token from
   `src/delivery/submission-evaluation-dispatcher.ts`.
-- Ebrahim's evaluation service implements `queueSubmissionEvaluation` and
-  registers itself against that token when its module is imported by
-  `DeliveryModule`.
-- Until that provider is registered, a submitted row remains `submitted` and
-  records `evaluationDispatch.status = "pending_integration"`. It never claims
-  that mock evaluation succeeded.
-- After the provider queues the database-backed evaluation, the delivery
-  service moves the submission to `under_review` and stores the evaluation-run
-  and agent-job IDs in submission metadata.
+- Ebrahim's evaluation service now implements `queueSubmissionEvaluation` and
+  is registered against that token through `EvaluationsModule`, which is
+  imported by `DeliveryModule`.
+- The provider queues the database-backed evaluation; the delivery service then
+  moves the submission to `under_review` and stores the evaluation-run and
+  agent-job IDs in submission metadata.
+- If queueing fails, the submitted row remains visible with an explicit failed
+  dispatch state. The API never reports a mock or unqueued evaluation as
+  successful.
 
 ## Frontend Route And Page Contracts
 
@@ -1425,13 +1412,17 @@ Add `deliveryEndpoints` in `src/lib/api.ts`.
 export const deliveryEndpoints = {
   repositories: {
     create: (projectId: string) => `/projects/${projectId}/repository`,
-    projectRepository: (projectId: string) => `/projects/${projectId}/repository`,
-    syncCollaborators: (projectId: string) => `/projects/${projectId}/repository/collaborators/sync`,
-    resendInvite: (collaboratorId: string) => `/repository-collaborators/${collaboratorId}/resend-invite`,
-    adminList: "/admin/repositories",
+    projectRepository: (projectId: string) =>
+      `/projects/${projectId}/repository`,
+    syncCollaborators: (projectId: string) =>
+      `/projects/${projectId}/repository/collaborators/sync`,
+    resendInvite: (collaboratorId: string) =>
+      `/repository-collaborators/${collaboratorId}/resend-invite`,
+    adminList: '/admin/repositories',
   },
   implementationMatching: {
-    startTasks: (projectId: string) => `/projects/${projectId}/matching/implementation-tasks`,
+    startTasks: (projectId: string) =>
+      `/projects/${projectId}/matching/implementation-tasks`,
     assignTask: (taskId: string) => `/project-tasks/${taskId}/assignment`,
   },
   submissions: {
@@ -1439,28 +1430,38 @@ export const deliveryEndpoints = {
     projectList: (projectId: string) => `/projects/${projectId}/submissions`,
     detail: (submissionId: string) => `/project-submissions/${submissionId}`,
     update: (submissionId: string) => `/project-submissions/${submissionId}`,
-    submit: (submissionId: string) => `/project-submissions/${submissionId}/submit`,
-    review: (submissionId: string) => `/project-submissions/${submissionId}/review`,
-    freelancerList: "/freelancer/submissions",
-    adminList: "/admin/submissions",
+    submit: (submissionId: string) =>
+      `/project-submissions/${submissionId}/submit`,
+    review: (submissionId: string) =>
+      `/project-submissions/${submissionId}/review`,
+    freelancerList: '/freelancer/submissions',
+    adminList: '/admin/submissions',
   },
   revisions: {
     create: (projectId: string) => `/projects/${projectId}/revision-requests`,
-    projectList: (projectId: string) => `/projects/${projectId}/revision-requests`,
-    updateStatus: (revisionRequestId: string) => `/revision-requests/${revisionRequestId}/status`,
+    projectList: (projectId: string) =>
+      `/projects/${projectId}/revision-requests`,
+    updateStatus: (revisionRequestId: string) =>
+      `/revision-requests/${revisionRequestId}/status`,
   },
   evaluations: {
-    create: (submissionId: string) => `/project-submissions/${submissionId}/evaluations`,
-    submissionList: (submissionId: string) => `/project-submissions/${submissionId}/evaluations`,
+    create: (submissionId: string) =>
+      `/project-submissions/${submissionId}/evaluations`,
+    submissionList: (submissionId: string) =>
+      `/project-submissions/${submissionId}/evaluations`,
     detail: (evaluationRunId: string) => `/evaluation-runs/${evaluationRunId}`,
-    retry: (evaluationRunId: string) => `/evaluation-runs/${evaluationRunId}/retry`,
-    adminList: "/admin/evaluations",
+    retry: (evaluationRunId: string) =>
+      `/evaluation-runs/${evaluationRunId}/retry`,
+    adminList: '/admin/evaluations',
   },
   releaseRequests: {
-    create: (projectId: string) => `/projects/${projectId}/payment-release-requests`,
-    projectList: (projectId: string) => `/projects/${projectId}/payment-release-requests`,
-    adminList: "/admin/payment-release-requests",
-    review: (requestId: string) => `/payment-release-requests/${requestId}/review`,
+    create: (projectId: string) =>
+      `/projects/${projectId}/payment-release-requests`,
+    projectList: (projectId: string) =>
+      `/projects/${projectId}/payment-release-requests`,
+    adminList: '/admin/payment-release-requests',
+    review: (requestId: string) =>
+      `/payment-release-requests/${requestId}/review`,
   },
 };
 ```
@@ -1770,34 +1771,26 @@ Sprint 5 is done when:
 - Frontend build passes.
 - AI service compile/import check passes.
 
-## Suggested Order Of Work
+## Remaining Integration Order
 
 1. Ebrahim provisions the replacement hosted database, applies/verifies all 22
    migrations, and publishes only the secret-manager references to the team.
-2. In parallel:
-   - Asaad implements submission, review/revision, and release-request backend
-     services.
-   - Ebrahim implements the full NestJS/FastAPI evaluation vertical and its
-     queue/recovery path.
-   - Sameh implements task matching/assignment and GitHub repository automation.
-   - Muhanad builds the customer/freelancer workspace shell and shared delivery
-     components against the fixed contracts.
-3. Vertical owners add their assigned typed frontend services and pages:
-   - Ebrahim: review/evaluation screens.
-   - Sameh: matching/repository screens.
-   - Muhanad: customer, freelancer, delivery, revision, and release screens.
-4. Asaad wires cross-vertical notifications and runs merge/integration checks.
-5. The team runs an end-to-end test:
-    - funded project
-    - materialized Scrum plan
-    - implementation matching
-    - assigned freelancer
-    - GitHub invite
-    - submission
-    - AI evaluation
-    - revision
-    - approval
-    - release request
-    - ledger release
-6. Each owner demonstrates their vertical against the replacement shared
+2. Muhanad builds the customer/freelancer workspace shell plus delivery,
+   submission, revision, and release services/pages against the fixed routes in
+   this document.
+3. Asaad reviews the merged cross-vertical notifications and runs final
+   integration checks after Muhanad's UI lands.
+4. The team runs an end-to-end test against the replacement shared database:
+   - funded project
+   - materialized Scrum plan
+   - implementation matching
+   - assigned freelancer
+   - GitHub invite
+   - submission
+   - AI evaluation
+   - revision
+   - approval
+   - release request
+   - ledger release
+5. Each owner demonstrates their vertical against the replacement shared
    database; Asaad signs off only after backend, frontend, and AI checks pass.

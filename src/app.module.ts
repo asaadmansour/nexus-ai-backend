@@ -20,6 +20,7 @@ import { PlanningModule } from './planning/planning.module';
 import { PaymentsModule } from './payments/payments.module';
 import { RepositoriesModule } from './repositories/repositories.module';
 import { DeliveryModule } from './delivery/delivery.module';
+import { EvaluationsModule } from './evaluations/evaluations.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { DeliveryModule } from './delivery/delivery.module';
     PaymentsModule,
     RepositoriesModule,
     DeliveryModule,
+    EvaluationsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

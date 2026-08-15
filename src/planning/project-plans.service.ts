@@ -90,7 +90,11 @@ export class ProjectPlansService {
 
     const generated = await this.aiService.generateProjectPlan({
       projectId,
-      projectPlanJobId: this.buildPlanJobId(projectId, architecture.id, uiux.id),
+      projectPlanJobId: this.buildPlanJobId(
+        projectId,
+        architecture.id,
+        uiux.id,
+      ),
       project: {
         id: project.id,
         title: project.title,
@@ -167,7 +171,6 @@ export class ProjectPlansService {
     };
   }
 
-
   async enqueueAutomaticGeneration(projectId: string, adminUserId: string) {
     const architecture = await this.resolveApprovedSubmission(
       projectId,
@@ -205,15 +208,15 @@ export class ProjectPlansService {
       };
     }
 
-    const agentJob = await this.aiJobsProducer.emitProjectPlanGenerationRequested(
-      {
+    const agentJob =
+      await this.aiJobsProducer.emitProjectPlanGenerationRequested({
         projectId,
         architectureSubmissionId: architecture.id,
         uiuxSubmissionId: uiux.id,
         requestedBy: adminUserId,
-        notes: 'Automatic scrum plan generation after architecture and UI/UX approval.',
-      },
-    );
+        notes:
+          'Automatic scrum plan generation after architecture and UI/UX approval.',
+      });
 
     return {
       queued: true,
@@ -501,7 +504,9 @@ export class ProjectPlansService {
       let quotedCurrency: string | null = null;
       for (const milestone of milestones) {
         const milestoneBudgetAmount =
-          milestone.budgetAmount != null ? Number(milestone.budgetAmount) : null;
+          milestone.budgetAmount != null
+            ? Number(milestone.budgetAmount)
+            : null;
         if (
           milestoneBudgetAmount !== null &&
           Number.isFinite(milestoneBudgetAmount) &&
@@ -831,7 +836,10 @@ export class ProjectPlansService {
   }
 
   private normalizeRoleKey(roleKey: string) {
-    const normalized = roleKey.trim().toLowerCase().replace(/[-\s]+/g, '_');
+    const normalized = roleKey
+      .trim()
+      .toLowerCase()
+      .replace(/[-\s]+/g, '_');
     if (
       ['architecture', 'system_architect', 'solution_architect'].includes(
         normalized,
@@ -976,7 +984,8 @@ export class ProjectPlansService {
     const budgetMax = Number(project.budgetMax);
     const currency = quotedCurrency ?? project.currency;
     const amount = quotedAmount.toFixed(2);
-    const isOutOfBudget = Number.isFinite(budgetMax) && quotedAmount > budgetMax;
+    const isOutOfBudget =
+      Number.isFinite(budgetMax) && quotedAmount > budgetMax;
 
     return {
       amount,
@@ -1081,9 +1090,7 @@ export class ProjectPlansService {
           type: this.dependencyType(dependency.type),
           notes: dependency.notes ?? null,
         }))
-        .filter(
-          (dependency) => dependency.taskKey && dependency.dependsOnKey,
-        );
+        .filter((dependency) => dependency.taskKey && dependency.dependsOnKey);
     }
     return this.extractDependencies(tasks);
   }
@@ -1205,7 +1212,10 @@ export class ProjectPlansService {
     }
   }
 
-  private async assertProjectVisibility(project: Project, requester: Requester) {
+  private async assertProjectVisibility(
+    project: Project,
+    requester: Requester,
+  ) {
     if (requester.role === UserRole.ADMIN) return;
 
     if (requester.role === UserRole.CUSTOMER) {

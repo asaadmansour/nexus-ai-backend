@@ -26,6 +26,7 @@ import {
   CvExtractionJobData,
   ProfileEmbeddingJobData,
   ProjectPlanGenerationJobData,
+  SubmissionEvaluationJobData,
 } from './queue.types';
 
 type RecoverableJobType = (typeof AI_JOB_TYPES)[keyof typeof AI_JOB_TYPES];
@@ -56,6 +57,9 @@ export class AiJobRecoveryService
     @Optional()
     @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
     private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
+    @Optional()
+    @InjectQueue(QUEUES.SUBMISSION_EVALUATION)
+    private readonly submissionEvaluationQueue: Queue<SubmissionEvaluationJobData> | null,
     @InjectRepository(AgentJob)
     private readonly agentJobRepository: Repository<AgentJob>,
   ) {}
@@ -233,7 +237,8 @@ export class AiJobRecoveryService
       this.cvExtractionQueue &&
       this.assessmentGenerationQueue &&
       this.profileEmbeddingQueue &&
-      this.projectPlanGenerationQueue,
+      this.projectPlanGenerationQueue &&
+      this.submissionEvaluationQueue,
     );
   }
 
@@ -358,6 +363,37 @@ export class AiJobRecoveryService
           add: (queueJobId) =>
             this.projectPlanGenerationQueue!.add(
               JOBS.GENERATE_PROJECT_PLAN,
+              data,
+              {
+                ...AI_QUEUE_JOB_OPTIONS,
+                jobId: queueJobId,
+              },
+            ),
+        };
+      }
+      case AI_JOB_TYPES.SUBMISSION_EVALUATION: {
+        const input = this.asRecord(job.input);
+        const taskId = input.taskId ?? null;
+        if (
+          !this.isString(input.evaluationRunId) ||
+          !this.isString(input.submissionId) ||
+          !this.isString(input.projectId) ||
+          (taskId !== null && !this.isString(taskId))
+        ) {
+          return null;
+        }
+        const data: SubmissionEvaluationJobData = {
+          agentJobId: job.id,
+          evaluationRunId: input.evaluationRunId,
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          taskId,
+        };
+        return {
+          queueName: QUEUES.SUBMISSION_EVALUATION,
+          add: (queueJobId) =>
+            this.submissionEvaluationQueue!.add(
+              JOBS.EVALUATE_SUBMISSION,
               data,
               {
                 ...AI_QUEUE_JOB_OPTIONS,

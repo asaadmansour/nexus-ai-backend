@@ -34,9 +34,12 @@ async function embed(text: string): Promise<number[] | null> {
   }
 }
 
-function profileSummaryText(summary: Record<string, unknown> | null): string | null {
+function profileSummaryText(
+  summary: Record<string, unknown> | null,
+): string | null {
   if (!summary) return null;
-  if (typeof summary.profileSummary === 'string') return summary.profileSummary.trim();
+  if (typeof summary.profileSummary === 'string')
+    return summary.profileSummary.trim();
   if (typeof summary.summary === 'string') return summary.summary.trim();
   return null;
 }
@@ -69,7 +72,9 @@ function buildSourceText(
       ? `Availability: ${profile.availabilityHoursPerWeek} hours per week`
       : null,
     profile.hourlyRate ? `Hourly rate: ${profile.hourlyRate}` : null,
-    profile.assessmentScore ? `Assessment score: ${profile.assessmentScore}` : null,
+    profile.assessmentScore
+      ? `Assessment score: ${profile.assessmentScore}`
+      : null,
     profile.skills?.length ? `CV skills: ${profile.skills.join(', ')}` : null,
     summary ? `Assessment profile summary: ${summary}` : null,
     skillRatings ? `Assessed skill ratings:\n${skillRatings}` : null,
@@ -122,7 +127,13 @@ async function main() {
        VALUES ($1, $2, $3, $4, $5::vector)
        ON CONFLICT (freelancer_profile_id, embedding_model)
        DO UPDATE SET embedding = EXCLUDED.embedding, source_text = EXCLUDED.source_text`,
-      [profile.id, EMBEDDING_MODEL, sourceText, DIMENSIONS, `[${vector.join(',')}]`],
+      [
+        profile.id,
+        EMBEDDING_MODEL,
+        sourceText,
+        DIMENSIONS,
+        `[${vector.join(',')}]`,
+      ],
     );
     done += 1;
     console.log(`  embedded ${profile.id}`);

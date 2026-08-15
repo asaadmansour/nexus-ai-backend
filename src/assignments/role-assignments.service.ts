@@ -643,7 +643,9 @@ export class RoleAssignmentsService {
       await this.assignmentRepo.update(assignmentId, {
         roleBriefStatus: 'fallback',
         roleBriefError:
-          error instanceof Error ? error.message : 'Role brief generation failed',
+          error instanceof Error
+            ? error.message
+            : 'Role brief generation failed',
       });
       this.logger.warn(
         `Role brief AI enrichment failed for assignment ${assignmentId}: ${
@@ -671,7 +673,9 @@ export class RoleAssignmentsService {
       title: `${roleLabel} planning brief for ${projectName}`,
       summary: [
         `${roleLabel} assignment for ${projectName}${domain}.`,
-        project.description ? `Project description: ${project.description}.` : null,
+        project.description
+          ? `Project description: ${project.description}.`
+          : null,
         brief?.summary ? `Brief summary: ${brief.summary}.` : null,
         brief?.mainGoal ? `Main goal: ${brief.mainGoal}.` : null,
       ]
@@ -787,9 +791,10 @@ export class RoleAssignmentsService {
   }
 
   private assignmentRoleBriefSummary(assignment: ProjectRoleAssignment) {
-    const roleBrief = assignment.roleBrief as
-      | { summary?: unknown; title?: unknown }
-      | null;
+    const roleBrief = assignment.roleBrief as {
+      summary?: unknown;
+      title?: unknown;
+    } | null;
     return (
       this.optionalString(roleBrief?.summary) ??
       this.optionalString(roleBrief?.title) ??

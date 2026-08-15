@@ -125,7 +125,12 @@ export class Project {
   quotedCurrency: string | null;
 
   @Index('projects_quote_status_idx')
-  @Column({ name: 'quote_status', type: 'varchar', length: 40, default: 'not_ready' })
+  @Column({
+    name: 'quote_status',
+    type: 'varchar',
+    length: 40,
+    default: 'not_ready',
+  })
   quoteStatus: string;
 
   @Column({ name: 'quote_generated_at', type: 'timestamptz', nullable: true })

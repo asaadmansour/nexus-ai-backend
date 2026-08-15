@@ -118,7 +118,11 @@ export class ProjectRoleAssignment {
   })
   roleBriefStatus!: string;
 
-  @Column({ name: 'role_brief_generated_at', type: 'timestamptz', nullable: true })
+  @Column({
+    name: 'role_brief_generated_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
   roleBriefGeneratedAt!: Date | null;
 
   @Column({ name: 'role_brief_error', type: 'text', nullable: true })

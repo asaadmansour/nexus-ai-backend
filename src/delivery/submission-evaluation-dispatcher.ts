@@ -4,7 +4,7 @@ export const SUBMISSION_EVALUATION_DISPATCHER = Symbol(
 
 export interface SubmissionEvaluationDispatchResult {
   evaluationRunId: string;
-  agentJobId: string;
+  agentJobId: string | null;
 }
 
 export interface SubmissionEvaluationDispatcher {

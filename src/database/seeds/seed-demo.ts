@@ -81,7 +81,13 @@ const FREELANCERS: FreelancerSeed[] = [
     lastName: 'Ali',
     headline: 'Product designer',
     bio: 'Product designer with strong ecommerce catalog and checkout UX experience.',
-    skills: ['Figma', 'Design Systems', 'User Flows', 'Ecommerce UX', 'Accessibility'],
+    skills: [
+      'Figma',
+      'Design Systems',
+      'User Flows',
+      'Ecommerce UX',
+      'Accessibility',
+    ],
     yearsExperience: 5,
     hourlyRate: '22.00',
     availabilityHoursPerWeek: 30,
@@ -209,7 +215,7 @@ async function seedDemo() {
     : await projectRepo.save(projectRepo.create(projectData));
 
   // 3. Completed brief
-  let brief = await briefRepo.findOne({ where: { projectId: project.id } });
+  const brief = await briefRepo.findOne({ where: { projectId: project.id } });
   const briefData = {
     projectId: project.id,
     isComplete: true,
@@ -229,9 +235,9 @@ async function seedDemo() {
     requiredSkills:
       'NestJS, PostgreSQL, System Design, Figma, Design Systems, Ecommerce UX',
   };
-  brief = brief
-    ? await briefRepo.save(Object.assign(brief, briefData))
-    : await briefRepo.save(briefRepo.create(briefData));
+  await briefRepo.save(
+    brief ? Object.assign(brief, briefData) : briefRepo.create(briefData),
+  );
 
   // 4. Approved freelancers + skill scores + profile embeddings
   let embeddedCount = 0;
@@ -266,7 +272,7 @@ async function seedDemo() {
     await skillScoreRepo.save(
       seed.skillScores.map((entry) =>
         skillScoreRepo.create({
-          freelancerProfileId: profile!.id,
+          freelancerProfileId: profile.id,
           userId: user.id,
           skill: entry.skill,
           score: entry.score,
@@ -286,7 +292,13 @@ async function seedDemo() {
          VALUES ($1, $2, $3, $4, $5::vector)
          ON CONFLICT (freelancer_profile_id, embedding_model)
          DO UPDATE SET embedding = EXCLUDED.embedding, source_text = EXCLUDED.source_text`,
-        [profile.id, EMBEDDING_MODEL, sourceText, 1024, `[${vector.join(',')}]`],
+        [
+          profile.id,
+          EMBEDDING_MODEL,
+          sourceText,
+          1024,
+          `[${vector.join(',')}]`,
+        ],
       );
       embeddedCount += 1;
     }
@@ -297,10 +309,14 @@ async function seedDemo() {
   console.log(`  Customer:    ${CUSTOMER.email} / ${CUSTOMER.password}`);
   console.log(`  Freelancers: ${FREELANCERS.map((f) => f.email).join(', ')}`);
   console.log(`               (password: ${FREELANCER_PASSWORD})`);
-  console.log(`  Embeddings:  ${embeddedCount}/${FREELANCERS.length} generated (dense arm)`);
+  console.log(
+    `  Embeddings:  ${embeddedCount}/${FREELANCERS.length} generated (dense arm)`,
+  );
   console.log(`  Project:     "${PROJECT_TITLE}" — status brief_complete`);
   console.log(`  Project ID:  ${project.id}`);
-  console.log('\nStart matching (copy–paste this whole block into a terminal):\n');
+  console.log(
+    '\nStart matching (copy–paste this whole block into a terminal):\n',
+  );
   console.log(
     `TOKEN=$(curl -s -X POST ${apiBase}/auth/login -H 'Content-Type: application/json' ` +
       `-d '{"email":"admin@nexus-ai.local","password":"Admin@123456"}' ` +

@@ -13,6 +13,7 @@ import {
   MatchFreelancersDto,
 } from './dto/MatchFreelancersDto';
 import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
+import { EvaluateSubmissionDto } from './dto/EvaluateSubmissionDto';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -199,6 +200,31 @@ export type ProjectQuoteResult = {
   pricingSignals: string[];
   sources: string[];
   source: 'fastapi' | 'local_mock' | 'local_fallback';
+};
+
+export type EvaluateSubmissionRubricItem = {
+  criterion: string;
+  met: boolean;
+  evidence: string;
+};
+
+export type EvaluateSubmissionResult = {
+  passed: boolean;
+  score: number;
+  revisionRequested: boolean;
+  revisionNotes: string;
+  requiresHumanReview: boolean;
+  rubric: EvaluateSubmissionRubricItem[];
+  source: 'fastapi' | 'local_mock' | 'local_fallback';
+};
+
+type FastApiEvaluateSubmissionResponse = {
+  passed?: unknown;
+  score?: unknown;
+  revisionRequested?: unknown;
+  revisionNotes?: unknown;
+  requiresHumanReview?: unknown;
+  rubric?: unknown;
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -907,6 +933,110 @@ export class AiService {
       return 'Architecture';
     }
     return roleKey.replace(/_/g, ' ');
+  }
+
+  async evaluateSubmission(
+    dto: EvaluateSubmissionDto,
+  ): Promise<EvaluateSubmissionResult> {
+    if (this.isMockMode()) {
+      return this.getMockEvaluateSubmissionResult(dto);
+    }
+
+    // Let AI-provider failures propagate. This runs on the queued worker path,
+    // whose retry/recovery only fires when the call throws — swallowing an
+    // outage into a deterministic mock would record a false (often passing)
+    // evaluation and never retry.
+    const result = await this.postToFastApi<FastApiEvaluateSubmissionResponse>(
+      '/agents/evaluate-submission',
+      {
+        project: dto.project,
+        task: dto.task,
+        submission: dto.submission,
+        brief: dto.brief ?? {},
+        projectSpec: dto.projectSpec ?? {},
+      },
+      'evaluate-submission',
+    );
+
+    return this.normalizeEvaluateSubmissionResult(result, 'fastapi');
+  }
+
+  private normalizeEvaluateSubmissionResult(
+    result: FastApiEvaluateSubmissionResponse,
+    source: EvaluateSubmissionResult['source'],
+  ): EvaluateSubmissionResult {
+    const rubric = this.normalizeEvaluationRubric(result.rubric);
+    const passed = result.passed === true;
+    const revisionRequested =
+      result.revisionRequested === true ||
+      (!passed && rubric.some((item) => !item.met));
+
+    return {
+      passed,
+      score: this.clampScore(this.toNumber(result.score) ?? 0),
+      revisionRequested,
+      revisionNotes:
+        this.optionalString(result.revisionNotes) ??
+        (revisionRequested
+          ? 'Revision requested. See rubric for unmet criteria.'
+          : ''),
+      requiresHumanReview: result.requiresHumanReview === true,
+      rubric,
+      source,
+    };
+  }
+
+  private normalizeEvaluationRubric(
+    value: unknown,
+  ): EvaluateSubmissionRubricItem[] {
+    return this.toRecordArray(value).map((item, index) => ({
+      criterion:
+        this.optionalString(item.criterion) ?? `Criterion ${index + 1}`,
+      met: item.met === true,
+      evidence: this.optionalString(item.evidence) ?? '',
+    }));
+  }
+
+  private clampScore(value: number) {
+    return Math.min(100, Math.max(0, Number(value.toFixed(2))));
+  }
+
+  private getMockEvaluateSubmissionResult(
+    dto: EvaluateSubmissionDto,
+    source: EvaluateSubmissionResult['source'] = 'local_mock',
+  ): EvaluateSubmissionResult {
+    const criteria = this.ensureStringArray(dto.task.acceptanceCriteria, [
+      'Deliverable meets the task description',
+      'Work is complete and reviewable',
+    ]);
+    const hasArtifact = Boolean(
+      this.optionalString(dto.submission.submissionUrl) ??
+      this.optionalString(dto.submission.repositoryUrl) ??
+      this.optionalString(dto.submission.pullRequestUrl) ??
+      this.optionalString(dto.submission.submissionText),
+    );
+    const rubric: EvaluateSubmissionRubricItem[] = criteria.map(
+      (criterion) => ({
+        criterion,
+        met: hasArtifact,
+        evidence: hasArtifact
+          ? 'Mock evaluation: submission artifact present.'
+          : 'Mock evaluation: no reviewable artifact was provided.',
+      }),
+    );
+    const passed = hasArtifact;
+
+    return {
+      passed,
+      score: passed ? 85 : 40,
+      revisionRequested: !passed,
+      revisionNotes: passed
+        ? ''
+        : 'Mock evaluation: attach the deliverable (URL, repository, or written submission) before resubmitting.',
+      requiresHumanReview: dto.task.isSpecTask,
+      rubric,
+      source,
+    };
   }
 
   private ensureStringArray(value: unknown, fallback: string[]): string[] {
