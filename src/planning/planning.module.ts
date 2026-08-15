@@ -17,6 +17,7 @@ import { ProjectPlanGenerationProcessor } from './jobs/project-plan-generation.p
 import { PlanningSubmissionEvaluationProcessor } from './jobs/planning-submission-evaluation.processor';
 import { areQueuesEnabled } from 'src/queues/queue-runtime';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
+import { MatchingModule } from 'src/matching/matching.module';
 
 const queueProcessors = areQueuesEnabled()
   ? [ProjectPlanGenerationProcessor, PlanningSubmissionEvaluationProcessor]
@@ -29,6 +30,7 @@ const queueProcessors = areQueuesEnabled()
     NotificationsModule,
     QueuesModule,
     AgentsModule,
+    MatchingModule,
   ],
   controllers: [
     ProjectPlanningController,

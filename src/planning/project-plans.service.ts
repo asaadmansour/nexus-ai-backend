@@ -30,6 +30,7 @@ import { ProjectTaskDependency } from 'src/projects/entities/project-task-depend
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { MatchingService } from 'src/matching/matching.service';
 import { GeneratePlanDto } from './dtos/generate-plan.dto';
 import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
@@ -65,6 +66,7 @@ export class ProjectPlansService {
     private readonly profileRepo: Repository<FreelancerProfile>,
     private readonly aiService: AiService,
     private readonly aiJobsProducer: AiJobsProducer,
+    private readonly matchingService: MatchingService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -477,10 +479,16 @@ export class ProjectPlansService {
       where: { projectId: plan.projectId },
     });
     if (existingSpec && !dto.replaceExisting) {
-      return this.existingMaterializationCounts(
+      const existing = await this.existingMaterializationCounts(
         plan.projectId,
         existingSpec.id,
       );
+      const matchingDispatch =
+        await this.matchingService.autoStartImplementationTasks(
+          plan.projectId,
+          adminUserId,
+        );
+      return { ...existing, matchingDispatch };
     }
 
     const milestones = (plan.milestones ??
@@ -489,193 +497,195 @@ export class ProjectPlansService {
     const dependencies = this.planDependencies(plan.dependencies, tasks);
     const projectSpec = (plan.projectSpec ?? {}) as ProjectPlanSpec;
 
-    return this.dataSource.transaction(async (manager) => {
-      if (existingSpec && dto.replaceExisting) {
-        await this.assertNoActivePayments(manager, plan.projectId);
-        await manager.delete(ProjectTask, { projectId: plan.projectId });
-        await manager.delete(ProjectMilestone, { projectId: plan.projectId });
-        await manager.delete(ProjectSpec, { projectId: plan.projectId });
-      }
-
-      const assignmentsByRole = await this.activePlanningAssignmentsByRole(
-        manager,
-        plan.projectId,
-      );
-      const milestoneIdByKey = new Map<string, string>();
-      let quotedAmount = 0;
-      let quotedCurrency: string | null = null;
-      for (const milestone of milestones) {
-        const milestoneBudgetAmount =
-          milestone.budgetAmount != null
-            ? Number(milestone.budgetAmount)
-            : null;
-        if (
-          milestoneBudgetAmount !== null &&
-          Number.isFinite(milestoneBudgetAmount) &&
-          milestoneBudgetAmount > 0
-        ) {
-          quotedAmount += milestoneBudgetAmount;
-          quotedCurrency = quotedCurrency ?? milestone.currency ?? null;
+    const materialization = await this.dataSource.transaction(
+      async (manager) => {
+        if (existingSpec && dto.replaceExisting) {
+          await this.assertNoActivePayments(manager, plan.projectId);
+          await manager.delete(ProjectTask, { projectId: plan.projectId });
+          await manager.delete(ProjectMilestone, { projectId: plan.projectId });
+          await manager.delete(ProjectSpec, { projectId: plan.projectId });
         }
 
-        const saved = await manager.save(
-          ProjectMilestone,
-          manager.create(ProjectMilestone, {
-            projectId: plan.projectId,
-            projectPlanId: plan.id,
-            title: milestone.title,
-            description: milestone.description ?? null,
-            status: 'planned',
-            orderIndex: milestone.orderIndex ?? 0,
-            startsAt: this.dateAtPlanDay(plan.createdAt, milestone.startDay),
-            dueAt: this.dateAtPlanDay(
-              plan.createdAt,
-              (milestone.startDay ?? 0) +
-                Math.max(1, milestone.estimatedDays ?? 1),
-            ),
-            budgetAmount:
-              milestoneBudgetAmount !== null &&
-              Number.isFinite(milestoneBudgetAmount)
-                ? milestoneBudgetAmount.toFixed(2)
-                : null,
-            currency: milestone.currency ?? null,
-            acceptanceCriteria: this.toJsonList(milestone.acceptanceCriteria),
-          }),
-        );
-        milestoneIdByKey.set(milestone.key, saved.id);
-      }
+        const milestoneIdByKey = new Map<string, string>();
+        let quotedAmount = 0;
+        let quotedCurrency: string | null = null;
+        for (const milestone of milestones) {
+          const milestoneBudgetAmount =
+            milestone.budgetAmount != null
+              ? Number(milestone.budgetAmount)
+              : null;
+          if (
+            milestoneBudgetAmount !== null &&
+            Number.isFinite(milestoneBudgetAmount) &&
+            milestoneBudgetAmount > 0
+          ) {
+            quotedAmount += milestoneBudgetAmount;
+            quotedCurrency = quotedCurrency ?? milestone.currency ?? null;
+          }
 
-      const taskIdByKey = new Map<string, string>();
-      for (const task of tasks) {
-        const assignment = this.assignmentForTaskRole(
-          task.roleKey,
-          assignmentsByRole,
-        );
-        const saved = await manager.save(
-          ProjectTask,
-          manager.create(ProjectTask, {
-            projectId: plan.projectId,
-            projectPlanId: plan.id,
-            milestoneId: milestoneIdByKey.get(task.milestoneKey) ?? null,
-            assignmentId: assignment?.id ?? null,
-            assignedFreelancerProfileId:
-              assignment?.freelancerProfileId ?? null,
-            title: task.title,
-            description: task.description ?? null,
-            status: 'todo',
-            priority: task.priority ?? 'medium',
-            roleKey: task.roleKey ?? null,
-            requiredSkills: task.requiredSkills ?? null,
-            estimatedHours:
-              task.estimatedHours != null ? String(task.estimatedHours) : null,
-            orderIndex: task.orderIndex ?? 0,
-            startsAt: this.dateAtPlanDay(plan.createdAt, task.startDay),
-            dueAt: this.dateAtPlanDay(
-              plan.createdAt,
-              (task.startDay ?? 0) + Math.max(1, task.durationDays ?? 1),
-            ),
-            acceptanceCriteria: this.toJsonList(task.acceptanceCriteria),
-            metadata: {
-              contractReferences: task.contractReferences ?? [],
-              ownedPaths: task.ownedPaths ?? [],
-              integrationChecks: task.integrationChecks ?? [],
-            },
-          }),
-        );
-        taskIdByKey.set(task.key, saved.id);
-      }
-
-      let dependencyCount = 0;
-      for (const dependency of dependencies) {
-        const taskId = taskIdByKey.get(dependency.taskKey);
-        const dependsOnTaskId = taskIdByKey.get(dependency.dependsOnKey);
-        if (!taskId || !dependsOnTaskId || dependsOnTaskId === taskId) {
-          continue;
-        }
-        await manager.save(
-          ProjectTaskDependency,
-          manager.create(ProjectTaskDependency, {
-            taskId,
-            dependsOnTaskId,
-            dependencyType: dependency.type,
-            notes: dependency.notes ?? null,
-          }),
-        );
-        dependencyCount += 1;
-      }
-
-      const spec = await manager.save(
-        ProjectSpec,
-        manager.create(ProjectSpec, {
-          projectId: plan.projectId,
-          approvedPlanId: plan.id,
-          architecture: this.specSection(projectSpec.architecture, {
-            architectureSubmissionId: plan.architectureSubmissionId,
-          }),
-          designSystem: this.specSection(projectSpec.designSystem, {
-            uiuxSubmissionId: plan.uiuxSubmissionId,
-          }),
-          apiContract: this.specSection(projectSpec.apiContract),
-          dataModel: this.specSection(projectSpec.dataModel),
-          conventions: this.specSection(projectSpec.conventions),
-          approvedBy: adminUserId,
-          lockedAt: new Date(),
-        }),
-      );
-
-      const project = await manager.findOne(Project, {
-        where: { id: plan.projectId },
-      });
-      if (project) {
-        const oldStatus = project.status;
-        const quote = this.shouldBackfillPlanQuote(project)
-          ? this.buildProjectQuote(project, quotedAmount, quotedCurrency)
-          : null;
-        if (quote) {
-          project.quotedAmount = quote.amount;
-          project.quotedCurrency = quote.currency;
-          project.quoteStatus = quote.status;
-          project.quoteGeneratedAt = quote.generatedAt;
-          project.quoteNotes = quote.notes;
-        }
-        project.status = ProjectStatus.IMPLEMENTATION_READY;
-        project.planningStatus = 'completed';
-        project.planningCompletedAt = project.planningCompletedAt ?? new Date();
-        project.implementationReadyAt =
-          project.implementationReadyAt ?? new Date();
-        await manager.save(Project, project);
-        if (oldStatus !== ProjectStatus.IMPLEMENTATION_READY) {
-          await manager.save(
-            ProjectStatusHistory,
-            manager.create(ProjectStatusHistory, {
-              projectId: project.id,
-              oldStatus,
-              newStatus: ProjectStatus.IMPLEMENTATION_READY,
-              changedBy: adminUserId,
-              changedByType: 'admin',
-              reason: 'Plan materialized into tasks.',
+          const saved = await manager.save(
+            ProjectMilestone,
+            manager.create(ProjectMilestone, {
+              projectId: plan.projectId,
+              projectPlanId: plan.id,
+              title: milestone.title,
+              description: milestone.description ?? null,
+              status: 'planned',
+              orderIndex: milestone.orderIndex ?? 0,
+              startsAt: this.dateAtPlanDay(plan.createdAt, milestone.startDay),
+              dueAt: this.dateAtPlanDay(
+                plan.createdAt,
+                (milestone.startDay ?? 0) +
+                  Math.max(1, milestone.estimatedDays ?? 1),
+              ),
+              budgetAmount:
+                milestoneBudgetAmount !== null &&
+                Number.isFinite(milestoneBudgetAmount)
+                  ? milestoneBudgetAmount.toFixed(2)
+                  : null,
+              currency: milestone.currency ?? null,
+              acceptanceCriteria: this.toJsonList(milestone.acceptanceCriteria),
             }),
           );
+          milestoneIdByKey.set(milestone.key, saved.id);
         }
-      }
 
-      return {
-        projectId: plan.projectId,
-        planId: plan.id,
-        projectStatus: ProjectStatus.IMPLEMENTATION_READY,
-        planningStatus: 'completed',
-        quote: {
-          amount: project?.quotedAmount ?? null,
-          currency: project?.quotedCurrency ?? null,
-          status: project?.quoteStatus ?? 'not_ready',
-          notes: project?.quoteNotes ?? null,
-        },
-        specId: spec.id,
-        milestoneCount: milestoneIdByKey.size,
-        taskCount: taskIdByKey.size,
-        dependencyCount,
-      };
-    });
+        const taskIdByKey = new Map<string, string>();
+        for (const task of tasks) {
+          const saved = await manager.save(
+            ProjectTask,
+            manager.create(ProjectTask, {
+              projectId: plan.projectId,
+              projectPlanId: plan.id,
+              milestoneId: milestoneIdByKey.get(task.milestoneKey) ?? null,
+              assignmentId: null,
+              assignedFreelancerProfileId: null,
+              title: task.title,
+              description: task.description ?? null,
+              status: 'todo',
+              priority: task.priority ?? 'medium',
+              roleKey: task.roleKey ?? null,
+              requiredSkills: task.requiredSkills ?? null,
+              estimatedHours:
+                task.estimatedHours != null
+                  ? String(task.estimatedHours)
+                  : null,
+              orderIndex: task.orderIndex ?? 0,
+              startsAt: this.dateAtPlanDay(plan.createdAt, task.startDay),
+              dueAt: this.dateAtPlanDay(
+                plan.createdAt,
+                (task.startDay ?? 0) + Math.max(1, task.durationDays ?? 1),
+              ),
+              acceptanceCriteria: this.toJsonList(task.acceptanceCriteria),
+              metadata: {
+                contractReferences: task.contractReferences ?? [],
+                ownedPaths: task.ownedPaths ?? [],
+                integrationChecks: task.integrationChecks ?? [],
+              },
+            }),
+          );
+          taskIdByKey.set(task.key, saved.id);
+        }
+
+        let dependencyCount = 0;
+        for (const dependency of dependencies) {
+          const taskId = taskIdByKey.get(dependency.taskKey);
+          const dependsOnTaskId = taskIdByKey.get(dependency.dependsOnKey);
+          if (!taskId || !dependsOnTaskId || dependsOnTaskId === taskId) {
+            continue;
+          }
+          await manager.save(
+            ProjectTaskDependency,
+            manager.create(ProjectTaskDependency, {
+              taskId,
+              dependsOnTaskId,
+              dependencyType: dependency.type,
+              notes: dependency.notes ?? null,
+            }),
+          );
+          dependencyCount += 1;
+        }
+
+        const spec = await manager.save(
+          ProjectSpec,
+          manager.create(ProjectSpec, {
+            projectId: plan.projectId,
+            approvedPlanId: plan.id,
+            architecture: this.specSection(projectSpec.architecture, {
+              architectureSubmissionId: plan.architectureSubmissionId,
+            }),
+            designSystem: this.specSection(projectSpec.designSystem, {
+              uiuxSubmissionId: plan.uiuxSubmissionId,
+            }),
+            apiContract: this.specSection(projectSpec.apiContract),
+            dataModel: this.specSection(projectSpec.dataModel),
+            conventions: this.specSection(projectSpec.conventions),
+            approvedBy: adminUserId,
+            lockedAt: new Date(),
+          }),
+        );
+
+        const project = await manager.findOne(Project, {
+          where: { id: plan.projectId },
+        });
+        if (project) {
+          const oldStatus = project.status;
+          const quote = this.shouldBackfillPlanQuote(project)
+            ? this.buildProjectQuote(project, quotedAmount, quotedCurrency)
+            : null;
+          if (quote) {
+            project.quotedAmount = quote.amount;
+            project.quotedCurrency = quote.currency;
+            project.quoteStatus = quote.status;
+            project.quoteGeneratedAt = quote.generatedAt;
+            project.quoteNotes = quote.notes;
+          }
+          project.status = ProjectStatus.IMPLEMENTATION_READY;
+          project.planningStatus = 'completed';
+          project.planningCompletedAt =
+            project.planningCompletedAt ?? new Date();
+          project.implementationReadyAt =
+            project.implementationReadyAt ?? new Date();
+          await manager.save(Project, project);
+          if (oldStatus !== ProjectStatus.IMPLEMENTATION_READY) {
+            await manager.save(
+              ProjectStatusHistory,
+              manager.create(ProjectStatusHistory, {
+                projectId: project.id,
+                oldStatus,
+                newStatus: ProjectStatus.IMPLEMENTATION_READY,
+                changedBy: adminUserId,
+                changedByType: 'admin',
+                reason: 'Plan materialized into tasks.',
+              }),
+            );
+          }
+        }
+
+        return {
+          projectId: plan.projectId,
+          planId: plan.id,
+          projectStatus: ProjectStatus.IMPLEMENTATION_READY,
+          planningStatus: 'completed',
+          quote: {
+            amount: project?.quotedAmount ?? null,
+            currency: project?.quotedCurrency ?? null,
+            status: project?.quoteStatus ?? 'not_ready',
+            notes: project?.quoteNotes ?? null,
+          },
+          specId: spec.id,
+          milestoneCount: milestoneIdByKey.size,
+          taskCount: taskIdByKey.size,
+          dependencyCount,
+        };
+      },
+    );
+    const matchingDispatch =
+      await this.matchingService.autoStartImplementationTasks(
+        plan.projectId,
+        adminUserId,
+      );
+    return { ...materialization, matchingDispatch };
   }
 
   // ---------------------------------------------------------------------------
@@ -824,52 +834,6 @@ export class ProjectPlansService {
       },
       order: { createdAt: 'DESC' },
     });
-  }
-
-  private async activePlanningAssignmentsByRole(
-    manager: EntityManager,
-    projectId: string,
-  ) {
-    const assignments = await manager.find(ProjectRoleAssignment, {
-      where: {
-        projectId,
-        phase: 'planning',
-        status: In(['assigned', 'accepted', 'in_progress', 'completed']),
-      },
-    });
-
-    return new Map(
-      assignments.map((assignment) => [
-        this.normalizeRoleKey(assignment.roleKey),
-        assignment,
-      ]),
-    );
-  }
-
-  private assignmentForTaskRole(
-    roleKey: string | null | undefined,
-    assignmentsByRole: Map<string, ProjectRoleAssignment>,
-  ) {
-    if (!roleKey) return null;
-    return assignmentsByRole.get(this.normalizeRoleKey(roleKey)) ?? null;
-  }
-
-  private normalizeRoleKey(roleKey: string) {
-    const normalized = roleKey
-      .trim()
-      .toLowerCase()
-      .replace(/[-\s]+/g, '_');
-    if (
-      ['architecture', 'system_architect', 'solution_architect'].includes(
-        normalized,
-      )
-    ) {
-      return 'architect';
-    }
-    if (['uiux', 'ui_ux_designer', 'ux_ui', 'design'].includes(normalized)) {
-      return 'ui_ux';
-    }
-    return normalized;
   }
 
   private async markPlanJobRunning(

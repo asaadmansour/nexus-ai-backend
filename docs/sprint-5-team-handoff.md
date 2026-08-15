@@ -14,8 +14,9 @@ Sprint 4 ended with this flow:
 8. Failed checks return exact revision work and require a new immutable submission version. Admin approval is blocked until AI recommends approval; the admin still makes the final decision.
 9. After both admin approvals, Scrum Master generates the implementation plan.
 10. Admin approves and materializes the plan into scheduled milestones, tasks, dependencies, task-level contract references, ownership boundaries, integration checks, and the locked project spec.
+11. Successful materialization automatically creates one background implementation-matching run per unassigned task. Admin reviews ranked candidates and confirms each final task assignment.
 
-Sprint 5 starts after step 10.
+Sprint 5 delivery work starts after step 11.
 
 The goal is:
 
@@ -73,7 +74,7 @@ What is ready:
 - All 9 Jest suites pass (22 tests).
 - Sprint 5 readiness migration, entity mappings, profile update persistence,
   and GitHub username validation are implemented locally.
-- PostgreSQL 17 with pgvector is running locally and all 23 migrations are
+- PostgreSQL 17 with pgvector is running locally and all 24 migrations are
   applied; post-migration inspection confirmed the Sprint 5 columns, foreign
   keys, status constraints, and required indexes.
 - A second clean disposable database passed the complete migration chain, a
@@ -104,13 +105,21 @@ What is ready:
 - Migration `1785700000000-AddPlanningEvaluationContract.ts` adds persistent
   planning evaluation lifecycle, score, recommendation, result, requirement
   snapshot, error, job link, and timestamp fields. A clean disposable database
-  applied all 23 migrations and verified all seven columns and three constraints.
+  applied all 24 migrations and verified all seven columns and three constraints.
+- Migration `1785800000000-GuardActiveTaskMatchingRuns.ts` cancels any older
+  duplicate active task-matching runs during upgrade and adds a partial unique
+  index so a task cannot have two queued/running matching runs concurrently.
 - A clean HTTP/BullMQ/mock-AI integration run verified the planning gate end to
   end: UI/UX waited for architecture; missing architecture evidence returned
   `changes_requested`; premature admin approval returned 409; complete
   architecture and UI/UX passed; admin approval queued Scrum generation; and
   materialization persisted three scheduled contract-aware tasks and two
   dependencies. The isolated database and Redis DB were removed afterward.
+- A separate clean integration run verified materialization-to-matching:
+  materialization returned in 31 ms with three persisted background task runs;
+  all three completed; a second materialization created no duplicates; tasks
+  remained unassigned until an admin selected a ranked candidate; and the
+  isolated database and Redis DB were removed afterward.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.
@@ -122,7 +131,7 @@ Shared-environment database gate:
 
 - Ebrahim provisions a replacement hosted PostgreSQL/Supabase project and
   shares its secret connection values through the team's secret manager.
-- Ebrahim runs `npm run db:show`, applies all 23 migrations deliberately, and
+- Ebrahim runs `npm run db:show`, applies all 24 migrations deliberately, and
   repeats the schema verification used locally.
 - The team must not reuse or circulate the expired Supabase URL.
 
@@ -220,6 +229,18 @@ Materialization stores schedule dates in `starts_at`/`due_at` and the three task
 contract arrays in `project_tasks.metadata`. The project plan is rejected by the
 AI service if tasks omit these fields or if any locked project-spec section is
 empty.
+
+After the materialization transaction commits, NestJS automatically invokes
+implementation matching in `async` mode. It persists one `matching_runs` row
+per unmatched task before returning, then performs ranking in the background.
+The materialization response includes `matchingDispatch` with `triggered`,
+`processing`, and the created run IDs. Repeating materialization is idempotent:
+tasks with active or completed runs are skipped.
+
+Planning-role assignments must never be copied onto implementation tasks.
+Materialized tasks start with both `assignment_id` and
+`assigned_freelancer_profile_id` null. Only the admin-confirmed task assignment
+route may populate them after candidate review.
 
 ## Required Sprint 5 DB Additions
 
@@ -752,7 +773,9 @@ Owner: Sameh.
 
 Roles: admin
 
-Purpose: create task-level matching runs after Scrum plan materialization.
+Purpose: create task-level matching runs after Scrum plan materialization. This
+route remains available for deliberate reruns or filtered matching; the initial
+bulk matching starts automatically after successful materialization.
 
 Payload:
 
@@ -1851,7 +1874,8 @@ Sprint 5 is done when:
 - Admin can create/open a GitHub repository for an implementation-ready project.
 - Freelancers can save GitHub usernames.
 - Admin can sync repo collaborators from assigned task freelancers.
-- Admin can start implementation matching for unassigned tasks.
+- Plan materialization automatically starts implementation matching for every
+  unassigned task; admin can still start deliberate filtered reruns.
 - Admin can approve a candidate and assign a freelancer to a task.
 - Freelancer sees assigned implementation tasks.
 - Freelancer can submit a task with PR/repo/file/text evidence.

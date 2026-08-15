@@ -299,6 +299,56 @@ export class MatchingService {
   // Start implementation-task matching
   // ---------------------------------------------------------------------------
 
+  async autoStartImplementationTasks(projectId: string, adminUserId: string) {
+    try {
+      const result = await this.startImplementationTasks(
+        projectId,
+        { mode: 'async' },
+        adminUserId,
+      );
+      return {
+        triggered: true,
+        ...result,
+      };
+    } catch (error) {
+      const message = this.errorMessage(error);
+      if (
+        error instanceof BadRequestException &&
+        message.includes('No unassigned implementation tasks')
+      ) {
+        return {
+          triggered: false,
+          projectId,
+          reason: 'no_unmatched_tasks',
+        };
+      }
+      const existingRunCount = await this.runRepo.count({
+        where: {
+          projectId,
+          targetType: 'task',
+          status: In(['queued', 'running', 'completed', 'reviewed']),
+        },
+      });
+      if (existingRunCount > 0) {
+        return {
+          triggered: false,
+          projectId,
+          reason: 'matching_already_started',
+          runCount: existingRunCount,
+        };
+      }
+      this.logger.error(
+        `Automatic implementation matching failed for project ${projectId}: ${message}`,
+      );
+      return {
+        triggered: false,
+        projectId,
+        reason: 'matching_start_failed',
+        error: message,
+      };
+    }
+  }
+
   // One matching run per implementation task. Runs are created up front so the
   // admin sees them immediately; the AI ranking then fills each one in turn.
   async startImplementationTasks(
@@ -359,28 +409,87 @@ export class MatchingService {
       return created;
     });
 
-    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    const processRuns = () =>
+      this.processImplementationRuns({
+        project,
+        briefSnapshot,
+        limit,
+        maxRate,
+        filters: dto.filters,
+        tasks,
+        runs,
+      });
+
+    if (dto.mode === 'async') {
+      void processRuns().catch((error) => {
+        this.logger.error(
+          `Background implementation matching crashed for project ${projectId}: ${this.errorMessage(error)}`,
+        );
+      });
+      return {
+        projectId,
+        projectStatus: ProjectStatus.MATCHING,
+        processing: 'background',
+        runs: runs.map((run) => ({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: run.targetTaskId,
+          targetRoleKey: run.targetRoleKey,
+          status: 'running',
+        })),
+      };
+    }
+
+    const runResults = await processRuns();
+
+    return {
+      projectId,
+      projectStatus: ProjectStatus.MATCHING,
+      runs: runResults,
+    };
+  }
+
+  private async processImplementationRuns(input: {
+    project: Project;
+    briefSnapshot: Record<string, unknown> | null;
+    limit: number;
+    maxRate: number | null;
+    filters: PlanningMatchingFiltersDto | undefined;
+    tasks: ProjectTask[];
+    runs: MatchingRun[];
+  }) {
+    const tasksById = new Map(input.tasks.map((task) => [task.id, task]));
     const runResults: Record<string, unknown>[] = [];
 
-    for (const run of runs) {
-      const task = tasksById.get(run.targetTaskId!)!;
+    for (const run of input.runs) {
+      const task = tasksById.get(run.targetTaskId!);
+      if (!task) {
+        runResults.push({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: run.targetTaskId,
+          status: 'failed',
+          error: await this.failRun(run, 'Materialized task was not found'),
+        });
+        continue;
+      }
       try {
-        const skills = dto.filters?.skills?.length
-          ? dto.filters.skills
+        const skills = input.filters?.skills?.length
+          ? input.filters.skills
           : (task.requiredSkills ?? []);
         const candidates = await this.buildTaskCandidatePool(
           task,
-          dto.filters,
-          maxRate,
+          input.filters,
+          input.maxRate,
         );
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
           targetType: 'task',
           targetRoleKey: run.targetRoleKey ?? 'implementation',
           targetTaskId: task.id,
-          limit,
-          project: this.buildProjectSnapshot(project, skills),
-          brief: briefSnapshot,
+          limit: input.limit,
+          project: this.buildProjectSnapshot(input.project, skills),
+          brief: input.briefSnapshot,
           task: this.buildTaskSnapshot(task, skills),
           candidates,
         });
@@ -409,12 +518,7 @@ export class MatchingService {
         });
       }
     }
-
-    return {
-      projectId,
-      projectStatus: ProjectStatus.MATCHING,
-      runs: runResults,
-    };
+    return runResults;
   }
 
   // ---------------------------------------------------------------------------
