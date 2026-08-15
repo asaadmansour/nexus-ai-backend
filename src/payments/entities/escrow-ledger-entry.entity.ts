@@ -23,6 +23,15 @@ import { ProjectPayment } from './project-payment.entity';
 @Index('escrow_ledger_entries_freelancer_idx', ['freelancerProfileId'], {
   where: '"freelancer_profile_id" IS NOT NULL',
 })
+@Index(
+  'escrow_ledger_entries_submission_release_uidx',
+  ['approvedSubmissionId'],
+  {
+    unique: true,
+    where:
+      '"approved_submission_id" IS NOT NULL AND "entry_type" = \'release\' AND "status" = \'posted\'',
+  },
+)
 export class EscrowLedgerEntry {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -115,6 +124,9 @@ export class EscrowLedgerEntry {
 
   @Column({ name: 'posted_at', type: 'timestamptz', nullable: true })
   postedAt!: Date | null;
+
+  @Column({ type: 'jsonb', nullable: true })
+  metadata!: Record<string, unknown> | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

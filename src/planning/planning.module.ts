@@ -14,10 +14,14 @@ import { AdminPlanningController } from './admin-planning.controller';
 import { PlanningSubmissionsService } from './planning-submissions.service';
 import { ProjectPlansService } from './project-plans.service';
 import { ProjectPlanGenerationProcessor } from './jobs/project-plan-generation.processor';
+import { PlanningSubmissionEvaluationProcessor } from './jobs/planning-submission-evaluation.processor';
 import { areQueuesEnabled } from 'src/queues/queue-runtime';
+import { PlanningEvaluationsService } from './planning-evaluations.service';
+import { MatchingModule } from 'src/matching/matching.module';
+import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
 
 const queueProcessors = areQueuesEnabled()
-  ? [ProjectPlanGenerationProcessor]
+  ? [ProjectPlanGenerationProcessor, PlanningSubmissionEvaluationProcessor]
   : [];
 
 @Module({
@@ -27,6 +31,7 @@ const queueProcessors = areQueuesEnabled()
     NotificationsModule,
     QueuesModule,
     AgentsModule,
+    MatchingModule,
   ],
   controllers: [
     ProjectPlanningController,
@@ -37,9 +42,15 @@ const queueProcessors = areQueuesEnabled()
   ],
   providers: [
     PlanningSubmissionsService,
+    PlanningEvaluationsService,
+    PlanningEvaluationSandboxService,
     ProjectPlansService,
     ...queueProcessors,
   ],
-  exports: [PlanningSubmissionsService, ProjectPlansService],
+  exports: [
+    PlanningSubmissionsService,
+    PlanningEvaluationsService,
+    ProjectPlansService,
+  ],
 })
 export class PlanningModule {}

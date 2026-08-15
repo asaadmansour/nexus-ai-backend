@@ -72,10 +72,12 @@ export class AddProjectQuoteFields1785300000000 implements MigrationInterface {
     constraintName: string,
     sql: string,
   ) {
-    const exists = await queryRunner.query(
+    const exists: unknown = await queryRunner.query(
       `SELECT 1 FROM pg_constraint WHERE conname = $1`,
       [constraintName],
     );
-    if (!exists.length) await queryRunner.query(sql);
+    if (!Array.isArray(exists) || exists.length === 0) {
+      await queryRunner.query(sql);
+    }
   }
 }

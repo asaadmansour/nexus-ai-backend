@@ -9,12 +9,14 @@ Sprint 4 ended with this flow:
 3. Customer funds escrow.
 4. Payment success starts planning-role matching.
 5. Admin chooses architect, then UI/UX.
-6. Architect and UI/UX submit planning deliverables.
-7. Admin approves both deliverables.
-8. Scrum Master generates the implementation plan.
-9. Admin approves and materializes the plan into milestones, tasks, dependencies, and the locked project spec.
+6. Architect and UI/UX submit project-specific evidence against their mandatory checklists.
+7. AI evaluates architecture first; UI/UX evaluation waits for approved architecture and then cross-checks its screens, states, fields, permissions, and endpoints against that contract.
+8. Failed checks return exact revision work and require a new immutable submission version. Admin approval is blocked until AI recommends approval; the admin still makes the final decision.
+9. After both admin approvals, Scrum Master generates the implementation plan.
+10. Admin approves and materializes the plan into scheduled milestones, tasks, dependencies, task-level contract references, ownership boundaries, integration checks, and the locked project spec.
+11. Successful materialization automatically creates one background implementation-matching run per unassigned task. Admin reviews ranked candidates and confirms each final task assignment.
 
-Sprint 5 starts after step 9.
+Sprint 5 delivery work starts after step 11.
 
 The goal is:
 
@@ -51,23 +53,16 @@ Important missing pieces before Sprint 5 is complete:
 - The previous Supabase project reference no longer exists. Local PostgreSQL 17
   with pgvector is working and fully migrated, but a new shared hosted database
   must be provisioned before staging/team integration.
-- No product routes for `project_submissions` yet.
-- No product routes for `project_submission_reviews` yet.
-- No product routes for `project_revision_requests` yet.
-- No product routes for `evaluation_runs` yet.
-- No GitHub repository service/controller yet.
-- Sprint 5 readiness migration `1785500000000-Sprint5Readiness.ts` is verified
-  locally and must be repeated on the replacement hosted database.
-- No implementation-task matching endpoint yet.
-- Current matching agent contract only validates `architect` and `ui_ux`.
-- No queue type for submission evaluation yet.
-- FastAPI `/agents/evaluate-submission` is still mock behavior.
-- Current payment release route releases a whole payment directly. Sprint 5 needs release requests with milestone/submission amounts.
-- Frontend has no real implementation task board, submission pages, evaluation queue, repository page, or release-request workflow.
+- Sprint 5 migrations `1785500000000-Sprint5Readiness.ts` and
+  `1785600000000-AddSprint5DeliveryContract.ts`, plus planning-gate migration
+  `1785700000000-AddPlanningEvaluationContract.ts`, are verified locally and
+  must be repeated on the replacement hosted database.
+- Customer/freelancer delivery, submission, revision, and release-request pages
+  and their typed frontend services still need to be implemented.
 
 ## Readiness Audit
 
-Audit date: 2026-08-13.
+Audit date: 2026-08-15.
 
 Verdict: **Sprint 5 is ready for local implementation.** It is not ready for a
 shared staging deployment until the expired Supabase project is replaced and
@@ -76,20 +71,68 @@ the verified migrations are applied there.
 What is ready:
 
 - NestJS production build passes.
-- All 6 Jest suites pass (13 tests).
+- All 9 Jest suites pass (22 tests).
 - Sprint 5 readiness migration, entity mappings, profile update persistence,
   and GitHub username validation are implemented locally.
-- PostgreSQL 17 with pgvector is running locally and all 21 migrations are
-  applied; a post-migration inspection confirmed the Sprint 5 columns, foreign
-  keys, status constraint, and six required indexes.
+- PostgreSQL 17 with pgvector is running locally and all 24 migrations are
+  applied; post-migration inspection confirmed the Sprint 5 columns, foreign
+  keys, status constraints, and required indexes.
 - A second clean disposable database passed the complete migration chain, a
   Sprint 5 revert, and Sprint 5 reapplication; the disposable database was then
   removed.
 - Local Redis is running, the backend starts with BullMQ enabled, and
   `/api/health` returns `{ "status": "ok" }` against the migrated database.
 - The changed Sprint 5 backend files pass lint/format checks, the full backend
-  build and all 13 tests pass, frontend lint and production build pass, and the
+  build and all 22 tests pass, frontend lint and production build pass, and the
   AI service compiles and imports successfully from its virtual environment.
+- Implementation-task matching, task assignment, GitHub repository automation,
+  and their frontend admin screens are present after synchronizing `dev`.
+- Muhanad's Sprint 5 delivery UI is merged into the shared feature branch with
+  its backend contracts reconciled: submission types, detail response shape,
+  release payloads, admin delivery views, customer review, and freelancer task
+  work screens now use the implemented API shapes.
+- Implementation-only freelancers are included by
+  `GET /freelancer/projects/assigned`; project assignment detail may return an
+  empty planning `assignments` array plus `implementationTaskCount`, and their
+  task assignment grants milestone/task read access for the project.
+- Submission/versioning, review/revision, release-request, ledger-only release,
+  authorization, pagination, and notification routes are implemented on
+  `feature/sprint-5-asaad-delivery`.
+- Evaluation routes, queue producer/processor/recovery, admin evaluation pages,
+  and the real FastAPI evaluation agent are integrated on the same feature
+  branch. Submitted work now queues an evaluation automatically through the
+  shared dispatcher contract.
+- A disposable 22-migration database passed the full HTTP delivery flow:
+  submission, revision, immutable replacement version, approval, release
+  request, idempotent ledger-only posting, and final project completion.
+- A fresh disposable 22-migration database also passed the merged live
+  submission-evaluation flow: HTTP submission, BullMQ dispatch, FastAPI/Gemini
+  evaluation, completed `evaluation_runs`/`agent_jobs` persistence, and admin
+  detail/list reads. Its isolated database and Redis namespace were removed
+  after verification.
+- Migration `1785700000000-AddPlanningEvaluationContract.ts` adds persistent
+  planning evaluation lifecycle, score, recommendation, result, requirement
+  snapshot, error, job link, and timestamp fields. A clean disposable database
+  applied all 24 migrations and verified all seven columns and three constraints.
+- Migration `1785800000000-GuardActiveTaskMatchingRuns.ts` cancels any older
+  duplicate active task-matching runs during upgrade and adds a partial unique
+  index so a task cannot have two queued/running matching runs concurrently.
+- A clean HTTP/BullMQ/mock-AI integration run verified the planning gate end to
+  end: UI/UX waited for architecture; missing architecture evidence returned
+  `changes_requested`; premature admin approval returned 409; complete
+  architecture and UI/UX passed; admin approval queued Scrum generation; and
+  materialization persisted three scheduled contract-aware tasks and two
+  dependencies. The isolated database and Redis DB were removed afterward.
+- A separate clean integration run verified materialization-to-matching:
+  materialization returned in 31 ms with three persisted background task runs;
+  all three completed; a second materialization created no duplicates; tasks
+  remained unassigned until an admin selected a ranked candidate; and the
+  isolated database and Redis DB were removed afterward.
+- A fresh 24-migration HTTP run verified the implementation-freelancer handoff
+  with zero planning assignments: the project appeared in the freelancer list,
+  assignment detail reported one implementation task, the task was readable,
+  and a backend-valid `file` draft submission plus nested detail response both
+  succeeded. The disposable server and database were removed afterward.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.
@@ -101,31 +144,135 @@ Shared-environment database gate:
 
 - Ebrahim provisions a replacement hosted PostgreSQL/Supabase project and
   shares its secret connection values through the team's secret manager.
-- Ebrahim runs `npm run db:show`, applies all 21 migrations deliberately, and
+- Ebrahim runs `npm run db:show`, applies all 24 migrations deliberately, and
   repeats the schema verification used locally.
 - The team must not reuse or circulate the expired Supabase URL.
 
 Blocking application work:
 
-- No Sprint 5 repository, submission, revision, evaluation, task-assignment,
-  or release-request controller/service exists yet.
-- Matching is implemented only for planning roles; the NestJS DTO currently
-  accepts only `architect` and `ui_ux`.
-- There is no `submission_evaluation` queue, producer, processor, or recovery
-  path.
-- FastAPI submission evaluation still returns mock output.
-- Sprint 5 frontend services and workspaces do not exist yet.
+- Customer/freelancer delivery, submission, revision, and release frontend
+  services and workspaces are still pending.
+- A replacement shared hosted database is still required before staging or
+  multi-developer integration testing.
+
+## Mandatory Planning Quality Gate
+
+This gate is part of the Sprint 5 implementation baseline. Implementation work
+must not start from informal architecture notes or design screenshots.
+
+### Ordering and decisions
+
+1. Architecture and UI/UX freelancers may prepare evidence in parallel.
+2. Architecture submission automatically queues AI evaluation.
+3. UI/UX submission is saved as `pending_architecture` until the latest
+   architecture submission passes AI and receives final admin approval.
+4. After architecture approval, the latest pending UI/UX submission queues
+   automatically and is cross-checked against the approved architecture.
+5. Any mandatory `partial`, `missing`, or `conflict` check forces
+   `changes_requested`, caps the score below 70, and returns actionable
+   `revisionItems`. The freelancer creates a new version; old versions remain
+   immutable and become `superseded`.
+6. A score of at least 80 with no blocker allows an AI `approve`
+   recommendation. It does not approve the deliverable.
+7. NestJS returns 409 if an admin tries to approve before a completed AI
+   `approve` recommendation.
+8. Final admin approval of both submissions queues Scrum plan generation.
+
+Planning evaluation statuses:
+
+- `pending`
+- `pending_architecture`
+- `queued`
+- `running`
+- `completed`
+- `failed`
+
+Routes:
+
+- `GET /api/projects/:projectId/planning-requirements/:submissionType`
+- `POST /api/projects/:projectId/planning-submissions`
+- `GET /api/planning-submissions/:submissionId`
+- `POST /api/planning-submissions/:submissionId/evaluation/retry` (admin)
+- `PATCH /api/planning-submissions/:submissionId/review` (admin)
+- FastAPI internal route: `POST /agents/evaluate-planning-submission`
+
+Every requirement is sent as:
+
+```json
+{
+  "key": "api_contract",
+  "title": "API and event contracts",
+  "description": "Methods, paths, auth, request, response, validation, and errors.",
+  "mandatory": true,
+  "requiresUrl": true
+}
+```
+
+Freelancer evidence is stored in
+`content.requirementEvidence[requirementKey] = { summary, urls }`. URL-required
+items cannot pass without a URL. The backend re-normalizes the AI response so a
+model cannot accidentally approve omitted evidence or omit a checklist row.
+
+Architecture base requirements cover system context, architecture diagram,
+technology decisions, module/data ownership, API/event contracts, data model,
+auth/security, integrations and failure behavior, non-functional requirements,
+deployment/observability, and implementation handoff.
+
+UI/UX base requirements cover Figma source, information architecture, full user
+flows, wireframes, high-fidelity responsive screens, clickable prototype, all
+screen/component states, accessibility, design system, screen-to-API/data
+mapping, and developer asset handoff.
+
+Both checklists add mandatory coverage rows for each project feature extracted
+from the confirmed brief. Do not hardcode one generic checklist in the frontend;
+always fetch it from NestJS.
+
+### Scrum output needed for independent parallel work
+
+The approved planning evidence, including evidence URLs, is passed to the Scrum
+Master. Each generated task must contain:
+
+- `startDay` and `durationDays` for the dependency-aware Gantt schedule.
+- `contractReferences` to approved architecture/design/API/data evidence.
+- `ownedPaths` defining the freelancer's primary code ownership boundary.
+- `integrationChecks` another freelancer or reviewer can run.
+- Project-specific acceptance criteria and explicit dependencies.
+
+Materialization stores schedule dates in `starts_at`/`due_at` and the three task
+contract arrays in `project_tasks.metadata`. The project plan is rejected by the
+AI service if tasks omit these fields or if any locked project-spec section is
+empty.
+
+After the materialization transaction commits, NestJS automatically invokes
+implementation matching in `async` mode. It persists one `matching_runs` row
+per unmatched task before returning, then performs ranking in the background.
+The materialization response includes `matchingDispatch` with `triggered`,
+`processing`, and the created run IDs. Repeating materialization is idempotent:
+tasks with active or completed runs are skipped.
+
+Planning-role assignments must never be copied onto implementation tasks.
+Materialized tasks start with both `assignment_id` and
+`assigned_freelancer_profile_id` null. Only the admin-confirmed task assignment
+route may populate them after candidate review.
 
 ## Required Sprint 5 DB Additions
 
-Ebrahim owns one coordinated Sprint 5 readiness migration for this section.
-Asaad and Sameh review the parts belonging to their verticals before it lands.
-Do not split these changes into competing migrations.
+Ebrahim owns the coordinated Sprint 5 readiness migration for this section.
+Asaad and Sameh review the parts belonging to their verticals. The later
+delivery-contract migration is intentionally separate because the readiness
+migration had already landed and been applied before the missing delivery
+columns were discovered; do not rewrite an applied migration.
 
-Implementation status (2026-08-13): the code below is implemented in
+Implementation status (2026-08-15): the code below is implemented in
 `1785500000000-Sprint5Readiness.ts` and matching TypeORM entities/DTOs. It was
 applied and verified on a clean local PostgreSQL 17 + pgvector database. The
 same verification remains required on the replacement hosted database.
+
+The delivery contract required one forward-only follow-up migration,
+`1785600000000-AddSprint5DeliveryContract.ts`, because the already-applied
+foundation schema had no `project_submissions.submission_type` column and no
+`escrow_ledger_entries.metadata` column. Do not edit the applied readiness
+migration; apply both migrations in order.
 
 ### Add `freelancer_profiles.github_username`
 
@@ -639,7 +786,9 @@ Owner: Sameh.
 
 Roles: admin
 
-Purpose: create task-level matching runs after Scrum plan materialization.
+Purpose: create task-level matching runs after Scrum plan materialization. This
+route remains available for deliberate reruns or filtered matching; the initial
+bulk matching starts automatically after successful materialization.
 
 Payload:
 
@@ -946,10 +1095,7 @@ Payload:
   "title": "Fix checkout webhook tests",
   "description": "The implementation needs duplicate event handling tests.",
   "requestedChanges": {
-    "items": [
-      "Add duplicate webhook test",
-      "Show event id in logs"
-    ]
+    "items": ["Add duplicate webhook test", "Show event id in logs"]
   },
   "dueAt": "2026-07-27T00:00:00.000Z"
 }
@@ -1219,9 +1365,7 @@ Request:
       "name": "Mina",
       "headline": "Frontend engineer",
       "skills": ["React", "Next.js"],
-      "skillScores": [
-        { "skill": "React", "score": 4.6 }
-      ],
+      "skillScores": [{ "skill": "React", "score": 4.6 }],
       "averageSkillScore": 4.3,
       "availabilityHours": 20,
       "hourlyRate": 25,
@@ -1281,16 +1425,13 @@ Request:
     "summary": "Online bakery store with payments and stock dashboard.",
     "projectType": "ecommerce",
     "domain": "bakery",
-    "acceptanceCriteria": [
-      "Customers can buy online",
-      "Admin can track stock"
-    ]
+    "acceptanceCriteria": ["Customers can buy online", "Admin can track stock"]
   },
   "projectSpec": {
-    "projectSpecId": "uuid",
-    "status": "locked",
+    "architecture": {},
+    "designSystem": {},
     "apiContract": {},
-    "designTokens": {},
+    "dataModel": {},
     "conventions": {}
   },
   "task": {
@@ -1323,38 +1464,27 @@ Response:
 {
   "passed": false,
   "score": 72,
-  "recommendation": "request_revision",
-  "summary": "Checkout session creation is present, but webhook idempotency tests are missing.",
-  "findings": [
-    {
-      "severity": "major",
-      "area": "webhook",
-      "message": "Duplicate Stripe event handling is not proven.",
-      "evidence": "No test or code path found for duplicate event ids."
-    }
-  ],
-  "acceptanceCoverage": [
+  "revisionRequested": true,
+  "revisionNotes": "Add duplicate webhook event handling and tests.",
+  "requiresHumanReview": true,
+  "rubric": [
     {
       "criterion": "Endpoint creates checkout session",
-      "status": "met",
+      "met": true,
       "evidence": "API route exists and validates amount."
     },
     {
       "criterion": "Webhook is idempotent",
-      "status": "partial",
+      "met": false,
       "evidence": "Webhook stores events but lacks duplicate handling test."
     }
-  ],
-  "riskFlags": ["payment_integrity", "missing_tests"],
-  "revisionRequested": true,
-  "revisionNotes": "Add duplicate webhook event handling and tests.",
-  "requiresHumanReview": true,
-  "modelName": "gemini-...",
-  "promptVersion": "submission-evaluation-v1"
+  ]
 }
 ```
 
-Backend stores this in `evaluation_runs`.
+The backend normalizes this response and stores it in `evaluation_runs`. It
+derives the database recommendation as `approve`, `changes_requested`, or
+`manual_review`; `reject` remains available for an explicit product decision.
 
 ### `POST /agents/generate-task`
 
@@ -1366,7 +1496,7 @@ Do not replace the Scrum Master project-plan flow with this. The source of truth
 
 Owner: Ebrahim.
 
-Add queue constants:
+Integrated queue constants:
 
 - Queue: `submission-evaluation`
 - Job name: `evaluate-submission`
@@ -1390,6 +1520,21 @@ Recovery:
 - Failed evaluation jobs older than 1 hour should be requeued from DB input.
 - Manual retry button calls `POST /api/evaluation-runs/:evaluationRunId/retry`.
 
+Integration seam already implemented by Asaad:
+
+- `DeliveryService` injects the optional
+  `SUBMISSION_EVALUATION_DISPATCHER` token from
+  `src/delivery/submission-evaluation-dispatcher.ts`.
+- Ebrahim's evaluation service now implements `queueSubmissionEvaluation` and
+  is registered against that token through `EvaluationsModule`, which is
+  imported by `DeliveryModule`.
+- The provider queues the database-backed evaluation; the delivery service then
+  moves the submission to `under_review` and stores the evaluation-run and
+  agent-job IDs in submission metadata.
+- If queueing fails, the submitted row remains visible with an explicit failed
+  dispatch state. The API never reports a mock or unqueued evaluation as
+  successful.
+
 ## Frontend Route And Page Contracts
 
 Frontend ownership is split by vertical below. Service names and routes are
@@ -1403,13 +1548,17 @@ Add `deliveryEndpoints` in `src/lib/api.ts`.
 export const deliveryEndpoints = {
   repositories: {
     create: (projectId: string) => `/projects/${projectId}/repository`,
-    projectRepository: (projectId: string) => `/projects/${projectId}/repository`,
-    syncCollaborators: (projectId: string) => `/projects/${projectId}/repository/collaborators/sync`,
-    resendInvite: (collaboratorId: string) => `/repository-collaborators/${collaboratorId}/resend-invite`,
-    adminList: "/admin/repositories",
+    projectRepository: (projectId: string) =>
+      `/projects/${projectId}/repository`,
+    syncCollaborators: (projectId: string) =>
+      `/projects/${projectId}/repository/collaborators/sync`,
+    resendInvite: (collaboratorId: string) =>
+      `/repository-collaborators/${collaboratorId}/resend-invite`,
+    adminList: '/admin/repositories',
   },
   implementationMatching: {
-    startTasks: (projectId: string) => `/projects/${projectId}/matching/implementation-tasks`,
+    startTasks: (projectId: string) =>
+      `/projects/${projectId}/matching/implementation-tasks`,
     assignTask: (taskId: string) => `/project-tasks/${taskId}/assignment`,
   },
   submissions: {
@@ -1417,28 +1566,38 @@ export const deliveryEndpoints = {
     projectList: (projectId: string) => `/projects/${projectId}/submissions`,
     detail: (submissionId: string) => `/project-submissions/${submissionId}`,
     update: (submissionId: string) => `/project-submissions/${submissionId}`,
-    submit: (submissionId: string) => `/project-submissions/${submissionId}/submit`,
-    review: (submissionId: string) => `/project-submissions/${submissionId}/review`,
-    freelancerList: "/freelancer/submissions",
-    adminList: "/admin/submissions",
+    submit: (submissionId: string) =>
+      `/project-submissions/${submissionId}/submit`,
+    review: (submissionId: string) =>
+      `/project-submissions/${submissionId}/review`,
+    freelancerList: '/freelancer/submissions',
+    adminList: '/admin/submissions',
   },
   revisions: {
     create: (projectId: string) => `/projects/${projectId}/revision-requests`,
-    projectList: (projectId: string) => `/projects/${projectId}/revision-requests`,
-    updateStatus: (revisionRequestId: string) => `/revision-requests/${revisionRequestId}/status`,
+    projectList: (projectId: string) =>
+      `/projects/${projectId}/revision-requests`,
+    updateStatus: (revisionRequestId: string) =>
+      `/revision-requests/${revisionRequestId}/status`,
   },
   evaluations: {
-    create: (submissionId: string) => `/project-submissions/${submissionId}/evaluations`,
-    submissionList: (submissionId: string) => `/project-submissions/${submissionId}/evaluations`,
+    create: (submissionId: string) =>
+      `/project-submissions/${submissionId}/evaluations`,
+    submissionList: (submissionId: string) =>
+      `/project-submissions/${submissionId}/evaluations`,
     detail: (evaluationRunId: string) => `/evaluation-runs/${evaluationRunId}`,
-    retry: (evaluationRunId: string) => `/evaluation-runs/${evaluationRunId}/retry`,
-    adminList: "/admin/evaluations",
+    retry: (evaluationRunId: string) =>
+      `/evaluation-runs/${evaluationRunId}/retry`,
+    adminList: '/admin/evaluations',
   },
   releaseRequests: {
-    create: (projectId: string) => `/projects/${projectId}/payment-release-requests`,
-    projectList: (projectId: string) => `/projects/${projectId}/payment-release-requests`,
-    adminList: "/admin/payment-release-requests",
-    review: (requestId: string) => `/payment-release-requests/${requestId}/review`,
+    create: (projectId: string) =>
+      `/projects/${projectId}/payment-release-requests`,
+    projectList: (projectId: string) =>
+      `/projects/${projectId}/payment-release-requests`,
+    adminList: '/admin/payment-release-requests',
+    review: (requestId: string) =>
+      `/payment-release-requests/${requestId}/review`,
   },
 };
 ```
@@ -1722,12 +1881,14 @@ Frontend:
 
 Sprint 5 is done when:
 
-- The replacement shared database is reachable and all 21 committed migrations,
-  including `1785500000000-Sprint5Readiness.ts`, are applied.
+- The replacement shared database is reachable and all 22 committed migrations,
+  including `1785500000000-Sprint5Readiness.ts` and
+  `1785600000000-AddSprint5DeliveryContract.ts`, are applied.
 - Admin can create/open a GitHub repository for an implementation-ready project.
 - Freelancers can save GitHub usernames.
 - Admin can sync repo collaborators from assigned task freelancers.
-- Admin can start implementation matching for unassigned tasks.
+- Plan materialization automatically starts implementation matching for every
+  unassigned task; admin can still start deliberate filtered reruns.
 - Admin can approve a candidate and assign a freelancer to a task.
 - Freelancer sees assigned implementation tasks.
 - Freelancer can submit a task with PR/repo/file/text evidence.
@@ -1747,34 +1908,26 @@ Sprint 5 is done when:
 - Frontend build passes.
 - AI service compile/import check passes.
 
-## Suggested Order Of Work
+## Remaining Integration Order
 
-1. Ebrahim provisions the replacement hosted database, applies/verifies all 21
+1. Ebrahim provisions the replacement hosted database, applies/verifies all 22
    migrations, and publishes only the secret-manager references to the team.
-2. In parallel:
-   - Asaad implements submission, review/revision, and release-request backend
-     services.
-   - Ebrahim implements the full NestJS/FastAPI evaluation vertical and its
-     queue/recovery path.
-   - Sameh implements task matching/assignment and GitHub repository automation.
-   - Muhanad builds the customer/freelancer workspace shell and shared delivery
-     components against the fixed contracts.
-3. Vertical owners add their assigned typed frontend services and pages:
-   - Ebrahim: review/evaluation screens.
-   - Sameh: matching/repository screens.
-   - Muhanad: customer, freelancer, delivery, revision, and release screens.
-4. Asaad wires cross-vertical notifications and runs merge/integration checks.
-5. The team runs an end-to-end test:
-    - funded project
-    - materialized Scrum plan
-    - implementation matching
-    - assigned freelancer
-    - GitHub invite
-    - submission
-    - AI evaluation
-    - revision
-    - approval
-    - release request
-    - ledger release
-6. Each owner demonstrates their vertical against the replacement shared
+2. Muhanad builds the customer/freelancer workspace shell plus delivery,
+   submission, revision, and release services/pages against the fixed routes in
+   this document.
+3. Asaad reviews the merged cross-vertical notifications and runs final
+   integration checks after Muhanad's UI lands.
+4. The team runs an end-to-end test against the replacement shared database:
+   - funded project
+   - materialized Scrum plan
+   - implementation matching
+   - assigned freelancer
+   - GitHub invite
+   - submission
+   - AI evaluation
+   - revision
+   - approval
+   - release request
+   - ledger release
+5. Each owner demonstrates their vertical against the replacement shared
    database; Asaad signs off only after backend, frontend, and AI checks pass.

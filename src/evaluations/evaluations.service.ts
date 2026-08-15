@@ -26,6 +26,10 @@ import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { QueueEvaluationDto } from './dtos/queue-evaluation.dto';
 import { RetryEvaluationDto } from './dtos/retry-evaluation.dto';
+import type {
+  SubmissionEvaluationDispatcher,
+  SubmissionEvaluationDispatchResult,
+} from 'src/delivery/submission-evaluation-dispatcher';
 
 interface Requester {
   userId: string;
@@ -35,7 +39,7 @@ interface Requester {
 const ACTIVE_RUN_STATUSES = ['queued', 'running', 'completed'];
 
 @Injectable()
-export class EvaluationsService {
+export class EvaluationsService implements SubmissionEvaluationDispatcher {
   private readonly logger = new Logger(EvaluationsService.name);
 
   constructor(
@@ -59,6 +63,23 @@ export class EvaluationsService {
     private readonly aiService: AiService,
     private readonly notificationsService: NotificationsService,
   ) {}
+
+  async queueSubmissionEvaluation(input: {
+    submissionId: string;
+    projectId: string;
+    taskId: string;
+    requestedBy: string;
+  }): Promise<SubmissionEvaluationDispatchResult> {
+    const result = await this.queueForSubmission(
+      input.submissionId,
+      { mode: 'async', reason: 'submission_submitted' },
+      input.requestedBy,
+    );
+    return {
+      evaluationRunId: result.evaluationRunId,
+      agentJobId: result.agentJobId,
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Queue / retry (admin)
@@ -344,15 +365,10 @@ export class EvaluationsService {
   ): EvaluateSubmissionDto['submission'] {
     const submissionText = this.extractSubmissionText(submission);
     const firstFileUrl = this.firstFileUrl(submission.fileUrls);
-    const submissionType = submission.pullRequestUrl
-      ? 'pull_request'
-      : submission.repoUrl
-        ? 'repo'
-        : submissionText
-          ? 'text'
-          : firstFileUrl
-            ? 'other'
-            : 'other';
+    const submissionType = this.toEvaluationSubmissionType(
+      submission.submissionType,
+      firstFileUrl,
+    );
 
     return {
       submissionId: submission.id,
@@ -367,12 +383,25 @@ export class EvaluationsService {
     };
   }
 
+  private toEvaluationSubmissionType(
+    submissionType: string,
+    fileUrl: string | null,
+  ): EvaluateSubmissionDto['submission']['submissionType'] {
+    if (submissionType === 'repository') return 'repo';
+    if (submissionType !== 'file') return submissionType;
+
+    const pathname = fileUrl?.split(/[?#]/, 1)[0]?.toLowerCase() ?? '';
+    if (pathname.endsWith('.pdf')) return 'pdf';
+    if (pathname.endsWith('.zip')) return 'zip';
+    return 'other';
+  }
+
   private async saveEvaluationResult(
     run: EvaluationRun,
     result: EvaluateSubmissionResult,
   ) {
     const recommendation = result.requiresHumanReview
-      ? 'needs_review'
+      ? 'manual_review'
       : result.passed
         ? 'approve'
         : 'changes_requested';

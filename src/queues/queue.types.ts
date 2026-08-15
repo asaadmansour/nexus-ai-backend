@@ -38,3 +38,10 @@ export interface SubmissionEvaluationJobData {
   projectId: string;
   taskId?: string | null;
 }
+
+export interface PlanningSubmissionEvaluationJobData {
+  agentJobId: string;
+  submissionId: string;
+  projectId: string;
+  requestedBy?: string | null;
+}

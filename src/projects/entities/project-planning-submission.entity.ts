@@ -9,6 +9,7 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile.entity';
+import { AgentJob } from '../../agents/entities/agent-job.entity';
 import { User } from '../../users/entities/user.entity';
 import { ProjectRoleAssignment } from './project-role-assignment.entity';
 import { Project } from './project.entity';
@@ -91,6 +92,50 @@ export class ProjectPlanningSubmission {
 
   @Column({ name: 'reviewed_at', type: 'timestamptz', nullable: true })
   reviewedAt!: Date | null;
+
+  @Column({
+    name: 'evaluation_status',
+    type: 'varchar',
+    length: 40,
+    default: 'pending',
+  })
+  evaluationStatus!: string;
+
+  @Column({
+    name: 'evaluation_score',
+    type: 'numeric',
+    precision: 5,
+    scale: 2,
+    nullable: true,
+  })
+  evaluationScore!: string | null;
+
+  @Column({
+    name: 'evaluation_recommendation',
+    type: 'varchar',
+    length: 40,
+    nullable: true,
+  })
+  evaluationRecommendation!: string | null;
+
+  @Column({ name: 'evaluation_requirements', type: 'jsonb', nullable: true })
+  evaluationRequirements!: Record<string, unknown> | null;
+
+  @Column({ name: 'evaluation_result', type: 'jsonb', nullable: true })
+  evaluationResult!: Record<string, unknown> | null;
+
+  @Column({ name: 'evaluation_error', type: 'text', nullable: true })
+  evaluationError!: string | null;
+
+  @Column({ name: 'evaluation_agent_job_id', type: 'uuid', nullable: true })
+  evaluationAgentJobId!: string | null;
+
+  @ManyToOne(() => AgentJob, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'evaluation_agent_job_id' })
+  evaluationAgentJob!: AgentJob | null;
+
+  @Column({ name: 'evaluated_at', type: 'timestamptz', nullable: true })
+  evaluatedAt!: Date | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

@@ -21,6 +21,11 @@ import { MatchingCandidate } from './matching-candidate.entity';
   'targetType',
   'targetRoleKey',
 ])
+@Index('matching_runs_active_task_uidx', ['targetTaskId'], {
+  unique: true,
+  where:
+    '"target_type" = \'task\' AND "target_task_id" IS NOT NULL AND "status" IN (\'queued\', \'running\')',
+})
 export class MatchingRun {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

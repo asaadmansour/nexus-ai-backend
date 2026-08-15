@@ -14,6 +14,7 @@ import {
 } from './dto/MatchFreelancersDto';
 import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 import { EvaluateSubmissionDto } from './dto/EvaluateSubmissionDto';
+import { EvaluatePlanningSubmissionDto } from './dto/EvaluatePlanningSubmissionDto';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -99,6 +100,7 @@ export type ProjectPlanMilestone = {
   title: string;
   description?: string;
   orderIndex: number;
+  startDay?: number;
   estimatedDays?: number | null;
   budgetAmount?: number | null;
   currency?: string | null;
@@ -115,7 +117,12 @@ export type ProjectPlanTask = {
   requiredSkills?: string[];
   estimatedHours?: number | null;
   orderIndex: number;
+  startDay?: number;
+  durationDays?: number;
   acceptanceCriteria?: string[];
+  contractReferences?: string[];
+  ownedPaths?: string[];
+  integrationChecks?: string[];
   dependsOn?: string[];
   status?: string;
 };
@@ -225,6 +232,74 @@ type FastApiEvaluateSubmissionResponse = {
   revisionNotes?: unknown;
   requiresHumanReview?: unknown;
   rubric?: unknown;
+};
+
+export type PlanningEvaluationCheck = {
+  key: string;
+  title: string;
+  status: 'met' | 'partial' | 'missing' | 'conflict';
+  mandatory: boolean;
+  severity: 'info' | 'minor' | 'major' | 'blocker';
+  evidence: string;
+  feedback: string;
+  citations: Array<{
+    artifactId: string;
+    location: string;
+    finding: string;
+  }>;
+};
+
+export type PlanningEvaluationIssue = {
+  id: string;
+  criterionKey: string;
+  severity: 'minor' | 'major' | 'blocker';
+  message: string;
+  citations: PlanningEvaluationCheck['citations'];
+};
+
+export type PlanningEvaluationResult = {
+  passed: boolean;
+  score: number;
+  recommendation: 'approve' | 'changes_requested' | 'reject';
+  summary: string;
+  checks: PlanningEvaluationCheck[];
+  strengths: string[];
+  risks: string[];
+  revisionItems: string[];
+  crossContractIssues: string[];
+  artifactManifest: Record<string, unknown>;
+  artifactManifestHash: string;
+  evaluationInputHash: string;
+  contextHash: string;
+  promptVersion: string;
+  modelName: string;
+  openIssues: PlanningEvaluationIssue[];
+  resolvedIssues: string[];
+  regressions: string[];
+  reused: boolean;
+  source: 'fastapi' | 'local_mock';
+};
+
+type FastApiPlanningEvaluationResponse = {
+  passed?: unknown;
+  score?: unknown;
+  recommendation?: unknown;
+  summary?: unknown;
+  checks?: unknown;
+  strengths?: unknown;
+  risks?: unknown;
+  revisionItems?: unknown;
+  crossContractIssues?: unknown;
+  artifactManifest?: unknown;
+  artifactManifestHash?: unknown;
+  evaluationInputHash?: unknown;
+  contextHash?: unknown;
+  promptVersion?: unknown;
+  modelName?: unknown;
+  openIssues?: unknown;
+  resolvedIssues?: unknown;
+  regressions?: unknown;
+  reused?: unknown;
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -961,6 +1036,235 @@ export class AiService {
     return this.normalizeEvaluateSubmissionResult(result, 'fastapi');
   }
 
+  async evaluatePlanningSubmission(
+    dto: EvaluatePlanningSubmissionDto,
+  ): Promise<PlanningEvaluationResult> {
+    if (this.isMockMode()) {
+      return this.normalizePlanningEvaluationResult(dto, {}, 'local_mock');
+    }
+
+    const result = await this.postToFastApi<FastApiPlanningEvaluationResponse>(
+      '/agents/evaluate-planning-submission',
+      { ...dto },
+      'evaluate-planning-submission',
+    );
+
+    return this.normalizePlanningEvaluationResult(dto, result, 'fastapi');
+  }
+
+  normalizePlanningEvaluationSandboxResult(
+    dto: EvaluatePlanningSubmissionDto,
+    result: Record<string, unknown>,
+  ): PlanningEvaluationResult {
+    return this.normalizePlanningEvaluationResult(dto, result, 'fastapi');
+  }
+
+  private normalizePlanningEvaluationResult(
+    dto: EvaluatePlanningSubmissionDto,
+    result: FastApiPlanningEvaluationResponse,
+    source: PlanningEvaluationResult['source'],
+  ): PlanningEvaluationResult {
+    const artifactManifest = this.asRecord(result.artifactManifest);
+    const inspectedArtifacts = new Map(
+      this.toRecordArray(artifactManifest.artifacts)
+        .filter((artifact) => artifact.status === 'inspected')
+        .map(
+          (artifact) => [this.optionalString(artifact.id), artifact] as const,
+        )
+        .filter((entry): entry is readonly [string, Record<string, unknown>] =>
+          Boolean(entry[0]),
+        ),
+    );
+    const returnedChecks = new Map(
+      this.toRecordArray(result.checks)
+        .map((item) => [this.optionalString(item.key), item] as const)
+        .filter((entry): entry is readonly [string, Record<string, unknown>] =>
+          Boolean(entry[0]),
+        ),
+    );
+    const evidence = this.asRecord(dto.submission.content.requirementEvidence);
+    const checks = dto.requirements.map((requirement) => {
+      const item = returnedChecks.get(requirement.key) ?? {};
+      const evidenceItem = this.asRecord(evidence[requirement.key]);
+      const summary = this.optionalString(evidenceItem.summary);
+      const urls = this.toStringArray(evidenceItem.urls);
+      const hasEvidence = Boolean(summary || urls.length);
+      const hasInspectedArtifact = [...inspectedArtifacts.values()].some(
+        (artifact) =>
+          this.toStringArray(artifact.requirementKeys).includes(
+            requirement.key,
+          ),
+      );
+      const hasRequiredUrl =
+        !requirement.requiresUrl ||
+        (source === 'local_mock' ? urls.length > 0 : hasInspectedArtifact);
+      const requestedStatus = this.optionalString(item.status);
+      let status: PlanningEvaluationCheck['status'] =
+        !hasEvidence || !hasRequiredUrl
+          ? 'missing'
+          : requestedStatus &&
+              ['met', 'partial', 'missing', 'conflict'].includes(
+                requestedStatus,
+              )
+            ? (requestedStatus as PlanningEvaluationCheck['status'])
+            : source === 'local_mock'
+              ? 'met'
+              : 'missing';
+      const citations = this.toRecordArray(item.citations)
+        .map((citation) => ({
+          artifactId: this.optionalString(citation.artifactId) ?? '',
+          location: this.optionalString(citation.location) ?? '',
+          finding: this.optionalString(citation.finding) ?? '',
+        }))
+        .filter(
+          (citation) =>
+            citation.artifactId &&
+            (source === 'local_mock' ||
+              this.toStringArray(
+                inspectedArtifacts.get(citation.artifactId)?.requirementKeys,
+              ).includes(requirement.key)),
+        );
+      if (
+        source !== 'local_mock' &&
+        requirement.requiresUrl &&
+        status === 'met' &&
+        citations.length === 0
+      ) {
+        status = 'partial';
+      }
+      const severityValue = this.optionalString(item.severity);
+      const severity: PlanningEvaluationCheck['severity'] =
+        status !== 'met' && requirement.mandatory
+          ? 'blocker'
+          : severityValue &&
+              ['info', 'minor', 'major', 'blocker'].includes(severityValue)
+            ? (severityValue as PlanningEvaluationCheck['severity'])
+            : status === 'met'
+              ? 'info'
+              : 'minor';
+
+      return {
+        key: requirement.key,
+        title: requirement.title,
+        status,
+        mandatory: requirement.mandatory,
+        severity,
+        evidence:
+          this.optionalString(item.evidence) ??
+          (hasEvidence
+            ? (summary ?? urls.join(', '))
+            : 'No evidence submitted.'),
+        feedback:
+          this.optionalString(item.feedback) ??
+          (status === 'met'
+            ? 'Requirement is supported by submitted evidence.'
+            : `Complete ${requirement.title} and provide specific evidence.`),
+        citations,
+      };
+    });
+    const blockers = checks.filter(
+      (check) => check.mandatory && check.status !== 'met',
+    );
+    const reportedScore = this.toNumber(result.score);
+    const rawScore = this.clampScore(
+      reportedScore ??
+        (source === 'local_mock'
+          ? (checks.filter((check) => check.status === 'met').length /
+              Math.max(1, checks.length)) *
+            100
+          : 0),
+    );
+    const score = blockers.length ? Math.min(rawScore, 69) : rawScore;
+    const requestedRecommendation = this.optionalString(result.recommendation);
+    const recommendation: PlanningEvaluationResult['recommendation'] =
+      blockers.length
+        ? 'changes_requested'
+        : requestedRecommendation === 'reject'
+          ? 'reject'
+          : requestedRecommendation === 'changes_requested' || score < 80
+            ? 'changes_requested'
+            : 'approve';
+    const revisionItems = Array.from(
+      new Set([
+        ...this.toStringArray(result.revisionItems),
+        ...blockers.map((check) => `${check.title}: ${check.feedback}`),
+      ]),
+    );
+
+    const returnedIssues = new Map(
+      this.toRecordArray(result.openIssues)
+        .map(
+          (issue) => [this.optionalString(issue.criterionKey), issue] as const,
+        )
+        .filter((entry): entry is readonly [string, Record<string, unknown>] =>
+          Boolean(entry[0]),
+        ),
+    );
+    const openIssues = checks
+      .filter((check) => check.status !== 'met')
+      .map((check) => {
+        const issue = returnedIssues.get(check.key) ?? {};
+        const severity = this.optionalString(issue.severity);
+        const defaultSeverity = check.mandatory
+          ? 'blocker'
+          : check.severity === 'major'
+            ? 'major'
+            : 'minor';
+        return {
+          id:
+            this.optionalString(issue.id) ??
+            `planning-${createHash('sha256').update(check.key).digest('hex').slice(0, 16)}`,
+          criterionKey: check.key,
+          severity: (check.mandatory
+            ? 'blocker'
+            : ['minor', 'major'].includes(severity ?? '')
+              ? severity
+              : defaultSeverity) as PlanningEvaluationIssue['severity'],
+          message: this.optionalString(issue.message) ?? check.feedback,
+          citations: this.toRecordArray(issue.citations)
+            .map((citation) => ({
+              artifactId: this.optionalString(citation.artifactId) ?? '',
+              location: this.optionalString(citation.location) ?? '',
+              finding: this.optionalString(citation.finding) ?? '',
+            }))
+            .filter((citation) =>
+              this.toStringArray(
+                inspectedArtifacts.get(citation.artifactId)?.requirementKeys,
+              ).includes(check.key),
+            ),
+        };
+      });
+
+    return {
+      passed: recommendation === 'approve',
+      score,
+      recommendation,
+      summary:
+        this.optionalString(result.summary) ??
+        (recommendation === 'approve'
+          ? 'All mandatory planning requirements are supported by evidence.'
+          : 'Mandatory planning requirements need revision.'),
+      checks,
+      strengths: this.toStringArray(result.strengths),
+      risks: this.toStringArray(result.risks),
+      revisionItems,
+      crossContractIssues: this.toStringArray(result.crossContractIssues),
+      artifactManifest,
+      artifactManifestHash:
+        this.optionalString(result.artifactManifestHash) ?? '',
+      evaluationInputHash:
+        this.optionalString(result.evaluationInputHash) ?? '',
+      contextHash: this.optionalString(result.contextHash) ?? '',
+      promptVersion: this.optionalString(result.promptVersion) ?? '',
+      modelName: this.optionalString(result.modelName) ?? '',
+      openIssues,
+      resolvedIssues: this.toStringArray(result.resolvedIssues),
+      regressions: this.toStringArray(result.regressions),
+      reused: result.reused === true,
+      source,
+    };
+  }
+
   private normalizeEvaluateSubmissionResult(
     result: FastApiEvaluateSubmissionResponse,
     source: EvaluateSubmissionResult['source'],
@@ -1057,6 +1361,7 @@ export class AiService {
         title: this.optionalString(item.title) ?? `Milestone ${index + 1}`,
         description: this.optionalString(item.description) ?? undefined,
         orderIndex: this.toNumber(item.orderIndex) ?? index + 1,
+        startDay: Math.max(0, this.toNumber(item.startDay) ?? 0),
         estimatedDays: this.toNumber(item.estimatedDays),
         budgetAmount: this.toNumber(item.budgetAmount),
         currency: this.optionalString(item.currency) ?? null,
@@ -1093,7 +1398,12 @@ export class AiService {
         requiredSkills: this.toStringArray(item.requiredSkills),
         estimatedHours: this.toNumber(item.estimatedHours),
         orderIndex: this.toNumber(item.orderIndex) ?? index + 1,
+        startDay: Math.max(0, this.toNumber(item.startDay) ?? 0),
+        durationDays: Math.max(1, this.toNumber(item.durationDays) ?? 1),
         acceptanceCriteria: this.toStringArray(item.acceptanceCriteria),
+        contractReferences: this.toStringArray(item.contractReferences),
+        ownedPaths: this.toStringArray(item.ownedPaths),
+        integrationChecks: this.toStringArray(item.integrationChecks),
         dependsOn,
         status: this.optionalString(item.status) ?? 'todo',
       };
@@ -1197,6 +1507,8 @@ export class AiService {
         description:
           'Auth, data model, and base API from the architecture plan.',
         orderIndex: 1,
+        startDay: 0,
+        estimatedDays: 10,
         budgetAmount: 3000,
         currency,
         acceptanceCriteria: [
@@ -1209,6 +1521,8 @@ export class AiService {
         title: 'Primary product flow',
         description: 'Main user-facing screens and their supporting endpoints.',
         orderIndex: 2,
+        startDay: 10,
+        estimatedDays: 10,
         budgetAmount: 4000,
         currency,
         acceptanceCriteria: [
@@ -1229,9 +1543,20 @@ export class AiService {
         requiredSkills: ['NestJS', 'PostgreSQL'],
         estimatedHours: 12,
         orderIndex: 1,
+        startDay: 0,
+        durationDays: 3,
         acceptanceCriteria: [
           'Migrations run',
           'Entities match the architecture',
+        ],
+        contractReferences: [
+          'architecture:data_model',
+          'architecture:module_boundaries',
+        ],
+        ownedPaths: ['backend/src/database', 'backend/src/projects'],
+        integrationChecks: [
+          'Run database migrations',
+          'Run backend unit tests',
         ],
         dependsOn: [],
       },
@@ -1245,7 +1570,15 @@ export class AiService {
         requiredSkills: ['NestJS', 'JWT'],
         estimatedHours: 10,
         orderIndex: 2,
+        startDay: 3,
+        durationDays: 3,
         acceptanceCriteria: ['Login works', 'Role guards enforced'],
+        contractReferences: [
+          'architecture:auth_security',
+          'architecture:api_contract',
+        ],
+        ownedPaths: ['backend/src/auth'],
+        integrationChecks: ['Run authentication integration tests'],
         dependsOn: ['t1'],
       },
       {
@@ -1258,7 +1591,18 @@ export class AiService {
         requiredSkills: ['React', 'TypeScript'],
         estimatedHours: 16,
         orderIndex: 1,
+        startDay: 6,
+        durationDays: 5,
         acceptanceCriteria: ['Screens responsive', 'Matches design system'],
+        contractReferences: [
+          'ui_ux:high_fidelity_screens',
+          'ui_ux:api_data_mapping',
+        ],
+        ownedPaths: ['frontend/src/app', 'frontend/src/components'],
+        integrationChecks: [
+          'Run frontend build',
+          'Complete the primary-flow smoke test',
+        ],
         dependsOn: ['t2'],
       },
     ];

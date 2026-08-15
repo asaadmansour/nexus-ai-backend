@@ -68,6 +68,11 @@ export class RedisService implements OnModuleDestroy {
     return (results?.[0]?.[1] as number) ?? 0;
   }
 
+  async ping(): Promise<'PONG'> {
+    await this.ensureReady();
+    return this.client.ping();
+  }
+
   private async ensureReady() {
     if (this.client.status === 'ready') return;
 
@@ -92,7 +97,6 @@ export class RedisService implements OnModuleDestroy {
 
   private waitUntilReady() {
     return new Promise<void>((resolve, reject) => {
-      let timeout: NodeJS.Timeout;
       const cleanup = () => {
         clearTimeout(timeout);
         this.client.off('ready', onReady);
@@ -111,7 +115,7 @@ export class RedisService implements OnModuleDestroy {
         cleanup();
         reject(new Error('Redis connection ended before it became ready'));
       };
-      timeout = setTimeout(() => {
+      const timeout = setTimeout(() => {
         cleanup();
         reject(new Error('Redis connection timed out before it became ready'));
       }, REDIS_READY_TIMEOUT_MS);

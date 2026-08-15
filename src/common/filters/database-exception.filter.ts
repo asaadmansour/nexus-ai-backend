@@ -5,6 +5,7 @@ import {
   ExceptionFilter,
   HttpException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { QueryFailedError } from 'typeorm';
@@ -17,10 +18,16 @@ interface PostgresDriverError {
 
 @Catch(QueryFailedError)
 export class DatabaseExceptionFilter implements ExceptionFilter<QueryFailedError> {
+  private readonly logger = new Logger(DatabaseExceptionFilter.name);
+
   catch(exception: QueryFailedError, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
     const translated = this.toHttpException(exception);
+    const driverError = exception.driverError as PostgresDriverError;
+    this.logger.error(
+      `Database query failed (code=${driverError.code ?? 'unknown'}, constraint=${driverError.constraint ?? 'unknown'}): ${driverError.detail ?? exception.message}`,
+    );
     const statusCode = translated.getStatus();
     const exceptionResponse = translated.getResponse();
 

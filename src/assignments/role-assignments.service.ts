@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -16,6 +17,7 @@ import { Brief } from 'src/projects/entities/brief.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
+import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from 'src/matching/entities/matching-candidate.entity';
 import { CreateRoleAssignmentDto } from './dtos/create-role-assignment.dto';
@@ -50,6 +52,8 @@ export class RoleAssignmentsService {
     private readonly assignmentRepo: Repository<ProjectRoleAssignment>,
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
+    @InjectRepository(ProjectTask)
+    private readonly taskRepo: Repository<ProjectTask>,
     @InjectRepository(FreelancerProfile)
     private readonly profileRepo: Repository<FreelancerProfile>,
     @InjectRepository(MatchingCandidate)
@@ -317,23 +321,23 @@ export class RoleAssignmentsService {
       return { data: [], total: 0 };
     }
 
-    const where: Record<string, unknown> = { freelancerProfileId: profile.id };
-    if (query.phase) where.phase = query.phase;
-    if (query.statuses?.length) where.status = In(query.statuses);
-
-    const [assignments, total] = await this.assignmentRepo.findAndCount({
-      where,
-      order: { createdAt: 'DESC' },
-      skip: (query.page - 1) * query.limit,
-      take: query.limit,
-      relations: ['project'],
-    });
+    const assignments =
+      !query.phase || query.phase === 'planning'
+        ? await this.assignmentRepo.find({
+            where: {
+              freelancerProfileId: profile.id,
+              ...(query.phase ? { phase: query.phase } : {}),
+              ...(query.statuses?.length ? { status: In(query.statuses) } : {}),
+            },
+            order: { createdAt: 'DESC' },
+            relations: ['project'],
+          })
+        : [];
 
     const briefs = await this.getBriefSummaries(
-      assignments.map((a) => a.projectId),
+      assignments.map((assignment) => assignment.projectId),
     );
-
-    const data = assignments.map((assignment) => {
+    const planningData = assignments.map((assignment) => {
       const project = assignment.project;
       return {
         assignmentId: assignment.id,
@@ -356,7 +360,76 @@ export class RoleAssignmentsService {
       };
     });
 
-    return { data, total };
+    const implementationTasks =
+      !query.phase || query.phase === 'implementation'
+        ? await this.taskRepo.find({
+            where: {
+              assignedFreelancerProfileId: profile.id,
+              status: In([
+                'todo',
+                'blocked',
+                'in_progress',
+                'review',
+                'changes_requested',
+              ]),
+            },
+            order: { assignedAt: 'DESC', createdAt: 'DESC' },
+            relations: ['project'],
+          })
+        : [];
+
+    const tasksByProject = new Map<string, ProjectTask[]>();
+    for (const task of implementationTasks) {
+      tasksByProject.set(task.projectId, [
+        ...(tasksByProject.get(task.projectId) ?? []),
+        task,
+      ]);
+    }
+
+    const implementationData = [...tasksByProject.entries()]
+      .map(([projectId, tasks]) => {
+        const project = tasks[0]?.project;
+        const roleKeys = [
+          ...new Set(
+            tasks
+              .map((task) => task.roleKey)
+              .filter((roleKey): roleKey is string => Boolean(roleKey)),
+          ),
+        ];
+        const status = tasks.some((task) =>
+          ['in_progress', 'review', 'changes_requested'].includes(task.status),
+        )
+          ? 'in_progress'
+          : 'assigned';
+        return {
+          assignmentId: `implementation:${projectId}`,
+          projectId,
+          projectTitle: project?.title ?? null,
+          phase: 'implementation',
+          roleKey: roleKeys.length === 1 ? roleKeys[0] : 'implementation',
+          status,
+          budgetMin: project ? Number(project.budgetMin) : null,
+          budgetMax: project ? Number(project.budgetMax) : null,
+          currency: project?.currency ?? null,
+          deadline: project?.deadline ?? null,
+          briefSummary: `${tasks.length} assigned implementation task${tasks.length === 1 ? '' : 's'}`,
+          roleBriefSummary: tasks
+            .slice(0, 3)
+            .map((task) => task.title)
+            .join(', '),
+          roleBriefStatus: 'task_contract',
+          nextAction: `Open ${tasks.length} implementation task${tasks.length === 1 ? '' : 's'}`,
+        };
+      })
+      .filter(
+        (item) =>
+          !query.statuses?.length || query.statuses.includes(item.status),
+      );
+
+    const combined = [...implementationData, ...planningData];
+    const total = combined.length;
+    const start = (query.page - 1) * query.limit;
+    return { data: combined.slice(start, start + query.limit), total };
   }
 
   async freelancerProjectAssignment(userId: string, projectId: string) {
@@ -375,7 +448,15 @@ export class RoleAssignmentsService {
       order: { createdAt: 'DESC' },
       relations: ['project', 'freelancerProfile', 'freelancerProfile.user'],
     });
-    if (!assignments.length) {
+    const implementationTask = await this.taskRepo.findOne({
+      where: {
+        projectId,
+        assignedFreelancerProfileId: profile.id,
+      },
+      order: { assignedAt: 'DESC', createdAt: 'DESC' },
+      relations: ['project'],
+    });
+    if (!assignments.length && !implementationTask) {
       throw new NotFoundException('Assigned project not found');
     }
 
@@ -394,7 +475,7 @@ export class RoleAssignmentsService {
       }
     }
 
-    const project = assignments[0].project;
+    const project = assignments[0]?.project ?? implementationTask!.project;
 
     return {
       project: {
@@ -422,6 +503,12 @@ export class RoleAssignmentsService {
       assignments: assignments.map((assignment) =>
         this.toAssignmentDto(assignment, assignment.freelancerProfile),
       ),
+      implementationTaskCount: await this.taskRepo.count({
+        where: {
+          projectId,
+          assignedFreelancerProfileId: profile.id,
+        },
+      }),
     };
   }
 
@@ -633,17 +720,20 @@ export class RoleAssignmentsService {
           : null,
       });
 
-      await this.assignmentRepo.update(assignment.id, {
-        roleBrief: result as unknown as Record<string, unknown>,
+      const update: QueryDeepPartialEntity<ProjectRoleAssignment> = {
+        roleBrief: result,
         roleBriefStatus: result.source === 'fastapi' ? 'generated' : 'fallback',
         roleBriefGeneratedAt: new Date(),
         roleBriefError: null,
-      } as any);
+      };
+      await this.assignmentRepo.update(assignment.id, update);
     } catch (error) {
       await this.assignmentRepo.update(assignmentId, {
         roleBriefStatus: 'fallback',
         roleBriefError:
-          error instanceof Error ? error.message : 'Role brief generation failed',
+          error instanceof Error
+            ? error.message
+            : 'Role brief generation failed',
       });
       this.logger.warn(
         `Role brief AI enrichment failed for assignment ${assignmentId}: ${
@@ -671,7 +761,9 @@ export class RoleAssignmentsService {
       title: `${roleLabel} planning brief for ${projectName}`,
       summary: [
         `${roleLabel} assignment for ${projectName}${domain}.`,
-        project.description ? `Project description: ${project.description}.` : null,
+        project.description
+          ? `Project description: ${project.description}.`
+          : null,
         brief?.summary ? `Brief summary: ${brief.summary}.` : null,
         brief?.mainGoal ? `Main goal: ${brief.mainGoal}.` : null,
       ]
@@ -787,9 +879,10 @@ export class RoleAssignmentsService {
   }
 
   private assignmentRoleBriefSummary(assignment: ProjectRoleAssignment) {
-    const roleBrief = assignment.roleBrief as
-      | { summary?: unknown; title?: unknown }
-      | null;
+    const roleBrief = assignment.roleBrief as {
+      summary?: unknown;
+      title?: unknown;
+    } | null;
     return (
       this.optionalString(roleBrief?.summary) ??
       this.optionalString(roleBrief?.title) ??

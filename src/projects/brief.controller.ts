@@ -30,11 +30,7 @@ export class BriefController {
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    return this.briefService.getBrief(
-      projectId,
-      user.sub,
-      false,
-    );
+    return this.briefService.getBrief(projectId, user.sub, false);
   }
 
   @Get('messages')
@@ -43,11 +39,7 @@ export class BriefController {
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    return this.briefService.getMessages(
-      projectId,
-      user.sub,
-      false,
-    );
+    return this.briefService.getMessages(projectId, user.sub, false);
   }
 
   @Post('messages')
@@ -72,12 +64,7 @@ export class BriefController {
     @Body() dto: UpdateBriefDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    return this.briefService.updateBrief(
-      projectId,
-      user.sub,
-      false,
-      dto,
-    );
+    return this.briefService.updateBrief(projectId, user.sub, false, dto);
   }
 
   @Post('reopen')
@@ -86,11 +73,7 @@ export class BriefController {
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    return this.briefService.reopenAiHelp(
-      projectId,
-      user.sub,
-      false,
-    );
+    return this.briefService.reopenAiHelp(projectId, user.sub, false);
   }
 
   @Post('confirm')
@@ -99,10 +82,6 @@ export class BriefController {
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    return this.briefService.confirmBrief(
-      projectId,
-      user.sub,
-      false,
-    );
+    return this.briefService.confirmBrief(projectId, user.sub, false);
   }
 }

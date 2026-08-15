@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -7,8 +8,12 @@ import {
   Patch,
   Post,
   Query,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import { RolesGuard } from 'src/common/guards/roles.guards';
@@ -24,6 +29,7 @@ import { GeneratePlanDto } from './dtos/generate-plan.dto';
 import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
 import { UpdateTaskDto } from './dtos/update-task.dto';
+import { PlanningEvaluationsService } from './planning-evaluations.service';
 
 function parsePage(page: string, limit: string) {
   return {
@@ -32,13 +38,43 @@ function parsePage(page: string, limit: string) {
   };
 }
 
+const PLANNING_ARTIFACT_TYPES = [
+  'application/json',
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'text/markdown',
+  'text/plain',
+  'text/yaml',
+];
+
 @Controller('projects/:projectId')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
 export class ProjectPlanningController {
   constructor(
     private readonly submissions: PlanningSubmissionsService,
     private readonly plans: ProjectPlansService,
+    private readonly evaluations: PlanningEvaluationsService,
   ) {}
+
+  @Get('planning-requirements/:submissionType')
+  @Roles(UserRole.ADMIN, UserRole.FREELANCER)
+  async getPlanningRequirements(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Param('submissionType') submissionType: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    if (submissionType !== 'architecture' && submissionType !== 'ui_ux') {
+      throw new BadRequestException('Unsupported planning submission type');
+    }
+    const data = await this.evaluations.getRequirements(
+      projectId,
+      submissionType,
+      { userId: user.sub, role: user.role },
+    );
+    return { status: 'success', data };
+  }
 
   @Post('planning-submissions')
   @Roles(UserRole.FREELANCER, UserRole.ADMIN)
@@ -51,6 +87,40 @@ export class ProjectPlanningController {
       userId: user.sub,
       role: user.role,
     });
+    return { status: 'success', data };
+  }
+
+  @Post('planning-artifacts')
+  @Roles(UserRole.FREELANCER, UserRole.ADMIN)
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: 25 * 1024 * 1024 },
+      fileFilter: (_request, file, callback) => {
+        if (!PLANNING_ARTIFACT_TYPES.includes(file.mimetype)) {
+          callback(
+            new BadRequestException(
+              'Planning artifacts must be PDF, JSON, YAML, text, JPEG, PNG, or WebP files',
+            ),
+            false,
+          );
+          return;
+        }
+        callback(null, true);
+      },
+    }),
+  )
+  async uploadPlanningArtifact(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @UploadedFile() file: Express.Multer.File,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    if (!file) throw new BadRequestException('No artifact file uploaded');
+    const data = await this.evaluations.uploadPlanningArtifact(
+      projectId,
+      file,
+      { userId: user.sub, role: user.role },
+    );
     return { status: 'success', data };
   }
 
@@ -143,7 +213,10 @@ export class ProjectPlanningController {
 @Controller('planning-submissions')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
 export class PlanningSubmissionDetailController {
-  constructor(private readonly submissions: PlanningSubmissionsService) {}
+  constructor(
+    private readonly submissions: PlanningSubmissionsService,
+    private readonly evaluations: PlanningEvaluationsService,
+  ) {}
 
   @Get(':submissionId')
   @Roles(UserRole.ADMIN, UserRole.CUSTOMER, UserRole.FREELANCER)
@@ -166,6 +239,16 @@ export class PlanningSubmissionDetailController {
     @CurrentUser() user: JwtPayload,
   ) {
     const data = await this.submissions.review(submissionId, dto, user.sub);
+    return { status: 'success', data };
+  }
+
+  @Post(':submissionId/evaluation/retry')
+  @Roles(UserRole.ADMIN)
+  async retryEvaluation(
+    @Param('submissionId', ParseUUIDPipe) submissionId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const data = await this.evaluations.retry(submissionId, user.sub);
     return { status: 'success', data };
   }
 }

@@ -108,7 +108,37 @@ const IMPLEMENTATION_MATCH_ALLOWED_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.MATCHED,
   ProjectStatus.ASSIGNED,
   ProjectStatus.ACTIVE,
+  ProjectStatus.UNDER_REVIEW,
 ]);
+
+const ASSIGNABLE_CANDIDATE_STATUSES = new Set([
+  'recommended',
+  'shortlisted',
+  'selected',
+]);
+
+export function assertTaskMatchingRunInvariant(
+  run: Pick<
+    MatchingRun,
+    'targetType' | 'targetTaskId' | 'projectId' | 'status'
+  >,
+  task: Pick<ProjectTask, 'id' | 'projectId'>,
+) {
+  if (
+    run.targetType !== 'task' ||
+    run.targetTaskId !== task.id ||
+    run.projectId !== task.projectId
+  ) {
+    throw new BadRequestException(
+      'The matching run does not belong to this project task',
+    );
+  }
+  if (!['completed', 'reviewed'].includes(run.status)) {
+    throw new ConflictException(
+      'The matching run must complete before a task can be assigned',
+    );
+  }
+}
 
 @Injectable()
 export class MatchingService {
@@ -299,6 +329,58 @@ export class MatchingService {
   // Start implementation-task matching
   // ---------------------------------------------------------------------------
 
+  async autoStartImplementationTasks(projectId: string, adminUserId: string) {
+    try {
+      const result = await this.startImplementationTasks(
+        projectId,
+        // Matching is deterministic and normally fast. Waiting here guarantees
+        // that a process restart cannot strand the automatically-created runs.
+        { mode: 'sync' },
+        adminUserId,
+      );
+      return {
+        triggered: true,
+        ...result,
+      };
+    } catch (error) {
+      const message = this.errorMessage(error);
+      if (
+        error instanceof BadRequestException &&
+        message.includes('No unassigned implementation tasks')
+      ) {
+        return {
+          triggered: false,
+          projectId,
+          reason: 'no_unmatched_tasks',
+        };
+      }
+      const existingRunCount = await this.runRepo.count({
+        where: {
+          projectId,
+          targetType: 'task',
+          status: In(['queued', 'running', 'completed', 'reviewed']),
+        },
+      });
+      if (existingRunCount > 0) {
+        return {
+          triggered: false,
+          projectId,
+          reason: 'matching_already_started',
+          runCount: existingRunCount,
+        };
+      }
+      this.logger.error(
+        `Automatic implementation matching failed for project ${projectId}: ${message}`,
+      );
+      return {
+        triggered: false,
+        projectId,
+        reason: 'matching_start_failed',
+        error: message,
+      };
+    }
+  }
+
   // One matching run per implementation task. Runs are created up front so the
   // admin sees them immediately; the AI ranking then fills each one in turn.
   async startImplementationTasks(
@@ -313,6 +395,7 @@ export class MatchingService {
       );
     }
 
+    await this.recoverStaleImplementationRuns(projectId);
     const tasks = await this.resolveMatchableTasks(projectId, dto);
     if (!tasks.length) {
       throw new BadRequestException(
@@ -359,28 +442,87 @@ export class MatchingService {
       return created;
     });
 
-    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    const processRuns = () =>
+      this.processImplementationRuns({
+        project,
+        briefSnapshot,
+        limit,
+        maxRate,
+        filters: dto.filters,
+        tasks,
+        runs,
+      });
+
+    if (dto.mode === 'async') {
+      void processRuns().catch((error) => {
+        this.logger.error(
+          `Background implementation matching crashed for project ${projectId}: ${this.errorMessage(error)}`,
+        );
+      });
+      return {
+        projectId,
+        projectStatus: ProjectStatus.MATCHING,
+        processing: 'background',
+        runs: runs.map((run) => ({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: run.targetTaskId,
+          targetRoleKey: run.targetRoleKey,
+          status: 'running',
+        })),
+      };
+    }
+
+    const runResults = await processRuns();
+
+    return {
+      projectId,
+      projectStatus: ProjectStatus.MATCHING,
+      runs: runResults,
+    };
+  }
+
+  private async processImplementationRuns(input: {
+    project: Project;
+    briefSnapshot: Record<string, unknown> | null;
+    limit: number;
+    maxRate: number | null;
+    filters: PlanningMatchingFiltersDto | undefined;
+    tasks: ProjectTask[];
+    runs: MatchingRun[];
+  }) {
+    const tasksById = new Map(input.tasks.map((task) => [task.id, task]));
     const runResults: Record<string, unknown>[] = [];
 
-    for (const run of runs) {
-      const task = tasksById.get(run.targetTaskId!)!;
+    for (const run of input.runs) {
+      const task = tasksById.get(run.targetTaskId!);
+      if (!task) {
+        runResults.push({
+          id: run.id,
+          targetType: 'task',
+          targetTaskId: run.targetTaskId,
+          status: 'failed',
+          error: await this.failRun(run, 'Materialized task was not found'),
+        });
+        continue;
+      }
       try {
-        const skills = dto.filters?.skills?.length
-          ? dto.filters.skills
+        const skills = input.filters?.skills?.length
+          ? input.filters.skills
           : (task.requiredSkills ?? []);
         const candidates = await this.buildTaskCandidatePool(
           task,
-          dto.filters,
-          maxRate,
+          input.filters,
+          input.maxRate,
         );
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
           targetType: 'task',
           targetRoleKey: run.targetRoleKey ?? 'implementation',
           targetTaskId: task.id,
-          limit,
-          project: this.buildProjectSnapshot(project, skills),
-          brief: briefSnapshot,
+          limit: input.limit,
+          project: this.buildProjectSnapshot(input.project, skills),
+          brief: input.briefSnapshot,
           task: this.buildTaskSnapshot(task, skills),
           candidates,
         });
@@ -409,12 +551,7 @@ export class MatchingService {
         });
       }
     }
-
-    return {
-      projectId,
-      projectStatus: ProjectStatus.MATCHING,
-      runs: runResults,
-    };
+    return runResults;
   }
 
   // ---------------------------------------------------------------------------
@@ -429,9 +566,12 @@ export class MatchingService {
     }
 
     const result = await this.dataSource.transaction(async (manager) => {
-      const task = await manager.findOne(ProjectTask, {
-        where: { id: taskId },
-      });
+      const task = await manager
+        .getRepository(ProjectTask)
+        .createQueryBuilder('task')
+        .setLock('pessimistic_write')
+        .where('task.id = :taskId', { taskId })
+        .getOne();
       if (!task) throw new NotFoundException('Task not found');
       if (task.assignedFreelancerProfileId) {
         throw new ConflictException(
@@ -444,10 +584,32 @@ export class MatchingService {
       if (dto.candidateId) {
         candidate = await manager.findOne(MatchingCandidate, {
           where: { id: dto.candidateId },
-          relations: ['freelancerProfile'],
+          relations: ['freelancerProfile', 'matchingRun'],
         });
         if (!candidate?.freelancerProfileId) {
           throw new NotFoundException('Matching candidate not found');
+        }
+        this.assertTaskMatchingRun(candidate.matchingRun, task);
+        if (
+          dto.sourceMatchingRunId &&
+          dto.sourceMatchingRunId !== candidate.matchingRunId
+        ) {
+          throw new BadRequestException(
+            'candidateId does not belong to sourceMatchingRunId',
+          );
+        }
+        if (!ASSIGNABLE_CANDIDATE_STATUSES.has(candidate.status)) {
+          throw new ConflictException(
+            'This matching candidate is no longer available for assignment',
+          );
+        }
+        if (
+          dto.freelancerProfileId &&
+          dto.freelancerProfileId !== candidate.freelancerProfileId
+        ) {
+          throw new BadRequestException(
+            'candidateId and freelancerProfileId refer to different freelancers',
+          );
         }
       }
 
@@ -459,10 +621,48 @@ export class MatchingService {
           where: { id: freelancerProfileId },
         }));
       if (!profile) throw new NotFoundException('Freelancer profile not found');
+      if (profile.verificationStatus !== 'approved') {
+        throw new ConflictException(
+          'Only an approved freelancer can be assigned to a task',
+        );
+      }
+      if (!profile.isAvailable) {
+        throw new ConflictException(
+          'This freelancer is not currently available for assignment',
+        );
+      }
+
+      let sourceRun: MatchingRun | null = candidate?.matchingRun ?? null;
+      if (!candidate && dto.sourceMatchingRunId) {
+        sourceRun = await manager.findOne(MatchingRun, {
+          where: { id: dto.sourceMatchingRunId },
+        });
+        if (!sourceRun) {
+          throw new NotFoundException('Source matching run not found');
+        }
+        this.assertTaskMatchingRun(sourceRun, task);
+
+        candidate = await manager.findOne(MatchingCandidate, {
+          where: {
+            matchingRunId: sourceRun.id,
+            freelancerProfileId,
+          },
+          relations: ['freelancerProfile', 'matchingRun'],
+        });
+        if (!candidate) {
+          throw new BadRequestException(
+            'The selected freelancer is not a candidate in the source matching run',
+          );
+        }
+        if (!ASSIGNABLE_CANDIDATE_STATUSES.has(candidate.status)) {
+          throw new ConflictException(
+            'This matching candidate is no longer available for assignment',
+          );
+        }
+      }
 
       task.assignedFreelancerProfileId = freelancerProfileId;
-      task.sourceMatchingRunId =
-        candidate?.matchingRunId ?? dto.sourceMatchingRunId ?? null;
+      task.sourceMatchingRunId = sourceRun?.id ?? null;
       task.sourceCandidateId = candidate?.id ?? null;
       task.assignedBy = adminUserId;
       task.assignedAt = new Date();
@@ -867,6 +1067,16 @@ export class MatchingService {
   ): Promise<ProjectRoleAssignment> {
     const { run, candidate, adminUserId, notes } = input;
     const roleKey = run.targetRoleKey!;
+    const profile = candidate.freelancerProfile;
+    if (
+      !profile ||
+      profile.verificationStatus !== 'approved' ||
+      !profile.isAvailable
+    ) {
+      throw new ConflictException(
+        'The selected freelancer is no longer approved and available',
+      );
+    }
 
     const existing = await manager.findOne(ProjectRoleAssignment, {
       where: {
@@ -881,7 +1091,6 @@ export class MatchingService {
       );
     }
 
-    const profile = candidate.freelancerProfile;
     return manager.save(
       ProjectRoleAssignment,
       manager.create(ProjectRoleAssignment, {
@@ -1222,6 +1431,30 @@ export class MatchingService {
 
     const busy = new Set(rows.map((row) => row.taskId));
     return tasks.filter((task) => !busy.has(task.id));
+  }
+
+  private assertTaskMatchingRun(run: MatchingRun, task: ProjectTask) {
+    assertTaskMatchingRunInvariant(run, task);
+  }
+
+  private async recoverStaleImplementationRuns(projectId: string) {
+    const result = await this.runRepo
+      .createQueryBuilder()
+      .update(MatchingRun)
+      .set({
+        status: 'failed',
+        error: 'Matching was interrupted before completion and can be retried.',
+      })
+      .where('project_id = :projectId', { projectId })
+      .andWhere('target_type = :targetType', { targetType: 'task' })
+      .andWhere("status IN ('queued', 'running')")
+      .andWhere("updated_at < NOW() - INTERVAL '2 hours'")
+      .execute();
+    if (result.affected) {
+      this.logger.warn(
+        `Recovered ${result.affected} stale implementation matching run(s) for project ${projectId}`,
+      );
+    }
   }
 
   // Max hourly rate the implementation budget affords, spread across the total

@@ -13,10 +13,20 @@ import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.e
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { MatchingModule } from 'src/matching/matching.module';
+import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
+import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { NotificationsModule } from 'src/notifications/notifications.module';
+import { PaymentReleaseRequestsService } from './payment-release-requests.service';
+import {
+  AdminPaymentReleaseRequestsController,
+  PaymentReleaseRequestDetailController,
+  ProjectPaymentReleaseRequestsController,
+} from './payment-release-requests.controller';
 
 @Module({
   imports: [
     MatchingModule,
+    NotificationsModule,
     TypeOrmModule.forFeature([
       ProjectPayment,
       PaymentReleaseRequest,
@@ -26,10 +36,18 @@ import { MatchingModule } from 'src/matching/matching.module';
       FreelancerProfile,
       Project,
       ProjectMilestone,
+      ProjectTask,
+      ProjectSubmission,
     ]),
   ],
-  exports: [TypeOrmModule],
-  providers: [PaymentsService, StripeService],
-  controllers: [PaymentsController, StripeWebhookController],
+  exports: [TypeOrmModule, PaymentReleaseRequestsService],
+  providers: [PaymentsService, StripeService, PaymentReleaseRequestsService],
+  controllers: [
+    PaymentsController,
+    StripeWebhookController,
+    ProjectPaymentReleaseRequestsController,
+    AdminPaymentReleaseRequestsController,
+    PaymentReleaseRequestDetailController,
+  ],
 })
 export class PaymentsModule {}

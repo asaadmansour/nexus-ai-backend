@@ -19,6 +19,7 @@ import {
   AssessmentGenerationJobData,
   CvExtractionJobData,
   ProfileEmbeddingJobData,
+  PlanningSubmissionEvaluationJobData,
   ProjectPlanGenerationJobData,
   SubmissionEvaluationJobData,
 } from './queue.types';
@@ -39,11 +40,61 @@ export class AiJobsProducer {
     @InjectQueue(QUEUES.PROJECT_PLAN_GENERATION)
     private readonly projectPlanGenerationQueue: Queue<ProjectPlanGenerationJobData> | null,
     @Optional()
+    @InjectQueue(QUEUES.PLANNING_SUBMISSION_EVALUATION)
+    private readonly planningSubmissionEvaluationQueue: Queue<PlanningSubmissionEvaluationJobData> | null,
+    @Optional()
     @InjectQueue(QUEUES.SUBMISSION_EVALUATION)
     private readonly submissionEvaluationQueue: Queue<SubmissionEvaluationJobData> | null,
     @InjectRepository(AgentJob)
     private readonly agentJobRepository: Repository<AgentJob>,
   ) {}
+
+  async emitPlanningSubmissionEvaluationRequested(input: {
+    submissionId: string;
+    projectId: string;
+    requestedBy?: string | null;
+  }) {
+    const agentJob = await this.agentJobRepository.save(
+      this.agentJobRepository.create({
+        agentName: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
+        jobType: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
+        projectId: input.projectId,
+        submissionId: input.submissionId,
+        userId: input.requestedBy ?? null,
+        status: 'queued',
+        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+        queueName: QUEUES.PLANNING_SUBMISSION_EVALUATION,
+        input: {
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          requestedBy: input.requestedBy ?? null,
+        },
+      }),
+    );
+
+    try {
+      await this.getQueue(
+        this.planningSubmissionEvaluationQueue,
+        QUEUES.PLANNING_SUBMISSION_EVALUATION,
+      ).add(
+        JOBS.EVALUATE_PLANNING_SUBMISSION,
+        {
+          agentJobId: agentJob.id,
+          submissionId: input.submissionId,
+          projectId: input.projectId,
+          requestedBy: input.requestedBy ?? null,
+        },
+        { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
+      );
+
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
+      return agentJob;
+    } catch (error) {
+      await this.markQueueAddFailed(agentJob, error);
+      throw error;
+    }
+  }
 
   async emitSubmissionEvaluationRequested(input: {
     evaluationRunId: string;
@@ -56,7 +107,8 @@ export class AiJobsProducer {
         agentName: AI_JOB_TYPES.SUBMISSION_EVALUATION,
         jobType: AI_JOB_TYPES.SUBMISSION_EVALUATION,
         projectId: input.projectId,
-        submissionId: input.submissionId,
+        projectSubmissionId: input.submissionId,
+        taskId: input.taskId ?? null,
         status: 'queued',
         maxAttempts: AI_JOB_RETRY.ATTEMPTS,
         queueName: QUEUES.SUBMISSION_EVALUATION,

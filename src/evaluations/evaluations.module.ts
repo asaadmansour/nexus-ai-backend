@@ -19,6 +19,7 @@ import {
   SubmissionEvaluationsController,
 } from './evaluations.controller';
 import { SubmissionEvaluationProcessor } from './jobs/submission-evaluation.processor';
+import { SUBMISSION_EVALUATION_DISPATCHER } from 'src/delivery/submission-evaluation-dispatcher';
 
 const queueProcessors = areQueuesEnabled()
   ? [SubmissionEvaluationProcessor]
@@ -45,7 +46,14 @@ const queueProcessors = areQueuesEnabled()
     EvaluationRunsController,
     AdminEvaluationsController,
   ],
-  providers: [EvaluationsService, ...queueProcessors],
-  exports: [EvaluationsService],
+  providers: [
+    EvaluationsService,
+    {
+      provide: SUBMISSION_EVALUATION_DISPATCHER,
+      useExisting: EvaluationsService,
+    },
+    ...queueProcessors,
+  ],
+  exports: [EvaluationsService, SUBMISSION_EVALUATION_DISPATCHER],
 })
 export class EvaluationsModule {}
