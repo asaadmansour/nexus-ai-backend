@@ -13,6 +13,7 @@ const validConfig = {
   CLOUDINARY_API_KEY: 'key',
   CLOUDINARY_API_SECRET: 'secret',
   STRIPE_SECRET_KEY: 'stripe-secret',
+  EVALUATION_SANDBOX_MODE: 'http',
 };
 
 describe('environment validation', () => {
@@ -24,6 +25,18 @@ describe('environment validation', () => {
         STRIPE_SECRET_KEY: undefined,
       }),
     ).toThrow('GOOGLE_CLIENT_SECRET, STRIPE_SECRET_KEY');
+  });
+
+  it('requires isolated artifact evaluation in production', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        NODE_ENV: 'production',
+        STRIPE_WEBHOOK_SECRET: 'webhook-secret',
+        SMTP_USER: 'smtp-user',
+        SMTP_PASSWORD: 'smtp-password',
+      }),
+    ).toThrow('EVALUATION_SANDBOX_MODE must be kubernetes');
   });
 
   it('rejects weak or placeholder production secrets', () => {

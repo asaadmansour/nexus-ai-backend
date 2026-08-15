@@ -16,7 +16,12 @@ export function validateEnv(config: Env): Env {
     'STRIPE_SECRET_KEY',
   ];
   if (config.NODE_ENV === 'production') {
-    requiredKeys.push('STRIPE_WEBHOOK_SECRET', 'SMTP_USER', 'SMTP_PASSWORD');
+    requiredKeys.push(
+      'STRIPE_WEBHOOK_SECRET',
+      'SMTP_USER',
+      'SMTP_PASSWORD',
+      'EVALUATION_SANDBOX_MODE',
+    );
   }
   const missingKeys = requiredKeys.filter((key) => !config[key]);
 
@@ -34,6 +39,11 @@ export function validateEnv(config: Env): Env {
   }
 
   if (config.NODE_ENV === 'production') {
+    if (config.EVALUATION_SANDBOX_MODE !== 'kubernetes') {
+      throw new Error(
+        'EVALUATION_SANDBOX_MODE must be kubernetes in production',
+      );
+    }
     const placeholderKeys = [
       'GOOGLE_CLIENT_SECRET',
       'CLOUDINARY_API_SECRET',

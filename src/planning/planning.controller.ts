@@ -8,8 +8,12 @@ import {
   Patch,
   Post,
   Query,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import { RolesGuard } from 'src/common/guards/roles.guards';
@@ -33,6 +37,17 @@ function parsePage(page: string, limit: string) {
     limit: Math.max(1, Math.min(parseInt(limit, 10) || 20, 100)),
   };
 }
+
+const PLANNING_ARTIFACT_TYPES = [
+  'application/json',
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'text/markdown',
+  'text/plain',
+  'text/yaml',
+];
 
 @Controller('projects/:projectId')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
@@ -72,6 +87,40 @@ export class ProjectPlanningController {
       userId: user.sub,
       role: user.role,
     });
+    return { status: 'success', data };
+  }
+
+  @Post('planning-artifacts')
+  @Roles(UserRole.FREELANCER, UserRole.ADMIN)
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: 25 * 1024 * 1024 },
+      fileFilter: (_request, file, callback) => {
+        if (!PLANNING_ARTIFACT_TYPES.includes(file.mimetype)) {
+          callback(
+            new BadRequestException(
+              'Planning artifacts must be PDF, JSON, YAML, text, JPEG, PNG, or WebP files',
+            ),
+            false,
+          );
+          return;
+        }
+        callback(null, true);
+      },
+    }),
+  )
+  async uploadPlanningArtifact(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @UploadedFile() file: Express.Multer.File,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    if (!file) throw new BadRequestException('No artifact file uploaded');
+    const data = await this.evaluations.uploadPlanningArtifact(
+      projectId,
+      file,
+      { userId: user.sub, role: user.role },
+    );
     return { status: 'success', data };
   }
 

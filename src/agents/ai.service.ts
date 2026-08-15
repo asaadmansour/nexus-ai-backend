@@ -242,6 +242,19 @@ export type PlanningEvaluationCheck = {
   severity: 'info' | 'minor' | 'major' | 'blocker';
   evidence: string;
   feedback: string;
+  citations: Array<{
+    artifactId: string;
+    location: string;
+    finding: string;
+  }>;
+};
+
+export type PlanningEvaluationIssue = {
+  id: string;
+  criterionKey: string;
+  severity: 'minor' | 'major' | 'blocker';
+  message: string;
+  citations: PlanningEvaluationCheck['citations'];
 };
 
 export type PlanningEvaluationResult = {
@@ -254,6 +267,16 @@ export type PlanningEvaluationResult = {
   risks: string[];
   revisionItems: string[];
   crossContractIssues: string[];
+  artifactManifest: Record<string, unknown>;
+  artifactManifestHash: string;
+  evaluationInputHash: string;
+  contextHash: string;
+  promptVersion: string;
+  modelName: string;
+  openIssues: PlanningEvaluationIssue[];
+  resolvedIssues: string[];
+  regressions: string[];
+  reused: boolean;
   source: 'fastapi' | 'local_mock';
 };
 
@@ -267,6 +290,16 @@ type FastApiPlanningEvaluationResponse = {
   risks?: unknown;
   revisionItems?: unknown;
   crossContractIssues?: unknown;
+  artifactManifest?: unknown;
+  artifactManifestHash?: unknown;
+  evaluationInputHash?: unknown;
+  contextHash?: unknown;
+  promptVersion?: unknown;
+  modelName?: unknown;
+  openIssues?: unknown;
+  resolvedIssues?: unknown;
+  regressions?: unknown;
+  reused?: unknown;
 };
 
 const REQUIREMENT_FIELD_NAMES = [
@@ -1019,11 +1052,29 @@ export class AiService {
     return this.normalizePlanningEvaluationResult(dto, result, 'fastapi');
   }
 
+  normalizePlanningEvaluationSandboxResult(
+    dto: EvaluatePlanningSubmissionDto,
+    result: Record<string, unknown>,
+  ): PlanningEvaluationResult {
+    return this.normalizePlanningEvaluationResult(dto, result, 'fastapi');
+  }
+
   private normalizePlanningEvaluationResult(
     dto: EvaluatePlanningSubmissionDto,
     result: FastApiPlanningEvaluationResponse,
     source: PlanningEvaluationResult['source'],
   ): PlanningEvaluationResult {
+    const artifactManifest = this.asRecord(result.artifactManifest);
+    const inspectedArtifacts = new Map(
+      this.toRecordArray(artifactManifest.artifacts)
+        .filter((artifact) => artifact.status === 'inspected')
+        .map(
+          (artifact) => [this.optionalString(artifact.id), artifact] as const,
+        )
+        .filter((entry): entry is readonly [string, Record<string, unknown>] =>
+          Boolean(entry[0]),
+        ),
+    );
     const returnedChecks = new Map(
       this.toRecordArray(result.checks)
         .map((item) => [this.optionalString(item.key), item] as const)
@@ -1038,9 +1089,17 @@ export class AiService {
       const summary = this.optionalString(evidenceItem.summary);
       const urls = this.toStringArray(evidenceItem.urls);
       const hasEvidence = Boolean(summary || urls.length);
-      const hasRequiredUrl = !requirement.requiresUrl || urls.length > 0;
+      const hasInspectedArtifact = [...inspectedArtifacts.values()].some(
+        (artifact) =>
+          this.toStringArray(artifact.requirementKeys).includes(
+            requirement.key,
+          ),
+      );
+      const hasRequiredUrl =
+        !requirement.requiresUrl ||
+        (source === 'local_mock' ? urls.length > 0 : hasInspectedArtifact);
       const requestedStatus = this.optionalString(item.status);
-      const status: PlanningEvaluationCheck['status'] =
+      let status: PlanningEvaluationCheck['status'] =
         !hasEvidence || !hasRequiredUrl
           ? 'missing'
           : requestedStatus &&
@@ -1051,15 +1110,37 @@ export class AiService {
             : source === 'local_mock'
               ? 'met'
               : 'missing';
+      const citations = this.toRecordArray(item.citations)
+        .map((citation) => ({
+          artifactId: this.optionalString(citation.artifactId) ?? '',
+          location: this.optionalString(citation.location) ?? '',
+          finding: this.optionalString(citation.finding) ?? '',
+        }))
+        .filter(
+          (citation) =>
+            citation.artifactId &&
+            (source === 'local_mock' ||
+              this.toStringArray(
+                inspectedArtifacts.get(citation.artifactId)?.requirementKeys,
+              ).includes(requirement.key)),
+        );
+      if (
+        source !== 'local_mock' &&
+        requirement.requiresUrl &&
+        status === 'met' &&
+        citations.length === 0
+      ) {
+        status = 'partial';
+      }
       const severityValue = this.optionalString(item.severity);
       const severity: PlanningEvaluationCheck['severity'] =
-        severityValue &&
-        ['info', 'minor', 'major', 'blocker'].includes(severityValue)
-          ? (severityValue as PlanningEvaluationCheck['severity'])
-          : status === 'met'
-            ? 'info'
-            : requirement.mandatory
-              ? 'blocker'
+        status !== 'met' && requirement.mandatory
+          ? 'blocker'
+          : severityValue &&
+              ['info', 'minor', 'major', 'blocker'].includes(severityValue)
+            ? (severityValue as PlanningEvaluationCheck['severity'])
+            : status === 'met'
+              ? 'info'
               : 'minor';
 
       return {
@@ -1078,6 +1159,7 @@ export class AiService {
           (status === 'met'
             ? 'Requirement is supported by submitted evidence.'
             : `Complete ${requirement.title} and provide specific evidence.`),
+        citations,
       };
     });
     const blockers = checks.filter(
@@ -1109,6 +1191,50 @@ export class AiService {
       ]),
     );
 
+    const returnedIssues = new Map(
+      this.toRecordArray(result.openIssues)
+        .map(
+          (issue) => [this.optionalString(issue.criterionKey), issue] as const,
+        )
+        .filter((entry): entry is readonly [string, Record<string, unknown>] =>
+          Boolean(entry[0]),
+        ),
+    );
+    const openIssues = checks
+      .filter((check) => check.status !== 'met')
+      .map((check) => {
+        const issue = returnedIssues.get(check.key) ?? {};
+        const severity = this.optionalString(issue.severity);
+        const defaultSeverity = check.mandatory
+          ? 'blocker'
+          : check.severity === 'major'
+            ? 'major'
+            : 'minor';
+        return {
+          id:
+            this.optionalString(issue.id) ??
+            `planning-${createHash('sha256').update(check.key).digest('hex').slice(0, 16)}`,
+          criterionKey: check.key,
+          severity: (check.mandatory
+            ? 'blocker'
+            : ['minor', 'major'].includes(severity ?? '')
+              ? severity
+              : defaultSeverity) as PlanningEvaluationIssue['severity'],
+          message: this.optionalString(issue.message) ?? check.feedback,
+          citations: this.toRecordArray(issue.citations)
+            .map((citation) => ({
+              artifactId: this.optionalString(citation.artifactId) ?? '',
+              location: this.optionalString(citation.location) ?? '',
+              finding: this.optionalString(citation.finding) ?? '',
+            }))
+            .filter((citation) =>
+              this.toStringArray(
+                inspectedArtifacts.get(citation.artifactId)?.requirementKeys,
+              ).includes(check.key),
+            ),
+        };
+      });
+
     return {
       passed: recommendation === 'approve',
       score,
@@ -1123,6 +1249,18 @@ export class AiService {
       risks: this.toStringArray(result.risks),
       revisionItems,
       crossContractIssues: this.toStringArray(result.crossContractIssues),
+      artifactManifest,
+      artifactManifestHash:
+        this.optionalString(result.artifactManifestHash) ?? '',
+      evaluationInputHash:
+        this.optionalString(result.evaluationInputHash) ?? '',
+      contextHash: this.optionalString(result.contextHash) ?? '',
+      promptVersion: this.optionalString(result.promptVersion) ?? '',
+      modelName: this.optionalString(result.modelName) ?? '',
+      openIssues,
+      resolvedIssues: this.toStringArray(result.resolvedIssues),
+      regressions: this.toStringArray(result.regressions),
+      reused: result.reused === true,
       source,
     };
   }

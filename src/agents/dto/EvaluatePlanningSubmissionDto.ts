@@ -12,6 +12,7 @@ export class EvaluatePlanningSubmissionDto {
   requirements!: PlanningEvaluationRequirementDto[];
   submission!: {
     submissionId: string;
+    submissionVersion: number;
     submissionType: 'architecture' | 'ui_ux';
     title: string | null;
     summary: string | null;
@@ -19,4 +20,5 @@ export class EvaluatePlanningSubmissionDto {
     fileUrls: Record<string, unknown>;
   };
   approvedArchitecture?: Record<string, unknown> | null;
+  previousVerdict?: Record<string, unknown> | null;
 }

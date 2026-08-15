@@ -18,6 +18,7 @@ import { PlanningSubmissionEvaluationProcessor } from './jobs/planning-submissio
 import { areQueuesEnabled } from 'src/queues/queue-runtime';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
 import { MatchingModule } from 'src/matching/matching.module';
+import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
 
 const queueProcessors = areQueuesEnabled()
   ? [ProjectPlanGenerationProcessor, PlanningSubmissionEvaluationProcessor]
@@ -42,6 +43,7 @@ const queueProcessors = areQueuesEnabled()
   providers: [
     PlanningSubmissionsService,
     PlanningEvaluationsService,
+    PlanningEvaluationSandboxService,
     ProjectPlansService,
     ...queueProcessors,
   ],

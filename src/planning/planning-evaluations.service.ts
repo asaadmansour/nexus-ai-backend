@@ -3,15 +3,16 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
-import {
-  AiService,
-  type PlanningEvaluationResult,
-} from 'src/agents/ai.service';
+import { createHash, randomUUID } from 'node:crypto';
+import { v2 as cloudinary, type UploadApiResponse } from 'cloudinary';
+import type { PlanningEvaluationResult } from 'src/agents/ai.service';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { NotificationsService } from 'src/notifications/notifications.service';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -28,6 +29,7 @@ import {
   type PlanningEvaluationRequirement,
   type PlanningSubmissionType,
 } from './planning-evaluation-requirements';
+import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
 
 @Injectable()
 export class PlanningEvaluationsService {
@@ -46,10 +48,97 @@ export class PlanningEvaluationsService {
     private readonly profileRepo: Repository<FreelancerProfile>,
     @InjectRepository(ProjectRoleAssignment)
     private readonly assignmentRepo: Repository<ProjectRoleAssignment>,
-    private readonly aiService: AiService,
+    private readonly evaluationSandbox: PlanningEvaluationSandboxService,
     private readonly aiJobsProducer: AiJobsProducer,
     private readonly notificationsService: NotificationsService,
-  ) {}
+    private readonly configService: ConfigService,
+  ) {
+    cloudinary.config({
+      cloud_name: this.configService.getOrThrow<string>(
+        'CLOUDINARY_CLOUD_NAME',
+      ),
+      api_key: this.configService.getOrThrow<string>('CLOUDINARY_API_KEY'),
+      api_secret: this.configService.getOrThrow<string>(
+        'CLOUDINARY_API_SECRET',
+      ),
+    });
+  }
+
+  async uploadPlanningArtifact(
+    projectId: string,
+    file: Express.Multer.File,
+    requester: { userId: string; role: UserRole },
+  ) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw new NotFoundException('Project not found');
+    if (requester.role === UserRole.FREELANCER) {
+      const profile = await this.profileRepo.findOne({
+        where: { userId: requester.userId },
+        select: { id: true },
+      });
+      const assignment = profile
+        ? await this.assignmentRepo.findOne({
+            where: {
+              projectId,
+              freelancerProfileId: profile.id,
+              status: In(['assigned', 'accepted', 'in_progress']),
+            },
+            select: { id: true },
+          })
+        : null;
+      if (!assignment) {
+        throw new ForbiddenException(
+          'Only an assigned planning freelancer can upload project artifacts',
+        );
+      }
+    }
+
+    const sha256 = createHash('sha256').update(file.buffer).digest('hex');
+    const originalName = file.originalname
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .slice(-120);
+    const isImage = ['image/jpeg', 'image/png', 'image/webp'].includes(
+      file.mimetype,
+    );
+    const publicId = isImage ? randomUUID() : `${randomUUID()}-${originalName}`;
+    const uploaded = await new Promise<UploadApiResponse>((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: isImage ? 'image' : 'raw',
+          folder: `planning-artifacts/${projectId}`,
+          public_id: publicId,
+          overwrite: false,
+          use_filename: false,
+          unique_filename: false,
+        },
+        (error, result) => {
+          if (error || !result) {
+            reject(
+              new InternalServerErrorException(
+                'Failed to store the planning artifact',
+              ),
+            );
+            return;
+          }
+          resolve(result);
+        },
+      );
+      stream.end(file.buffer);
+    });
+
+    return {
+      url: uploaded.secure_url,
+      publicId: uploaded.public_id,
+      storageVersion: uploaded.version,
+      originalName: file.originalname,
+      contentType: file.mimetype,
+      sizeBytes: file.size,
+      sha256,
+    };
+  }
 
   async getRequirements(
     projectId: string,
@@ -115,10 +204,16 @@ export class PlanningEvaluationsService {
       where: { projectId: submission.projectId },
     });
     const requirements = buildPlanningEvaluationRequirements(type, brief);
+    const existingSnapshot = this.asRecord(submission.evaluationRequirements);
+    const preservedVerdict = this.asRecord(existingSnapshot.previousVerdict);
+    const previousVerdict =
+      submission.evaluationResult ??
+      (Object.keys(preservedVerdict).length > 0 ? preservedVerdict : null);
     submission.evaluationRequirements = {
       version: 1,
       submissionType: type,
       requirements,
+      previousVerdict,
     };
 
     if (
@@ -230,7 +325,10 @@ export class PlanningEvaluationsService {
 
     try {
       const payload = await this.buildPayload(submission);
-      const result = await this.aiService.evaluatePlanningSubmission(payload);
+      const result = await this.evaluationSandbox.evaluate(
+        payload,
+        data.agentJobId,
+      );
       await this.saveResult(submission, result);
       await this.markJobCompleted(data.agentJobId, result);
       try {
@@ -282,6 +380,19 @@ export class PlanningEvaluationsService {
     const requirements = Array.isArray(snapshot.requirements)
       ? (snapshot.requirements as PlanningEvaluationRequirement[])
       : buildPlanningEvaluationRequirements(type, brief);
+    const previousSubmission = await this.submissionRepo
+      .createQueryBuilder('submission')
+      .where('submission.project_id = :projectId', {
+        projectId: submission.projectId,
+      })
+      .andWhere('submission.submission_type = :type', { type })
+      .andWhere('submission.version < :version', {
+        version: submission.version,
+      })
+      .andWhere('submission.evaluation_result IS NOT NULL')
+      .orderBy('submission.version', 'DESC')
+      .getOne();
+    const retryVerdict = this.asRecord(snapshot.previousVerdict);
 
     return {
       project: {
@@ -310,6 +421,7 @@ export class PlanningEvaluationsService {
       requirements,
       submission: {
         submissionId: submission.id,
+        submissionVersion: submission.version,
         submissionType: type,
         title: submission.title,
         summary: submission.summary,
@@ -324,6 +436,10 @@ export class PlanningEvaluationsService {
             fileUrls: architecture.fileUrls ?? {},
           }
         : null,
+      previousVerdict:
+        Object.keys(retryVerdict).length > 0
+          ? retryVerdict
+          : (previousSubmission?.evaluationResult ?? null),
     };
   }
 
