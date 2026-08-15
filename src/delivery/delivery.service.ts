@@ -21,6 +21,7 @@ import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-r
 import { ProjectSubmissionReview } from 'src/projects/entities/project-submission-review.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { ProjectTaskDependency } from 'src/projects/entities/project-task-dependency.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
@@ -41,7 +42,37 @@ type SubmissionWriteResult = {
   submission: ProjectSubmission;
   project: Project;
   previousSubmissionId: string | null;
+  alreadySubmitted?: boolean;
 };
+
+export function assertTaskAcceptsDraft(task: Pick<ProjectTask, 'status'>) {
+  if (['done', 'cancelled', 'review'].includes(task.status)) {
+    throw new ConflictException(
+      `A submission cannot be edited while its task is ${task.status}`,
+    );
+  }
+}
+
+export function assertSubmissionMatchesCurrentTask(
+  submission: Pick<ProjectSubmission, 'taskId' | 'freelancerProfileId'> & {
+    task: Pick<ProjectTask, 'assignedFreelancerProfileId'> | null;
+  },
+) {
+  if (!submission.taskId || !submission.task) {
+    throw new ConflictException(
+      'The submission is no longer linked to an active project task',
+    );
+  }
+  if (
+    !submission.freelancerProfileId ||
+    submission.task.assignedFreelancerProfileId !==
+      submission.freelancerProfileId
+  ) {
+    throw new ConflictException(
+      'The task assignment changed after this submission was created',
+    );
+  }
+}
 
 @Injectable()
 export class DeliveryService {
@@ -176,6 +207,19 @@ export class DeliveryService {
       if (!submission) throw new NotFoundException('Submission not found');
 
       await this.assertSubmissionOwner(submission, requester, manager);
+      if (!submission.taskId) {
+        throw new ConflictException('The submission is not linked to a task');
+      }
+      const lockedTask = await manager
+        .getRepository(ProjectTask)
+        .createQueryBuilder('task')
+        .setLock('pessimistic_write')
+        .where('task.id = :taskId', { taskId: submission.taskId })
+        .getOne();
+      if (!lockedTask) throw new NotFoundException('Project task not found');
+      submission.task = lockedTask;
+      assertSubmissionMatchesCurrentTask(submission);
+      assertTaskAcceptsDraft(submission.task);
       if (!['draft', 'changes_requested'].includes(submission.status)) {
         throw new ConflictException(
           'Only draft or changes-requested submissions can be edited',
@@ -243,16 +287,34 @@ export class DeliveryService {
       if (!submission) throw new NotFoundException('Submission not found');
 
       await this.assertSubmissionOwner(submission, requester, manager);
+      if (!submission.taskId) {
+        throw new ConflictException('The submission is not linked to a task');
+      }
+      const lockedTask = await manager
+        .getRepository(ProjectTask)
+        .createQueryBuilder('task')
+        .setLock('pessimistic_write')
+        .where('task.id = :taskId', { taskId: submission.taskId })
+        .getOne();
+      if (!lockedTask) throw new NotFoundException('Project task not found');
+      submission.task = lockedTask;
+      assertSubmissionMatchesCurrentTask(submission);
       if (['submitted', 'under_review'].includes(submission.status)) {
         return {
           submission,
           project: submission.project,
           previousSubmissionId: null,
+          alreadySubmitted: true,
         } satisfies SubmissionWriteResult;
       }
       if (!['draft', 'changes_requested'].includes(submission.status)) {
         throw new ConflictException('This submission cannot be submitted');
       }
+      await this.assertTaskReadyForSubmission(
+        manager,
+        submission.task,
+        submission.freelancerProfileId,
+      );
 
       let previousSubmissionId: string | null = null;
       if (submission.status === 'changes_requested') {
@@ -294,6 +356,15 @@ export class DeliveryService {
       } satisfies SubmissionWriteResult;
     });
 
+    if (result.alreadySubmitted) {
+      return {
+        ...result.submission,
+        evaluationDispatch:
+          result.submission.metadata?.evaluationDispatch ?? null,
+        reused: true,
+      };
+    }
+
     const dispatch = await this.dispatchEvaluation(
       result.submission,
       requester.sub,
@@ -319,6 +390,7 @@ export class DeliveryService {
         .getOne();
       if (!submission) throw new NotFoundException('Submission not found');
       this.assertReviewerAccess(submission.project, requester);
+      assertSubmissionMatchesCurrentTask(submission);
       if (!['submitted', 'under_review'].includes(submission.status)) {
         throw new ConflictException(
           'Only submitted or under-review work can be reviewed',
@@ -517,9 +589,13 @@ export class DeliveryService {
       where: { id: projectId },
     });
     if (!project) throw new NotFoundException('Project not found');
-    const task = await manager.getRepository(ProjectTask).findOne({
-      where: { id: dto.taskId, projectId },
-    });
+    const task = await manager
+      .getRepository(ProjectTask)
+      .createQueryBuilder('task')
+      .setLock('pessimistic_write')
+      .where('task.id = :taskId', { taskId: dto.taskId })
+      .andWhere('task.projectId = :projectId', { projectId })
+      .getOne();
     if (!task) throw new NotFoundException('Project task not found');
     if (!task.assignedFreelancerProfileId) {
       throw new ConflictException(
@@ -589,7 +665,14 @@ export class DeliveryService {
     const shouldSubmit = submission.status === 'submitted';
     if (shouldSubmit) {
       this.assertSubmissionHasEvidence(submission);
+      await this.assertTaskReadyForSubmission(
+        manager,
+        task,
+        submission.freelancerProfileId,
+      );
       submission.status = 'draft';
+    } else {
+      assertTaskAcceptsDraft(task);
     }
     let saved = await repo.save(submission);
     if (shouldSubmit) {
@@ -963,6 +1046,45 @@ export class DeliveryService {
     });
     if (!profile || submission.freelancerProfileId !== profile.id) {
       throw new ForbiddenException('You do not own this submission');
+    }
+  }
+
+  private async assertTaskReadyForSubmission(
+    manager: EntityManager,
+    task: ProjectTask,
+    freelancerProfileId: string | null,
+  ) {
+    if (
+      !freelancerProfileId ||
+      task.assignedFreelancerProfileId !== freelancerProfileId
+    ) {
+      throw new ConflictException(
+        "Only the task's current assignee can submit this work",
+      );
+    }
+    assertTaskAcceptsDraft(task);
+    if (task.status === 'blocked') {
+      throw new ConflictException(
+        'Move the task out of blocked status before submitting work',
+      );
+    }
+
+    const unfinishedDependencies = await manager
+      .getRepository(ProjectTask)
+      .createQueryBuilder('dependencyTask')
+      .innerJoin(
+        ProjectTaskDependency,
+        'dependency',
+        'dependency.depends_on_task_id = dependencyTask.id AND dependency.task_id = :taskId',
+        { taskId: task.id },
+      )
+      .where('dependencyTask.status != :done', { done: 'done' })
+      .andWhere("dependency.dependency_type IN ('blocks', 'after')")
+      .getCount();
+    if (unfinishedDependencies > 0) {
+      throw new ConflictException(
+        'This task has unfinished blocking dependencies',
+      );
     }
   }
 

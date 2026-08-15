@@ -16,6 +16,7 @@
     "db:create": "typeorm-ts-node-commonjs migration:create",
     "db:generate": "npm run typeorm -- migration:generate",
     "db:migrate": "npm run typeorm -- migration:run",
+    "db:migrate:prod": "typeorm -d dist/database/data-source.js migration:run",
     "db:revert": "npm run typeorm -- migration:revert",
     "db:show": "npm run typeorm -- migration:show",
     "seed:admin": "ts-node -r tsconfig-paths/register src/database/seeds/seed-admin.ts",
@@ -63,7 +64,7 @@
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "stripe": "22.3.2",
-    "typeorm": "0.3.30"
+    "typeorm": "0.3.31"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

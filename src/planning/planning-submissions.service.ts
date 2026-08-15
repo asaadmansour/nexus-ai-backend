@@ -29,6 +29,12 @@ const ROLE_TO_SUBMISSION_TYPE: Record<string, string> = {
   architect: 'architecture',
   ui_ux: 'ui_ux',
 };
+const ACTIVE_PLANNING_ASSIGNMENT_STATUSES = [
+  'assigned',
+  'accepted',
+  'in_progress',
+  'completed',
+];
 
 @Injectable()
 export class PlanningSubmissionsService {
@@ -64,6 +70,14 @@ export class PlanningSubmissionsService {
     if (!assignment || assignment.projectId !== projectId) {
       throw new NotFoundException('Assignment not found for this project');
     }
+    if (
+      assignment.phase !== 'planning' ||
+      !ACTIVE_PLANNING_ASSIGNMENT_STATUSES.includes(assignment.status)
+    ) {
+      throw new ConflictException(
+        'This planning assignment is not active for submissions',
+      );
+    }
 
     const isAdmin = requester.role === UserRole.ADMIN;
     if (!isAdmin) {
@@ -81,16 +95,44 @@ export class PlanningSubmissionsService {
     }
 
     const status = dto.status ?? 'submitted';
-    const latest = await this.submissionRepo.findOne({
-      where: {
-        assignmentId: assignment.id,
-        submissionType: dto.submissionType,
-      },
-      order: { version: 'DESC' },
-    });
-    const version = (latest?.version ?? 0) + 1;
+    if (status === 'submitted') this.assertSubmissionHasEvidence(dto);
 
     const submission = await this.dataSource.transaction(async (manager) => {
+      const lockedAssignment = await manager
+        .getRepository(ProjectRoleAssignment)
+        .createQueryBuilder('assignment')
+        .setLock('pessimistic_write')
+        .where('assignment.id = :assignmentId', {
+          assignmentId: assignment.id,
+        })
+        .getOne();
+      if (
+        !lockedAssignment ||
+        lockedAssignment.projectId !== projectId ||
+        lockedAssignment.phase !== 'planning' ||
+        !ACTIVE_PLANNING_ASSIGNMENT_STATUSES.includes(lockedAssignment.status)
+      ) {
+        throw new ConflictException(
+          'This planning assignment is not active for submissions',
+        );
+      }
+      const latest = await manager.findOne(ProjectPlanningSubmission, {
+        where: {
+          assignmentId: assignment.id,
+          submissionType: dto.submissionType,
+        },
+        order: { version: 'DESC' },
+      });
+      if (latest && ['submitted', 'approved'].includes(latest.status)) {
+        throw new ConflictException(
+          'The current planning submission must be reviewed before another version is created',
+        );
+      }
+      if (latest?.status === 'draft' && status === 'draft') {
+        throw new ConflictException(
+          'A draft planning submission already exists for this assignment',
+        );
+      }
       if (latest && latest.status !== 'superseded') {
         latest.status = 'superseded';
         await manager.save(ProjectPlanningSubmission, latest);
@@ -103,7 +145,7 @@ export class PlanningSubmissionsService {
           assignmentId: assignment.id,
           freelancerProfileId: assignment.freelancerProfileId,
           submissionType: dto.submissionType,
-          version,
+          version: (latest?.version ?? 0) + 1,
           status,
           title: dto.title ?? null,
           summary: dto.summary ?? null,
@@ -237,15 +279,34 @@ export class PlanningSubmissionsService {
     }
 
     const result = await this.dataSource.transaction(async (manager) => {
-      const submission = await manager.findOne(ProjectPlanningSubmission, {
-        where: { id: submissionId },
-        relations: ['freelancerProfile'],
-      });
+      const submission = await manager
+        .getRepository(ProjectPlanningSubmission)
+        .createQueryBuilder('submission')
+        .setLock('pessimistic_write', undefined, ['submission'])
+        .leftJoinAndSelect('submission.freelancerProfile', 'freelancerProfile')
+        .where('submission.id = :submissionId', { submissionId })
+        .getOne();
       if (!submission) throw new NotFoundException('Submission not found');
 
-      if (dto.status === 'approved' && submission.status !== 'submitted') {
+      // Serializing reviews at project level guarantees that concurrent
+      // architecture/UI approvals cannot both miss the plan-unlock condition.
+      await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId: submission.projectId })
+        .getOneOrFail();
+
+      const latest = await manager.findOne(ProjectPlanningSubmission, {
+        where: {
+          projectId: submission.projectId,
+          submissionType: submission.submissionType,
+        },
+        order: { version: 'DESC' },
+      });
+      if (latest?.id !== submission.id || submission.status !== 'submitted') {
         throw new ConflictException(
-          'Only the current submitted version can be approved',
+          'Only the current submitted version can be reviewed',
         );
       }
 
@@ -461,6 +522,20 @@ export class PlanningSubmissionsService {
 
   private getErrorMessage(error: unknown) {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  private assertSubmissionHasEvidence(dto: CreatePlanningSubmissionDto) {
+    const hasContent = Boolean(
+      dto.content && Object.keys(dto.content).length > 0,
+    );
+    const hasFiles = Boolean(
+      dto.fileUrls && Object.keys(dto.fileUrls).length > 0,
+    );
+    if (!dto.summary?.trim() && !hasContent && !hasFiles) {
+      throw new BadRequestException(
+        'A submitted planning deliverable must include evidence',
+      );
+    }
   }
 
   private async getProject(projectId: string) {

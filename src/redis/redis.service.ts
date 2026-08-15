@@ -68,6 +68,11 @@ export class RedisService implements OnModuleDestroy {
     return (results?.[0]?.[1] as number) ?? 0;
   }
 
+  async ping(): Promise<'PONG'> {
+    await this.ensureReady();
+    return this.client.ping();
+  }
+
   private async ensureReady() {
     if (this.client.status === 'ready') return;
 

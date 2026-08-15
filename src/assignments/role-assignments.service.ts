@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -719,12 +720,13 @@ export class RoleAssignmentsService {
           : null,
       });
 
-      await this.assignmentRepo.update(assignment.id, {
-        roleBrief: result as unknown as Record<string, unknown>,
+      const update: QueryDeepPartialEntity<ProjectRoleAssignment> = {
+        roleBrief: result,
         roleBriefStatus: result.source === 'fastapi' ? 'generated' : 'fallback',
         roleBriefGeneratedAt: new Date(),
         roleBriefError: null,
-      } as any);
+      };
+      await this.assignmentRepo.update(assignment.id, update);
     } catch (error) {
       await this.assignmentRepo.update(assignmentId, {
         roleBriefStatus: 'fallback',

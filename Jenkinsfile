@@ -17,7 +17,7 @@ pipeline {
     // Run unit tests in a throwaway node container (fails the build if they fail)
     stage('Test') {
       steps {
-        sh 'docker run --rm -v $WORKSPACE:/app -w /app node:24-alpine sh -c "npm ci && npm test"'
+        sh 'docker run --rm -v $WORKSPACE:/app -w /app node:24-alpine sh -c "npm ci && npm test -- --runInBand && npm run build"'
       }
     }
 
@@ -37,8 +37,10 @@ pipeline {
     stage('Deploy to EKS') {
       steps {
         sh 'aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER'
-        // First run: kubectl apply the Kubernetes/ manifests. After that, just swap the image tag:
-        sh 'kubectl set image deployment/backend backend=$IMAGE'
+        sh 'kubectl apply -f Kubernetes/configmap.yaml'
+        sh 'kubectl apply -f Kubernetes/Deployments/backend-deployment.yaml'
+        sh 'kubectl set image deployment/backend backend=$IMAGE migrate=$IMAGE'
+        sh 'kubectl rollout status deployment/backend --timeout=5m'
       }
     }
   }

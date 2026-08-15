@@ -51,7 +51,7 @@ export class PaymentReleaseRequestsService {
     dto: CreatePaymentReleaseRequestDto,
     requester: JwtPayload,
   ) {
-    const request = await this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const project = await manager
         .getRepository(Project)
         .createQueryBuilder('project')
@@ -127,10 +127,10 @@ export class PaymentReleaseRequestsService {
           where: {
             submissionId: submission.id,
             freelancerProfileId,
-            status: In(['pending', 'approved']),
+            status: In(['pending', 'approved', 'released']),
           },
         });
-      if (existing) return existing;
+      if (existing) return { request: existing, created: false };
 
       const amount = this.toCents(dto.amount);
       const available = await this.availableHeldCents(manager, project);
@@ -161,7 +161,7 @@ export class PaymentReleaseRequestsService {
         throw new ConflictException('No funded escrow payment was found');
       }
 
-      return manager.getRepository(PaymentReleaseRequest).save({
+      const request = await manager.getRepository(PaymentReleaseRequest).save({
         projectId,
         milestoneId,
         submissionId: submission.id,
@@ -182,10 +182,11 @@ export class PaymentReleaseRequestsService {
           stripeTransferId: null,
         },
       });
+      return { request, created: true };
     });
 
-    await this.notifyReleaseRequested(request);
-    return request;
+    if (result.created) await this.notifyReleaseRequested(result.request);
+    return result.request;
   }
 
   async createForApprovedSubmission(

@@ -1,0 +1,41 @@
+import { validateEnv } from './env.validation';
+
+const validConfig = {
+  DATABASE_URL: 'postgresql://localhost/nexus',
+  REDIS_URL: 'redis://localhost:6379',
+  JWT_SECRET: 'a'.repeat(64),
+  FRONTEND_URL: 'http://localhost:3001',
+  AI_SERVICE_URL: 'http://localhost:8000',
+  GOOGLE_CLIENT_ID: 'client-id',
+  GOOGLE_CLIENT_SECRET: 'client-secret',
+  GOOGLE_CALLBACK_URL: 'http://localhost:3000/api/auth/google/callback',
+  CLOUDINARY_CLOUD_NAME: 'cloud',
+  CLOUDINARY_API_KEY: 'key',
+  CLOUDINARY_API_SECRET: 'secret',
+  STRIPE_SECRET_KEY: 'stripe-secret',
+};
+
+describe('environment validation', () => {
+  it('reports integrations that would otherwise fail during startup', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        GOOGLE_CLIENT_SECRET: undefined,
+        STRIPE_SECRET_KEY: undefined,
+      }),
+    ).toThrow('GOOGLE_CLIENT_SECRET, STRIPE_SECRET_KEY');
+  });
+
+  it('rejects weak or placeholder production secrets', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        NODE_ENV: 'production',
+        JWT_SECRET: 'change-me',
+        STRIPE_WEBHOOK_SECRET: 'webhook-secret',
+        SMTP_USER: 'smtp-user',
+        SMTP_PASSWORD: 'smtp-password',
+      }),
+    ).toThrow('JWT_SECRET must be a non-placeholder value');
+  });
+});

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -29,8 +30,11 @@ import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { ProjectTaskDependency } from 'src/projects/entities/project-task-dependency.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
+import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
+import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingService } from 'src/matching/matching.service';
+import { PaymentReleaseRequest } from 'src/payments/entities/payment-release-request.entity';
 import { GeneratePlanDto } from './dtos/generate-plan.dto';
 import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
@@ -39,6 +43,26 @@ import { UpdateTaskDto } from './dtos/update-task.dto';
 interface Requester {
   userId: string;
   role: UserRole;
+}
+
+const DELIVERY_MANAGED_TASK_STATUSES = new Set([
+  'review',
+  'changes_requested',
+  'done',
+]);
+
+const FREELANCER_TASK_TRANSITIONS: Record<string, Set<string>> = {
+  todo: new Set(['todo', 'blocked', 'in_progress']),
+  blocked: new Set(['blocked', 'todo', 'in_progress']),
+  in_progress: new Set(['in_progress', 'blocked']),
+  changes_requested: new Set(['changes_requested', 'blocked', 'in_progress']),
+};
+
+export function canFreelancerTransitionTask(
+  currentStatus: string,
+  nextStatus: string,
+) {
+  return FREELANCER_TASK_TRANSITIONS[currentStatus]?.has(nextStatus) ?? false;
 }
 
 @Injectable()
@@ -126,6 +150,13 @@ export class ProjectPlansService {
     });
 
     const plan = await this.dataSource.transaction(async (manager) => {
+      await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOneOrFail();
+
       await manager
         .createQueryBuilder()
         .update(ProjectPlan)
@@ -430,16 +461,28 @@ export class ProjectPlansService {
       );
     }
 
-    const plan = await this.planRepo.findOne({ where: { id: planId } });
-    if (!plan) throw new NotFoundException('Plan not found');
+    const plan = await this.dataSource.transaction(async (manager) => {
+      const lockedPlan = await manager
+        .getRepository(ProjectPlan)
+        .createQueryBuilder('plan')
+        .setLock('pessimistic_write')
+        .where('plan.id = :planId', { planId })
+        .getOne();
+      if (!lockedPlan) throw new NotFoundException('Plan not found');
+      if (!lockedPlan.isCurrent || lockedPlan.status !== 'generated') {
+        throw new ConflictException(
+          'Only the current generated plan can be reviewed',
+        );
+      }
 
-    plan.status = dto.status;
-    plan.adminNotes = dto.adminNotes ?? plan.adminNotes ?? null;
-    if (dto.status === 'approved') {
-      plan.approvedBy = adminUserId;
-      plan.approvedAt = new Date();
-    }
-    await this.planRepo.save(plan);
+      lockedPlan.status = dto.status;
+      lockedPlan.adminNotes = dto.adminNotes ?? lockedPlan.adminNotes ?? null;
+      if (dto.status === 'approved') {
+        lockedPlan.approvedBy = adminUserId;
+        lockedPlan.approvedAt = new Date();
+      }
+      return manager.save(ProjectPlan, lockedPlan);
+    });
 
     const response: Record<string, unknown> = {
       id: plan.id,
@@ -474,21 +517,10 @@ export class ProjectPlansService {
         'Only an approved plan can be materialized',
       );
     }
-
-    const existingSpec = await this.specRepo.findOne({
-      where: { projectId: plan.projectId },
-    });
-    if (existingSpec && !dto.replaceExisting) {
-      const existing = await this.existingMaterializationCounts(
-        plan.projectId,
-        existingSpec.id,
+    if (!plan.isCurrent) {
+      throw new ConflictException(
+        'Only the current approved plan can be materialized',
       );
-      const matchingDispatch =
-        await this.matchingService.autoStartImplementationTasks(
-          plan.projectId,
-          adminUserId,
-        );
-      return { ...existing, matchingDispatch };
     }
 
     const milestones = (plan.milestones ??
@@ -499,8 +531,63 @@ export class ProjectPlansService {
 
     const materialization = await this.dataSource.transaction(
       async (manager) => {
+        const project = await manager
+          .getRepository(Project)
+          .createQueryBuilder('project')
+          .setLock('pessimistic_write')
+          .where('project.id = :projectId', { projectId: plan.projectId })
+          .getOne();
+        if (!project) throw new NotFoundException('Project not found');
+
+        const lockedPlan = await manager
+          .getRepository(ProjectPlan)
+          .createQueryBuilder('plan')
+          .setLock('pessimistic_write')
+          .where('plan.id = :planId', { planId })
+          .getOne();
+        if (!lockedPlan) throw new NotFoundException('Plan not found');
+        if (lockedPlan.status !== 'approved' || !lockedPlan.isCurrent) {
+          throw new ConflictException(
+            'The plan is no longer the current approved plan',
+          );
+        }
+
+        const existingSpec = await manager.findOne(ProjectSpec, {
+          where: { projectId: plan.projectId },
+        });
+        if (existingSpec && !dto.replaceExisting) {
+          // A transaction-scoped EntityManager owns one PostgreSQL client, so
+          // its queries must remain sequential (pg rejects concurrent client
+          // queries starting with v9).
+          const milestoneCount = await manager.count(ProjectMilestone, {
+            where: { projectId: plan.projectId },
+          });
+          const taskCount = await manager.count(ProjectTask, {
+            where: { projectId: plan.projectId },
+          });
+          const dependencyCount = await manager
+            .getRepository(ProjectTaskDependency)
+            .createQueryBuilder('dependency')
+            .innerJoin(ProjectTask, 'task', 'task.id = dependency.task_id')
+            .where('task.project_id = :projectId', {
+              projectId: plan.projectId,
+            })
+            .getCount();
+          return {
+            projectId: plan.projectId,
+            planId: existingSpec.approvedPlanId,
+            specId: existingSpec.id,
+            projectStatus: project.status,
+            planningStatus: project.planningStatus,
+            milestoneCount,
+            taskCount,
+            dependencyCount,
+            alreadyMaterialized: true,
+          };
+        }
+
         if (existingSpec && dto.replaceExisting) {
-          await this.assertNoActivePayments(manager, plan.projectId);
+          await this.assertMaterializationReplaceable(manager, plan.projectId);
           await manager.delete(ProjectTask, { projectId: plan.projectId });
           await manager.delete(ProjectMilestone, { projectId: plan.projectId });
           await manager.delete(ProjectSpec, { projectId: plan.projectId });
@@ -625,41 +712,35 @@ export class ProjectPlansService {
           }),
         );
 
-        const project = await manager.findOne(Project, {
-          where: { id: plan.projectId },
-        });
-        if (project) {
-          const oldStatus = project.status;
-          const quote = this.shouldBackfillPlanQuote(project)
-            ? this.buildProjectQuote(project, quotedAmount, quotedCurrency)
-            : null;
-          if (quote) {
-            project.quotedAmount = quote.amount;
-            project.quotedCurrency = quote.currency;
-            project.quoteStatus = quote.status;
-            project.quoteGeneratedAt = quote.generatedAt;
-            project.quoteNotes = quote.notes;
-          }
-          project.status = ProjectStatus.IMPLEMENTATION_READY;
-          project.planningStatus = 'completed';
-          project.planningCompletedAt =
-            project.planningCompletedAt ?? new Date();
-          project.implementationReadyAt =
-            project.implementationReadyAt ?? new Date();
-          await manager.save(Project, project);
-          if (oldStatus !== ProjectStatus.IMPLEMENTATION_READY) {
-            await manager.save(
-              ProjectStatusHistory,
-              manager.create(ProjectStatusHistory, {
-                projectId: project.id,
-                oldStatus,
-                newStatus: ProjectStatus.IMPLEMENTATION_READY,
-                changedBy: adminUserId,
-                changedByType: 'admin',
-                reason: 'Plan materialized into tasks.',
-              }),
-            );
-          }
+        const oldStatus = project.status;
+        const quote = this.shouldBackfillPlanQuote(project)
+          ? this.buildProjectQuote(project, quotedAmount, quotedCurrency)
+          : null;
+        if (quote) {
+          project.quotedAmount = quote.amount;
+          project.quotedCurrency = quote.currency;
+          project.quoteStatus = quote.status;
+          project.quoteGeneratedAt = quote.generatedAt;
+          project.quoteNotes = quote.notes;
+        }
+        project.status = ProjectStatus.IMPLEMENTATION_READY;
+        project.planningStatus = 'completed';
+        project.planningCompletedAt = project.planningCompletedAt ?? new Date();
+        project.implementationReadyAt =
+          project.implementationReadyAt ?? new Date();
+        await manager.save(Project, project);
+        if (oldStatus !== ProjectStatus.IMPLEMENTATION_READY) {
+          await manager.save(
+            ProjectStatusHistory,
+            manager.create(ProjectStatusHistory, {
+              projectId: project.id,
+              oldStatus,
+              newStatus: ProjectStatus.IMPLEMENTATION_READY,
+              changedBy: adminUserId,
+              changedByType: 'admin',
+              reason: 'Plan materialized into tasks.',
+            }),
+          );
         }
 
         return {
@@ -778,34 +859,61 @@ export class ProjectPlansService {
   }
 
   async updateTask(taskId: string, dto: UpdateTaskDto, requester: Requester) {
-    const task = await this.taskRepo.findOne({ where: { id: taskId } });
-    if (!task) throw new NotFoundException('Task not found');
-
     const isAdmin = requester.role === UserRole.ADMIN;
-    if (!isAdmin) {
-      const profile = await this.profileRepo.findOne({
-        where: { userId: requester.userId },
-      });
-      if (!profile || task.assignedFreelancerProfileId !== profile.id) {
-        throw new ForbiddenException('You can only update your own task');
-      }
-      if (dto.assignedFreelancerProfileId || dto.assignmentId) {
-        throw new ForbiddenException('You cannot reassign a task');
-      }
+    if (
+      dto.assignedFreelancerProfileId !== undefined ||
+      dto.assignmentId !== undefined
+    ) {
+      throw new BadRequestException(
+        'Use the task assignment endpoint to assign a freelancer',
+      );
+    }
+    if (dto.status && DELIVERY_MANAGED_TASK_STATUSES.has(dto.status)) {
+      throw new BadRequestException(
+        `${dto.status} is managed by the submission review workflow`,
+      );
     }
 
-    if (dto.status === 'in_progress') {
-      await this.assertDependenciesDone(taskId);
-    }
+    const task = await this.dataSource.transaction(async (manager) => {
+      const lockedTask = await manager
+        .getRepository(ProjectTask)
+        .createQueryBuilder('task')
+        .setLock('pessimistic_write')
+        .where('task.id = :taskId', { taskId })
+        .getOne();
+      if (!lockedTask) throw new NotFoundException('Task not found');
 
-    if (dto.status) task.status = dto.status;
-    if (isAdmin && dto.assignedFreelancerProfileId !== undefined) {
-      task.assignedFreelancerProfileId = dto.assignedFreelancerProfileId;
-    }
-    if (isAdmin && dto.assignmentId !== undefined) {
-      task.assignmentId = dto.assignmentId;
-    }
-    await this.taskRepo.save(task);
+      if (!isAdmin) {
+        const profile = await manager.findOne(FreelancerProfile, {
+          where: { userId: requester.userId },
+        });
+        if (!profile || lockedTask.assignedFreelancerProfileId !== profile.id) {
+          throw new ForbiddenException('You can only update your own task');
+        }
+        if (
+          dto.status &&
+          !canFreelancerTransitionTask(lockedTask.status, dto.status)
+        ) {
+          throw new ConflictException(
+            `A freelancer cannot move a task from ${lockedTask.status} to ${dto.status}`,
+          );
+        }
+      }
+
+      if (dto.status === 'in_progress') {
+        await this.assertDependenciesDone(taskId, manager);
+      }
+      if (dto.status) lockedTask.status = dto.status;
+      if (dto.notes !== undefined) {
+        lockedTask.metadata = {
+          ...(lockedTask.metadata ?? {}),
+          statusNotes: dto.notes.trim() || null,
+          statusUpdatedBy: requester.userId,
+          statusUpdatedAt: new Date().toISOString(),
+        };
+      }
+      return manager.save(ProjectTask, lockedTask);
+    });
 
     return {
       id: task.id,
@@ -1134,26 +1242,7 @@ export class ProjectPlansService {
       : 'blocks';
   }
 
-  private async existingMaterializationCounts(
-    projectId: string,
-    specId: string,
-  ) {
-    const [milestoneCount, taskCount] = await Promise.all([
-      this.milestoneRepo.count({ where: { projectId } }),
-      this.taskRepo.count({ where: { projectId } }),
-    ]);
-    return {
-      projectId,
-      specId,
-      projectStatus: ProjectStatus.IMPLEMENTATION_READY,
-      planningStatus: 'completed',
-      milestoneCount,
-      taskCount,
-      alreadyMaterialized: true,
-    };
-  }
-
-  private async assertNoActivePayments(
+  private async assertMaterializationReplaceable(
     manager: EntityManager,
     projectId: string,
   ) {
@@ -1165,6 +1254,29 @@ export class ProjectPlansService {
     if (held && Number(held.heldAmount) > 0) {
       throw new BadRequestException(
         'Cannot replace a materialized plan while funds are held in escrow',
+      );
+    }
+
+    const startedTaskCount = await manager
+      .getRepository(ProjectTask)
+      .createQueryBuilder('task')
+      .where('task.project_id = :projectId', { projectId })
+      .andWhere(
+        "(task.assigned_freelancer_profile_id IS NOT NULL OR task.status NOT IN ('todo', 'blocked'))",
+      )
+      .getCount();
+    const submissionCount = await manager.count(ProjectSubmission, {
+      where: { projectId },
+    });
+    const revisionCount = await manager.count(ProjectRevisionRequest, {
+      where: { projectId },
+    });
+    const releaseCount = await manager.count(PaymentReleaseRequest, {
+      where: { projectId },
+    });
+    if (startedTaskCount || submissionCount || revisionCount || releaseCount) {
+      throw new ConflictException(
+        'Cannot replace a materialized plan after assignment or delivery work has started',
       );
     }
   }
@@ -1183,8 +1295,12 @@ export class ProjectPlansService {
     return counts;
   }
 
-  private async assertDependenciesDone(taskId: string) {
-    const blocking = await this.taskRepo
+  private async assertDependenciesDone(
+    taskId: string,
+    manager: EntityManager = this.dataSource.manager,
+  ) {
+    const blocking = await manager
+      .getRepository(ProjectTask)
       .createQueryBuilder('t')
       .innerJoin(
         ProjectTaskDependency,
@@ -1193,6 +1309,7 @@ export class ProjectPlansService {
         { taskId },
       )
       .where('t.status != :done', { done: 'done' })
+      .andWhere("d.dependency_type IN ('blocks', 'after')")
       .getCount();
     if (blocking > 0) {
       throw new BadRequestException(

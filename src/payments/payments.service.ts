@@ -9,6 +9,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import Stripe from 'stripe';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
@@ -140,14 +141,17 @@ export class PaymentsService {
 
       stripeAccountId = account.id;
 
-      await this.freelancerProfilesRepository.update(profile.id, {
+      const profileUpdate: QueryDeepPartialEntity<FreelancerProfile> = {
         stripeAccountId,
         stripeOnboardingStatus: 'link_created',
         stripeChargesEnabled: this.isAccountOnboarded(account),
         stripePayoutsEnabled: this.isAccountOnboarded(account),
-        stripeRequirementsDue: this.accountRequirements(account),
+        stripeRequirementsDue: this.accountRequirements(
+          account,
+        ) as unknown as QueryDeepPartialEntity<Record<string, unknown>>,
         stripeOnboardedAt: this.isAccountOnboarded(account) ? new Date() : null,
-      } as any);
+      };
+      await this.freelancerProfilesRepository.update(profile.id, profileUpdate);
     }
 
     const returnUrl = this.resolveStripeConnectUrl(
@@ -190,13 +194,16 @@ export class PaymentsService {
       ? (profile.stripeOnboardedAt ?? new Date())
       : null;
 
-    await this.freelancerProfilesRepository.update(profile.id, {
+    const profileUpdate: QueryDeepPartialEntity<FreelancerProfile> = {
       stripeOnboardingStatus: onboardingStatus,
       stripeChargesEnabled: onboarded,
       stripePayoutsEnabled: onboarded,
-      stripeRequirementsDue: this.accountRequirements(account),
+      stripeRequirementsDue: this.accountRequirements(
+        account,
+      ) as unknown as QueryDeepPartialEntity<Record<string, unknown>>,
       stripeOnboardedAt: onboardedAt,
-    } as any);
+    };
+    await this.freelancerProfilesRepository.update(profile.id, profileUpdate);
 
     if (!onboarded) {
       throw new BadRequestException(
@@ -311,13 +318,16 @@ export class PaymentsService {
       ? (profile.stripeOnboardedAt ?? new Date())
       : null;
 
-    await this.freelancerProfilesRepository.update(profile.id, {
+    const profileUpdate: QueryDeepPartialEntity<FreelancerProfile> = {
       stripeOnboardingStatus: onboardingStatus,
       stripeChargesEnabled: onboarded,
       stripePayoutsEnabled: onboarded,
-      stripeRequirementsDue: this.accountRequirements(account),
+      stripeRequirementsDue: this.accountRequirements(
+        account,
+      ) as unknown as QueryDeepPartialEntity<Record<string, unknown>>,
       stripeOnboardedAt: onboardedAt,
-    } as any);
+    };
+    await this.freelancerProfilesRepository.update(profile.id, profileUpdate);
 
     return {
       status: 'success',
@@ -951,14 +961,25 @@ export class PaymentsService {
   }
 
   private async handlePaymentIntentFailed(intent: Stripe.PaymentIntent) {
-    await this.paymentsRepository.update({ stripePaymentIntentId: intent.id }, {
+    const paymentUpdate: QueryDeepPartialEntity<ProjectPayment> = {
       status: 'failed',
       failedAt: new Date(),
       metadata: {
         stripePaymentIntentStatus: intent.status,
-        lastPaymentError: intent.last_payment_error ?? null,
-      },
-    } as any);
+        lastPaymentError: intent.last_payment_error
+          ? {
+              code: intent.last_payment_error.code ?? null,
+              declineCode: intent.last_payment_error.decline_code ?? null,
+              message: intent.last_payment_error.message ?? null,
+              type: intent.last_payment_error.type,
+            }
+          : null,
+      } as unknown as QueryDeepPartialEntity<Record<string, unknown>>,
+    };
+    await this.paymentsRepository.update(
+      { stripePaymentIntentId: intent.id },
+      paymentUpdate,
+    );
   }
 
   private async handleSetupIntentSucceeded(intent: Stripe.SetupIntent) {
@@ -990,15 +1011,18 @@ export class PaymentsService {
       return;
     }
 
-    await this.freelancerProfilesRepository.update(profile.id, {
+    const profileUpdate: QueryDeepPartialEntity<FreelancerProfile> = {
       stripeOnboardingStatus: this.accountOnboardingStatus(account),
       stripeChargesEnabled: this.isAccountOnboarded(account),
       stripePayoutsEnabled: this.isAccountOnboarded(account),
-      stripeRequirementsDue: this.accountRequirements(account),
+      stripeRequirementsDue: this.accountRequirements(
+        account,
+      ) as unknown as QueryDeepPartialEntity<Record<string, unknown>>,
       stripeOnboardedAt: this.isAccountOnboarded(account)
         ? (profile.stripeOnboardedAt ?? new Date())
         : null,
-    } as any);
+    };
+    await this.freelancerProfilesRepository.update(profile.id, profileUpdate);
   }
 
   private buildProjectPaymentSummary(
