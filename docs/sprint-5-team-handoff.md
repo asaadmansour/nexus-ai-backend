@@ -87,6 +87,14 @@ What is ready:
   AI service compiles and imports successfully from its virtual environment.
 - Implementation-task matching, task assignment, GitHub repository automation,
   and their frontend admin screens are present after synchronizing `dev`.
+- Muhanad's Sprint 5 delivery UI is merged into the shared feature branch with
+  its backend contracts reconciled: submission types, detail response shape,
+  release payloads, admin delivery views, customer review, and freelancer task
+  work screens now use the implemented API shapes.
+- Implementation-only freelancers are included by
+  `GET /freelancer/projects/assigned`; project assignment detail may return an
+  empty planning `assignments` array plus `implementationTaskCount`, and their
+  task assignment grants milestone/task read access for the project.
 - Submission/versioning, review/revision, release-request, ledger-only release,
   authorization, pagination, and notification routes are implemented on
   `feature/sprint-5-asaad-delivery`.
@@ -120,6 +128,11 @@ What is ready:
   all three completed; a second materialization created no duplicates; tasks
   remained unassigned until an admin selected a ranked candidate; and the
   isolated database and Redis DB were removed afterward.
+- A fresh 24-migration HTTP run verified the implementation-freelancer handoff
+  with zero planning assignments: the project appeared in the freelancer list,
+  assignment detail reported one implementation task, the task was readable,
+  and a backend-valid `file` draft submission plus nested detail response both
+  succeeded. The disposable server and database were removed afterward.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.

@@ -1231,7 +1231,13 @@ export class ProjectPlansService {
         },
         select: { id: true },
       });
-      if (!assignment) {
+      const implementationTask = await this.taskRepo.exist({
+        where: {
+          projectId: project.id,
+          assignedFreelancerProfileId: profile.id,
+        },
+      });
+      if (!assignment && !implementationTask) {
         throw new ForbiddenException('You are not assigned to this project');
       }
     }
