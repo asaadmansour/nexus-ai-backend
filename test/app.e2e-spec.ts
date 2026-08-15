@@ -16,11 +16,11 @@ describe('AppController (e2e)', () => {
     await app.init();
   });
 
-  it('/ (GET)', () => {
+  it('/health/live (GET)', () => {
     return request(app.getHttpServer())
-      .get('/')
+      .get('/health/live')
       .expect(200)
-      .expect('Hello World!');
+      .expect({ status: 'ok' });
   });
 
   afterEach(async () => {
