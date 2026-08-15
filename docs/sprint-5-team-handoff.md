@@ -51,23 +51,18 @@ Important missing pieces before Sprint 5 is complete:
 - The previous Supabase project reference no longer exists. Local PostgreSQL 17
   with pgvector is working and fully migrated, but a new shared hosted database
   must be provisioned before staging/team integration.
-- No product routes for `project_submissions` yet.
-- No product routes for `project_submission_reviews` yet.
-- No product routes for `project_revision_requests` yet.
 - No product routes for `evaluation_runs` yet.
-- No GitHub repository service/controller yet.
-- Sprint 5 readiness migration `1785500000000-Sprint5Readiness.ts` is verified
-  locally and must be repeated on the replacement hosted database.
-- No implementation-task matching endpoint yet.
-- Current matching agent contract only validates `architect` and `ui_ux`.
+- Sprint 5 migrations `1785500000000-Sprint5Readiness.ts` and
+  `1785600000000-AddSprint5DeliveryContract.ts` are verified locally and must
+  be repeated on the replacement hosted database.
 - No queue type for submission evaluation yet.
 - FastAPI `/agents/evaluate-submission` is still mock behavior.
-- Current payment release route releases a whole payment directly. Sprint 5 needs release requests with milestone/submission amounts.
-- Frontend has no real implementation task board, submission pages, evaluation queue, repository page, or release-request workflow.
+- Frontend delivery/submission/revision/evaluation/release-request pages and
+  typed delivery services still need to be implemented.
 
 ## Readiness Audit
 
-Audit date: 2026-08-13.
+Audit date: 2026-08-15.
 
 Verdict: **Sprint 5 is ready for local implementation.** It is not ready for a
 shared staging deployment until the expired Supabase project is replaced and
@@ -76,20 +71,28 @@ the verified migrations are applied there.
 What is ready:
 
 - NestJS production build passes.
-- All 6 Jest suites pass (13 tests).
+- All 7 Jest suites pass (19 tests).
 - Sprint 5 readiness migration, entity mappings, profile update persistence,
   and GitHub username validation are implemented locally.
-- PostgreSQL 17 with pgvector is running locally and all 21 migrations are
-  applied; a post-migration inspection confirmed the Sprint 5 columns, foreign
-  keys, status constraint, and six required indexes.
+- PostgreSQL 17 with pgvector is running locally and all 22 migrations are
+  applied; post-migration inspection confirmed the Sprint 5 columns, foreign
+  keys, status constraints, and required indexes.
 - A second clean disposable database passed the complete migration chain, a
   Sprint 5 revert, and Sprint 5 reapplication; the disposable database was then
   removed.
 - Local Redis is running, the backend starts with BullMQ enabled, and
   `/api/health` returns `{ "status": "ok" }` against the migrated database.
 - The changed Sprint 5 backend files pass lint/format checks, the full backend
-  build and all 13 tests pass, frontend lint and production build pass, and the
+  build and all 19 tests pass, frontend lint and production build pass, and the
   AI service compiles and imports successfully from its virtual environment.
+- Implementation-task matching, task assignment, GitHub repository automation,
+  and their frontend admin screens are present after synchronizing `dev`.
+- Submission/versioning, review/revision, release-request, ledger-only release,
+  authorization, pagination, and notification routes are implemented on
+  `feature/sprint-5-asaad-delivery`.
+- A disposable 22-migration database passed the full HTTP delivery flow:
+  submission, revision, immutable replacement version, approval, release
+  request, idempotent ledger-only posting, and final project completion.
 - The seven Sprint 5 foundation tables and their TypeORM entities exist.
 - Foreign keys and the main list/filter indexes for submissions, revisions,
   evaluations, repositories, collaborators, and release requests exist.
@@ -101,31 +104,35 @@ Shared-environment database gate:
 
 - Ebrahim provisions a replacement hosted PostgreSQL/Supabase project and
   shares its secret connection values through the team's secret manager.
-- Ebrahim runs `npm run db:show`, applies all 21 migrations deliberately, and
+- Ebrahim runs `npm run db:show`, applies all 22 migrations deliberately, and
   repeats the schema verification used locally.
 - The team must not reuse or circulate the expired Supabase URL.
 
 Blocking application work:
 
-- No Sprint 5 repository, submission, revision, evaluation, task-assignment,
-  or release-request controller/service exists yet.
-- Matching is implemented only for planning roles; the NestJS DTO currently
-  accepts only `architect` and `ui_ux`.
 - There is no `submission_evaluation` queue, producer, processor, or recovery
   path.
 - FastAPI submission evaluation still returns mock output.
-- Sprint 5 frontend services and workspaces do not exist yet.
+- Sprint 5 delivery/review frontend services and workspaces do not exist yet.
 
 ## Required Sprint 5 DB Additions
 
-Ebrahim owns one coordinated Sprint 5 readiness migration for this section.
-Asaad and Sameh review the parts belonging to their verticals before it lands.
-Do not split these changes into competing migrations.
+Ebrahim owns the coordinated Sprint 5 readiness migration for this section.
+Asaad and Sameh review the parts belonging to their verticals. The later
+delivery-contract migration is intentionally separate because the readiness
+migration had already landed and been applied before the missing delivery
+columns were discovered; do not rewrite an applied migration.
 
-Implementation status (2026-08-13): the code below is implemented in
+Implementation status (2026-08-15): the code below is implemented in
 `1785500000000-Sprint5Readiness.ts` and matching TypeORM entities/DTOs. It was
 applied and verified on a clean local PostgreSQL 17 + pgvector database. The
 same verification remains required on the replacement hosted database.
+
+The delivery contract required one forward-only follow-up migration,
+`1785600000000-AddSprint5DeliveryContract.ts`, because the already-applied
+foundation schema had no `project_submissions.submission_type` column and no
+`escrow_ledger_entries.metadata` column. Do not edit the applied readiness
+migration; apply both migrations in order.
 
 ### Add `freelancer_profiles.github_username`
 
@@ -1390,6 +1397,21 @@ Recovery:
 - Failed evaluation jobs older than 1 hour should be requeued from DB input.
 - Manual retry button calls `POST /api/evaluation-runs/:evaluationRunId/retry`.
 
+Integration seam already implemented by Asaad:
+
+- `DeliveryService` injects the optional
+  `SUBMISSION_EVALUATION_DISPATCHER` token from
+  `src/delivery/submission-evaluation-dispatcher.ts`.
+- Ebrahim's evaluation service implements `queueSubmissionEvaluation` and
+  registers itself against that token when its module is imported by
+  `DeliveryModule`.
+- Until that provider is registered, a submitted row remains `submitted` and
+  records `evaluationDispatch.status = "pending_integration"`. It never claims
+  that mock evaluation succeeded.
+- After the provider queues the database-backed evaluation, the delivery
+  service moves the submission to `under_review` and stores the evaluation-run
+  and agent-job IDs in submission metadata.
+
 ## Frontend Route And Page Contracts
 
 Frontend ownership is split by vertical below. Service names and routes are
@@ -1722,8 +1744,9 @@ Frontend:
 
 Sprint 5 is done when:
 
-- The replacement shared database is reachable and all 21 committed migrations,
-  including `1785500000000-Sprint5Readiness.ts`, are applied.
+- The replacement shared database is reachable and all 22 committed migrations,
+  including `1785500000000-Sprint5Readiness.ts` and
+  `1785600000000-AddSprint5DeliveryContract.ts`, are applied.
 - Admin can create/open a GitHub repository for an implementation-ready project.
 - Freelancers can save GitHub usernames.
 - Admin can sync repo collaborators from assigned task freelancers.
@@ -1749,7 +1772,7 @@ Sprint 5 is done when:
 
 ## Suggested Order Of Work
 
-1. Ebrahim provisions the replacement hosted database, applies/verifies all 21
+1. Ebrahim provisions the replacement hosted database, applies/verifies all 22
    migrations, and publishes only the secret-manager references to the team.
 2. In parallel:
    - Asaad implements submission, review/revision, and release-request backend

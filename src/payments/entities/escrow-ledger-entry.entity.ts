@@ -116,6 +116,9 @@ export class EscrowLedgerEntry {
   @Column({ name: 'posted_at', type: 'timestamptz', nullable: true })
   postedAt!: Date | null;
 
+  @Column({ type: 'jsonb', nullable: true })
+  metadata!: Record<string, unknown> | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 }

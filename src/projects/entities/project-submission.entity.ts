@@ -21,6 +21,7 @@ import { Project } from './project.entity';
 
 @Entity('project_submissions')
 @Index('project_submissions_project_status_idx', ['projectId', 'status'])
+@Index('project_submissions_project_type_idx', ['projectId', 'submissionType'])
 @Index('project_submissions_task_status_idx', ['taskId', 'status'], {
   where: '"task_id" IS NOT NULL',
 })
@@ -100,6 +101,9 @@ export class ProjectSubmission {
 
   @Column({ type: 'int', default: 1 })
   version!: number;
+
+  @Column({ name: 'submission_type', type: 'varchar', length: 40 })
+  submissionType!: string;
 
   @Column({ type: 'varchar', length: 40, default: 'draft' })
   status!: string;

@@ -19,6 +19,7 @@ import { AssignmentsModule } from './assignments/assignments.module';
 import { PlanningModule } from './planning/planning.module';
 import { PaymentsModule } from './payments/payments.module';
 import { RepositoriesModule } from './repositories/repositories.module';
+import { DeliveryModule } from './delivery/delivery.module';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { RepositoriesModule } from './repositories/repositories.module';
     PlanningModule,
     PaymentsModule,
     RepositoriesModule,
+    DeliveryModule,
   ],
   controllers: [AppController],
   providers: [AppService],
