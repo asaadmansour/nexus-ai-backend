@@ -1,4 +1,5 @@
 import type { EvaluateSubmissionDto } from 'src/agents/dto/EvaluateSubmissionDto';
+import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { EvaluationRun } from 'src/projects/entities/evaluation-run.entity';
@@ -177,6 +178,118 @@ describe('EvaluationsService GitHub update coalescing', () => {
   });
 });
 
+describe('EvaluationsService evaluation dispatch recovery', () => {
+  it('repairs an active run whose BullMQ job is missing instead of returning 409', async () => {
+    const run = {
+      id: 'run-id',
+      submissionId: 'submission-id',
+      status: 'queued',
+      agentJobId: 'orphaned-job-id',
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    } as EvaluationRun;
+    const submission = {
+      id: 'submission-id',
+      projectId: 'project-id',
+      taskId: 'task-id',
+    } as ProjectSubmission;
+    const replacement = { id: 'replacement-job-id' } as AgentJob;
+    const lockedRunRepo = {
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(run),
+      }),
+      save: jest.fn((value: EvaluationRun) => Promise.resolve(value)),
+    };
+    const dispatch = jest.fn().mockImplementation(() => {
+      expect(run.agentJobId).toBe(replacement.id);
+      return Promise.resolve(replacement);
+    });
+    const service = Object.create(
+      EvaluationsService.prototype,
+    ) as EvaluationsService;
+    Object.assign(service as unknown as Record<string, unknown>, {
+      runRepo: { findOne: jest.fn().mockResolvedValue(run) },
+      submissionRepo: { findOne: jest.fn().mockResolvedValue(submission) },
+      agentJobRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'orphaned-job-id',
+          queueJobId: 'orphaned-job-id',
+        }),
+        update: jest.fn(),
+      },
+      aiJobsProducer: {
+        getSubmissionEvaluationQueueState: jest
+          .fn()
+          .mockResolvedValue('missing'),
+        prepareSubmissionEvaluationRequested: jest
+          .fn()
+          .mockResolvedValue(replacement),
+        dispatchPreparedSubmissionEvaluation: dispatch,
+      },
+      dataSource: {
+        transaction: jest.fn(
+          (callback: (manager: Record<string, unknown>) => unknown) =>
+            callback({ getRepository: () => lockedRunRepo }),
+        ),
+      },
+      logger: { log: jest.fn(), error: jest.fn() },
+    });
+
+    await expect(
+      service.retryRun(run.id, { reason: 'manual_retry' }, 'admin-id'),
+    ).resolves.toMatchObject({
+      evaluationRunId: run.id,
+      agentJobId: replacement.id,
+      status: 'queued',
+      reused: true,
+      recovered: true,
+    });
+    expect(dispatch).toHaveBeenCalledWith(replacement);
+  });
+
+  it('reuses a healthy active queue job without publishing a duplicate', async () => {
+    const run = {
+      id: 'run-id',
+      submissionId: 'submission-id',
+      status: 'running',
+      agentJobId: 'job-id',
+    } as EvaluationRun;
+    const service = Object.create(
+      EvaluationsService.prototype,
+    ) as EvaluationsService;
+    const prepare = jest.fn();
+    Object.assign(service as unknown as Record<string, unknown>, {
+      runRepo: { findOne: jest.fn().mockResolvedValue(run) },
+      submissionRepo: {
+        findOne: jest.fn().mockResolvedValue({ id: 'submission-id' }),
+      },
+      agentJobRepo: {
+        findOne: jest.fn().mockResolvedValue({ id: 'job-id' }),
+      },
+      aiJobsProducer: {
+        getSubmissionEvaluationQueueState: jest
+          .fn()
+          .mockResolvedValue('active'),
+        prepareSubmissionEvaluationRequested: prepare,
+      },
+      logger: { log: jest.fn() },
+    });
+
+    await expect(
+      service.retryRun(run.id, { reason: 'manual_retry' }, 'admin-id'),
+    ).resolves.toEqual({
+      evaluationRunId: run.id,
+      agentJobId: 'job-id',
+      status: 'running',
+      reused: true,
+    });
+    expect(prepare).not.toHaveBeenCalled();
+  });
+});
+
 describe('EvaluationsService rubric snapshot consistency', () => {
   it('reuses the frozen rubric when a completed submission is evaluated again', async () => {
     const rubricSnapshot = {
@@ -228,6 +341,11 @@ describe('EvaluationsService rubric snapshot consistency', () => {
         Object.assign(createdRun, value),
       ),
       save: jest.fn((value: EvaluationRun) => Promise.resolve(value)),
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(createdRun),
+      }),
     };
     const service = Object.create(
       EvaluationsService.prototype,
@@ -235,10 +353,23 @@ describe('EvaluationsService rubric snapshot consistency', () => {
     Object.assign(service as unknown as Record<string, unknown>, {
       submissionRepo: { findOne: jest.fn().mockResolvedValue(submission) },
       runRepo,
+      agentJobRepo: { findOne: jest.fn(), update: jest.fn() },
+      dataSource: {
+        transaction: jest.fn(
+          (callback: (manager: Record<string, unknown>) => unknown) =>
+            callback({ getRepository: () => runRepo }),
+        ),
+      },
       aiJobsProducer: {
-        emitSubmissionEvaluationRequested: jest
+        prepareSubmissionEvaluationRequested: jest
           .fn()
           .mockResolvedValue({ id: 'agent-job-id' }),
+        dispatchPreparedSubmissionEvaluation: jest
+          .fn()
+          .mockImplementation((job: AgentJob) => {
+            expect(createdRun.agentJobId).toBe(job.id);
+            return Promise.resolve(job);
+          }),
       },
       logger: { log: jest.fn() },
     });

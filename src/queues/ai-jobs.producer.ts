@@ -96,14 +96,17 @@ export class AiJobsProducer {
     }
   }
 
-  async emitSubmissionEvaluationRequested(input: {
-    evaluationRunId: string;
-    submissionId: string;
-    projectId: string;
-    taskId?: string | null;
-  }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
+  async prepareSubmissionEvaluationRequested(
+    input: {
+      evaluationRunId: string;
+      submissionId: string;
+      projectId: string;
+      taskId?: string | null;
+    },
+    repository: Repository<AgentJob> = this.agentJobRepository,
+  ) {
+    return repository.save(
+      repository.create({
         agentName: AI_JOB_TYPES.SUBMISSION_EVALUATION,
         jobType: AI_JOB_TYPES.SUBMISSION_EVALUATION,
         projectId: input.projectId,
@@ -120,30 +123,39 @@ export class AiJobsProducer {
         },
       }),
     );
+  }
+
+  async dispatchPreparedSubmissionEvaluation(
+    agentJob: AgentJob,
+    queueJobId: string = agentJob.id,
+  ) {
+    const data = this.readSubmissionEvaluationData(agentJob);
 
     try {
       await this.getQueue(
         this.submissionEvaluationQueue,
         QUEUES.SUBMISSION_EVALUATION,
-      ).add(
-        JOBS.EVALUATE_SUBMISSION,
-        {
-          agentJobId: agentJob.id,
-          evaluationRunId: input.evaluationRunId,
-          submissionId: input.submissionId,
-          projectId: input.projectId,
-          taskId: input.taskId ?? null,
-        },
-        { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
-      );
+      ).add(JOBS.EVALUATE_SUBMISSION, data, {
+        ...AI_QUEUE_JOB_OPTIONS,
+        jobId: queueJobId,
+      });
 
-      agentJob.queueJobId = agentJob.id;
+      agentJob.queueJobId = queueJobId;
       await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
       throw error;
     }
+  }
+
+  async getSubmissionEvaluationQueueState(agentJob: AgentJob): Promise<string> {
+    const queue = this.getQueue(
+      this.submissionEvaluationQueue,
+      QUEUES.SUBMISSION_EVALUATION,
+    );
+    const queueJob = await queue.getJob(agentJob.queueJobId ?? agentJob.id);
+    return queueJob ? queueJob.getState() : 'missing';
   }
 
   async emitCvUploaded(input: {
@@ -350,6 +362,34 @@ export class AiJobsProducer {
     }
 
     return queue;
+  }
+
+  private readSubmissionEvaluationData(
+    agentJob: AgentJob,
+  ): SubmissionEvaluationJobData {
+    const input = agentJob.input;
+    const evaluationRunId = input?.evaluationRunId;
+    const submissionId = input?.submissionId;
+    const projectId = input?.projectId;
+    const taskId = input?.taskId ?? null;
+    if (
+      agentJob.jobType !== AI_JOB_TYPES.SUBMISSION_EVALUATION ||
+      typeof evaluationRunId !== 'string' ||
+      typeof submissionId !== 'string' ||
+      typeof projectId !== 'string' ||
+      (taskId !== null && typeof taskId !== 'string')
+    ) {
+      throw new Error(
+        `Agent job ${agentJob.id} does not contain a valid submission evaluation payload`,
+      );
+    }
+    return {
+      agentJobId: agentJob.id,
+      evaluationRunId,
+      submissionId,
+      projectId,
+      taskId,
+    };
   }
 
   private async markQueueAddFailed(agentJob: AgentJob, error: unknown) {

@@ -27,9 +27,10 @@ import { SUBMISSION_EVALUATION_DISPATCHER } from 'src/delivery/submission-evalua
 import { ImplementationEvaluationSandboxService } from './implementation-evaluation-sandbox.service';
 import { GithubWebhookService } from './github-webhook.service';
 import { GithubWebhookController } from './github-webhook.controller';
+import { EvaluationRunRecoveryService } from './evaluation-run-recovery.service';
 
 const queueProcessors = areQueuesEnabled()
-  ? [SubmissionEvaluationProcessor]
+  ? [SubmissionEvaluationProcessor, EvaluationRunRecoveryService]
   : [];
 
 @Module({

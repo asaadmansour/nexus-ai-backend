@@ -32,8 +32,12 @@ import {
 
 type RecoverableJobType = (typeof AI_JOB_TYPES)[keyof typeof AI_JOB_TYPES];
 
-const RECOVERABLE_JOB_TYPES = Object.values(
-  AI_JOB_TYPES,
+// Implementation evaluation runs have their own reconciliation because their
+// database run must be active and linked to the replacement job before BullMQ
+// can safely publish it. Requeueing only the failed agent job would cause the
+// worker to cancel it against the already-failed evaluation run.
+const RECOVERABLE_JOB_TYPES = Object.values(AI_JOB_TYPES).filter(
+  (jobType) => jobType !== AI_JOB_TYPES.SUBMISSION_EVALUATION,
 ) as RecoverableJobType[];
 
 @Injectable()

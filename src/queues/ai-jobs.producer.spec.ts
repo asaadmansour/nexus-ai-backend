@@ -6,8 +6,9 @@ import { SubmissionEvaluationJobData } from './queue.types';
 
 describe('AiJobsProducer', () => {
   it('links evaluation jobs to delivery submissions, not planning submissions', async () => {
+    const addJob = jest.fn().mockResolvedValue(undefined);
     const queue = {
-      add: jest.fn().mockResolvedValue(undefined),
+      add: addJob,
     } as unknown as Queue<SubmissionEvaluationJobData>;
     const agentJob = { id: 'agent-job-id' } as AgentJob;
     const createAgentJob = jest.fn((input: Partial<AgentJob>) =>
@@ -27,12 +28,13 @@ describe('AiJobsProducer', () => {
       repository,
     );
 
-    await producer.emitSubmissionEvaluationRequested({
+    const prepared = await producer.prepareSubmissionEvaluationRequested({
       evaluationRunId: 'evaluation-run-id',
       submissionId: 'delivery-submission-id',
       projectId: 'project-id',
       taskId: 'task-id',
     });
+    await producer.dispatchPreparedSubmissionEvaluation(prepared);
 
     expect(createAgentJob).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -42,6 +44,15 @@ describe('AiJobsProducer', () => {
     );
     expect(createAgentJob).not.toHaveBeenCalledWith(
       expect.objectContaining({ submissionId: 'delivery-submission-id' }),
+    );
+    expect(addJob).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        agentJobId: agentJob.id,
+        evaluationRunId: 'evaluation-run-id',
+        submissionId: 'delivery-submission-id',
+      }),
+      expect.objectContaining({ jobId: agentJob.id }),
     );
   });
 });

@@ -6,7 +6,14 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Not, QueryFailedError, Repository } from 'typeorm';
+import {
+  DataSource,
+  In,
+  LessThanOrEqual,
+  Not,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import type { EvaluateSubmissionResult } from 'src/agents/ai.service';
 import type { EvaluateSubmissionDto } from 'src/agents/dto/EvaluateSubmissionDto';
@@ -109,12 +116,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       order: { createdAt: 'DESC' },
     });
     if (existing && ACTIVE_RUN_STATUSES.includes(existing.status)) {
-      return {
-        evaluationRunId: existing.id,
-        agentJobId: existing.agentJobId,
-        status: existing.status,
-        reused: true,
-      };
+      return this.ensureActiveRunDispatch(existing, submission);
     }
 
     // Freeze the task-aware rubric on the first run for this submission. A
@@ -151,12 +153,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       // unique index rejects the duplicate — reuse the winner instead.
       const active = await this.findActiveRun(submissionId);
       if (this.isUniqueViolation(error) && active) {
-        return {
-          evaluationRunId: active.id,
-          agentJobId: active.agentJobId,
-          status: active.status,
-          reused: true,
-        };
+        return this.ensureActiveRunDispatch(active, submission);
       }
       throw error;
     }
@@ -184,7 +181,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       throw new NotFoundException('Submission for this run no longer exists');
     }
     if (ACTIVE_RUN_STATUSES.includes(run.status)) {
-      throw new ConflictException('This evaluation run is already active');
+      return this.ensureActiveRunDispatch(run, submission);
     }
 
     // Another run may already be active for this submission (the partial unique
@@ -209,27 +206,180 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
   }
 
   private async enqueueRun(run: EvaluationRun, submission: ProjectSubmission) {
-    try {
-      const agentJob =
-        await this.aiJobsProducer.emitSubmissionEvaluationRequested({
+    // The run must point at its agent job before BullMQ can expose the job to
+    // a worker. Publishing first lets a fast worker observe agentJobId=null
+    // and incorrectly cancel the only job as superseded.
+    const dispatch = await this.ensureActiveRunDispatch(run, submission);
+    return {
+      evaluationRunId: dispatch.evaluationRunId,
+      agentJobId: dispatch.agentJobId,
+      status: dispatch.status,
+    };
+  }
+
+  async recoverOrphanedRuns() {
+    const cutoff = new Date(Date.now() - 30_000);
+    const runs = await this.runRepo.find({
+      where: {
+        status: In(ACTIVE_RUN_STATUSES),
+        updatedAt: LessThanOrEqual(cutoff),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 50,
+    });
+    let recovered = 0;
+    for (const run of runs) {
+      try {
+        const submission = run.submissionId
+          ? await this.submissionRepo.findOne({
+              where: { id: run.submissionId },
+            })
+          : null;
+        if (!submission) {
+          await this.markEvaluationRunFailedById(
+            run.id,
+            'Submission no longer exists',
+          );
+          continue;
+        }
+        const result = await this.ensureActiveRunDispatch(run, submission);
+        if (result.recovered) recovered += 1;
+      } catch (error) {
+        this.logger.error(
+          `Could not reconcile evaluation run ${run.id}: ${this.getErrorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: runs.length, recovered };
+  }
+
+  private async ensureActiveRunDispatch(
+    run: EvaluationRun,
+    submission: ProjectSubmission,
+  ): Promise<{
+    evaluationRunId: string;
+    agentJobId: string;
+    status: string;
+    reused: boolean;
+    recovered?: boolean;
+  }> {
+    if (!ACTIVE_RUN_STATUSES.includes(run.status)) {
+      throw new ConflictException('This evaluation run is no longer active');
+    }
+
+    const agentJob = run.agentJobId
+      ? await this.agentJobRepo.findOne({ where: { id: run.agentJobId } })
+      : null;
+    if (agentJob) {
+      const queueState =
+        await this.aiJobsProducer.getSubmissionEvaluationQueueState(agentJob);
+      if (
+        [
+          'active',
+          'waiting',
+          'delayed',
+          'prioritized',
+          'waiting-children',
+        ].includes(queueState)
+      ) {
+        return {
           evaluationRunId: run.id,
-          submissionId: submission.id,
-          projectId: submission.projectId,
-          taskId: submission.taskId,
-        });
-      run.agentJobId = agentJob.id;
-      await this.runRepo.save(run);
-      return {
+          agentJobId: agentJob.id,
+          status: run.status,
+          reused: true,
+        };
+      }
+    }
+
+    const replacement =
+      await this.aiJobsProducer.prepareSubmissionEvaluationRequested({
         evaluationRunId: run.id,
-        agentJobId: agentJob.id,
-        status: 'queued',
+        submissionId: submission.id,
+        projectId: submission.projectId,
+        taskId: submission.taskId,
+      });
+    const linked = await this.dataSource.transaction(async (manager) => {
+      const repository = manager.getRepository(EvaluationRun);
+      const current = await repository
+        .createQueryBuilder('evaluationRun')
+        .setLock('pessimistic_write')
+        .where('evaluationRun.id = :runId', { runId: run.id })
+        .getOne();
+      if (
+        !current ||
+        !ACTIVE_RUN_STATUSES.includes(current.status) ||
+        current.agentJobId !== run.agentJobId
+      ) {
+        return null;
+      }
+      current.agentJobId = replacement.id;
+      current.status = 'queued';
+      current.startedAt = null;
+      current.completedAt = null;
+      current.error = null;
+      await repository.save(current);
+      return current;
+    });
+
+    if (!linked) {
+      await this.markJobCancelled(replacement.id, {
+        reason: 'evaluation_dispatch_recovery_lost_race',
+      });
+      const current = await this.runRepo.findOne({ where: { id: run.id } });
+      if (!current || !ACTIVE_RUN_STATUSES.includes(current.status)) {
+        throw new ConflictException('This evaluation run is no longer active');
+      }
+      const currentJob = current.agentJobId
+        ? await this.agentJobRepo.findOne({
+            where: { id: current.agentJobId },
+          })
+        : null;
+      if (!currentJob) {
+        throw new ConflictException(
+          'Evaluation dispatch changed concurrently; retry reconciliation',
+        );
+      }
+      return {
+        evaluationRunId: current.id,
+        agentJobId: currentJob.id,
+        status: current.status,
+        reused: true,
       };
+    }
+
+    if (agentJob) {
+      await this.markJobCancelled(agentJob.id, {
+        reason: 'orphaned_evaluation_dispatch_replaced',
+        replacementAgentJobId: replacement.id,
+      });
+    }
+    try {
+      await this.aiJobsProducer.dispatchPreparedSubmissionEvaluation(
+        replacement,
+      );
     } catch (error) {
-      run.status = 'failed';
-      run.error = this.getErrorMessage(error);
-      await this.runRepo.save(run);
+      await this.runRepo
+        .createQueryBuilder()
+        .update(EvaluationRun)
+        .set({
+          status: 'failed',
+          error: this.getErrorMessage(error),
+          completedAt: new Date(),
+        })
+        .where('id = :runId', { runId: linked.id })
+        .andWhere('agent_job_id = :agentJobId', {
+          agentJobId: replacement.id,
+        })
+        .execute();
       throw error;
     }
+    return {
+      evaluationRunId: linked.id,
+      agentJobId: replacement.id,
+      status: 'queued',
+      reused: true,
+      recovered: true,
+    };
   }
 
   // ---------------------------------------------------------------------------
