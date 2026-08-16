@@ -12,6 +12,8 @@ import {
 import { FreelancerProfile } from '../../freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from '../../projects/entities/project-milestone.entity';
 import { ProjectSubmission } from '../../projects/entities/project-submission.entity';
+import { ProjectPlanningSubmission } from '../../projects/entities/project-planning-submission.entity';
+import { ProjectRoleAssignment } from '../../projects/entities/project-role-assignment.entity';
 import { Project } from '../../projects/entities/project.entity';
 import { User } from '../../users/entities/user.entity';
 import { EscrowLedgerEntry } from './escrow-ledger-entry.entity';
@@ -31,8 +33,7 @@ import { ProjectPayment } from './project-payment.entity';
   'payment_release_requests_milestone_freelancer_status_idx',
   ['milestoneId', 'freelancerProfileId', 'status'],
   {
-    where:
-      '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
+    where: '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
   },
 )
 @Index(
@@ -42,6 +43,15 @@ import { ProjectPayment } from './project-payment.entity';
     unique: true,
     where:
       '"submission_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL AND "status" IN (\'pending\', \'approved\')',
+  },
+)
+@Index(
+  'payment_release_requests_pending_planning_submission_uidx',
+  ['planningSubmissionId', 'freelancerProfileId'],
+  {
+    unique: true,
+    where:
+      '"planning_submission_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL AND "status" IN (\'pending\', \'approved\')',
   },
 )
 export class PaymentReleaseRequest {
@@ -71,6 +81,26 @@ export class PaymentReleaseRequest {
   })
   @JoinColumn({ name: 'submission_id' })
   submission!: ProjectSubmission | null;
+
+  @Column({ name: 'planning_submission_id', type: 'uuid', nullable: true })
+  planningSubmissionId!: string | null;
+
+  @ManyToOne(() => ProjectPlanningSubmission, {
+    nullable: true,
+    onDelete: 'SET NULL',
+  })
+  @JoinColumn({ name: 'planning_submission_id' })
+  planningSubmission!: ProjectPlanningSubmission | null;
+
+  @Column({ name: 'role_assignment_id', type: 'uuid', nullable: true })
+  roleAssignmentId!: string | null;
+
+  @ManyToOne(() => ProjectRoleAssignment, {
+    nullable: true,
+    onDelete: 'SET NULL',
+  })
+  @JoinColumn({ name: 'role_assignment_id' })
+  roleAssignment!: ProjectRoleAssignment | null;
 
   @Column({ name: 'payment_id', type: 'uuid', nullable: true })
   paymentId!: string | null;

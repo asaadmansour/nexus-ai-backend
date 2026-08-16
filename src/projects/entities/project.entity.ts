@@ -139,6 +139,9 @@ export class Project {
   @Column({ name: 'quote_notes', type: 'text', nullable: true })
   quoteNotes: string | null;
 
+  @Column({ name: 'budget_allocation', type: 'jsonb', nullable: true })
+  budgetAllocation: Record<string, unknown> | null;
+
   @OneToMany(() => ProjectRoleAssignment, (assignment) => assignment.project)
   roleAssignments?: ProjectRoleAssignment[];
 

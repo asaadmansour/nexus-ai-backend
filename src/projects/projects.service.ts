@@ -3,13 +3,15 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Project } from './entities/project.entity';
 import { CreateProjectDto } from './dtos/create-project.dto';
 import { UpdateProjectDto } from './dtos/update-project.dto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { ProjectPayment } from 'src/payments/entities/project-payment.entity';
 
 const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_ASSIGNED,
@@ -33,6 +35,8 @@ export class ProjectsService {
   constructor(
     @InjectRepository(Project)
     private readonly projectRepository: Repository<Project>,
+    @InjectRepository(ProjectPayment)
+    private readonly projectPaymentRepository: Repository<ProjectPayment>,
   ) {}
 
   async create(customerId: string, dto: CreateProjectDto) {
@@ -84,6 +88,28 @@ export class ProjectsService {
     dto: UpdateProjectDto,
   ) {
     const project = await this.findOne(id, userId, isAdmin);
+    const pricingChanged =
+      dto.budgetMin !== undefined ||
+      dto.budgetMax !== undefined ||
+      dto.currency !== undefined;
+    if (pricingChanged && Number(project.heldAmount ?? 0) > 0) {
+      throw new ConflictException(
+        'Project budget and currency cannot change after escrow has been funded',
+      );
+    }
+    if (pricingChanged) {
+      const activePayment = await this.projectPaymentRepository.exists({
+        where: {
+          projectId: id,
+          status: In(['requires_payment', 'processing', 'succeeded']),
+        },
+      });
+      if (activePayment) {
+        throw new ConflictException(
+          'Project budget and currency cannot change while an escrow checkout is active or funded',
+        );
+      }
+    }
 
     if (dto.title !== undefined) project.title = dto.title;
     if (dto.description !== undefined) project.description = dto.description;
@@ -99,6 +125,15 @@ export class ProjectsService {
     }
 
     if (dto.currency !== undefined) project.currency = dto.currency;
+    if (pricingChanged) {
+      project.quotedAmount = null;
+      project.quotedCurrency = null;
+      project.quoteStatus = 'not_ready';
+      project.quoteGeneratedAt = null;
+      project.quoteNotes =
+        'The customer changed the budget. Reconfirm the requirements brief to generate a new price and compensation allocation.';
+      project.budgetAllocation = null;
+    }
     if (dto.deadline !== undefined)
       project.deadline = dto.deadline ? new Date(dto.deadline) : null;
     if (dto.isDeadlineFlexible !== undefined)

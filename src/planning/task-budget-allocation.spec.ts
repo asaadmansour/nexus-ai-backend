@@ -1,4 +1,7 @@
-import { allocateTaskBudgets } from './task-budget-allocation';
+import {
+  allocateProjectTaskBudgets,
+  allocateTaskBudgets,
+} from './task-budget-allocation';
 
 describe('allocateTaskBudgets', () => {
   it('allocates by estimated hours and preserves the exact milestone total', () => {
@@ -48,5 +51,52 @@ describe('allocateTaskBudgets', () => {
       amount: '10.00',
       currency: 'EGP',
     });
+  });
+
+  it('allocates the exact implementation pool using effort and complexity', () => {
+    const allocations = allocateProjectTaskBudgets(
+      500,
+      [
+        {
+          key: 'simple',
+          milestoneKey: 'm1',
+          estimatedHours: 10,
+          priority: 'medium',
+          requiredSkills: ['React'],
+        },
+        {
+          key: 'complex',
+          milestoneKey: 'm2',
+          estimatedHours: 10,
+          priority: 'high',
+          requiredSkills: ['NestJS', 'PostgreSQL', 'Security'],
+        },
+      ],
+      'egp',
+    );
+
+    const simple = Number(allocations.get('simple')?.amount);
+    const complex = Number(allocations.get('complex')?.amount);
+    expect(simple + complex).toBe(500);
+    expect(complex).toBeGreaterThan(simple);
+    expect(allocations.get('complex')?.currency).toBe('EGP');
+  });
+
+  it('preserves rounding cents across many tasks', () => {
+    const allocations = allocateProjectTaskBudgets(
+      '0.05',
+      [
+        { key: 'a', milestoneKey: 'm' },
+        { key: 'b', milestoneKey: 'm' },
+        { key: 'c', milestoneKey: 'm' },
+      ],
+      'USD',
+    );
+    expect(
+      [...allocations.values()].reduce(
+        (sum, allocation) => sum + Number(allocation.amount),
+        0,
+      ),
+    ).toBe(0.05);
   });
 });

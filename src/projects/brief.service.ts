@@ -14,6 +14,7 @@ import { Project } from './entities/project.entity';
 import { AiService, type ProjectQuoteResult } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { assessPlanningRequirementProfile } from 'src/planning/planning-evaluation-requirements';
+import { createProjectBudgetAllocation } from 'src/planning/project-budget-allocation';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
@@ -366,6 +367,7 @@ export class BriefService {
       project: this.buildProjectQuoteContext(project),
       brief: this.buildBriefQuoteContext(brief, project),
     });
+    const requirementProfile = assessPlanningRequirementProfile(project, brief);
 
     brief.isComplete = true;
     brief.completedAt = brief.completedAt ?? new Date();
@@ -391,6 +393,19 @@ export class BriefService {
         project.quoteStatus = projectQuote.quoteStatus;
         project.quoteGeneratedAt = new Date();
         project.quoteNotes = this.buildProjectQuoteNotes(projectQuote);
+        project.budgetAllocation = createProjectBudgetAllocation(
+          projectQuote.amount,
+          projectQuote.currency,
+          requirementProfile.complexity,
+          project.quoteGeneratedAt,
+        );
+      } else if (!project.budgetAllocation && project.quotedAmount) {
+        project.budgetAllocation = createProjectBudgetAllocation(
+          project.quotedAmount,
+          project.quotedCurrency ?? project.currency,
+          requirementProfile.complexity,
+          project.quoteGeneratedAt ?? new Date(),
+        );
       }
 
       if (this.shouldMarkBriefComplete(project)) {

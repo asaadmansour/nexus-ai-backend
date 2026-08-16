@@ -87,9 +87,12 @@ export class AiOperationsMonitorService
       this.jobs
         .createQueryBuilder('job')
         .where('job.status = :status', { status: 'running' })
-        .andWhere('COALESCE(job.lockedAt, job.startedAt, job.updatedAt) < :runningBefore', {
-          runningBefore,
-        })
+        .andWhere(
+          'COALESCE(job.lockedAt, job.startedAt, job.updatedAt) < :runningBefore',
+          {
+            runningBefore,
+          },
+        )
         .getCount(),
       this.jobs
         .createQueryBuilder('job')
@@ -121,7 +124,11 @@ export class AiOperationsMonitorService
         return snapshot;
       }
       const signature = `${snapshot.status}:${snapshot.stuckQueued}:${snapshot.stuckRunning}:${snapshot.failedRecent}`;
-      const cooldown = this.number('AI_JOB_ALERT_COOLDOWN_MS', 3_600_000, 60_000);
+      const cooldown = this.number(
+        'AI_JOB_ALERT_COOLDOWN_MS',
+        3_600_000,
+        60_000,
+      );
       if (
         signature === this.lastAlertSignature &&
         Date.now() - this.lastAlertAt < cooldown

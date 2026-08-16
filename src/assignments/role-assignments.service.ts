@@ -24,6 +24,10 @@ import {
   assessPlanningRequirementProfile,
   type PlanningComplexity,
 } from 'src/planning/planning-evaluation-requirements';
+import {
+  planningRoleAllocation,
+  requiredProjectTotalForRate,
+} from 'src/planning/project-budget-allocation';
 import { CreateRoleAssignmentDto } from './dtos/create-role-assignment.dto';
 import { UpdateAssignmentStatusDto } from './dtos/update-assignment-status.dto';
 import { confirmedBriefValue } from './confirmed-brief-value';
@@ -91,6 +95,7 @@ export class RoleAssignmentsService {
     }
 
     const project = await this.getProject(projectId);
+    this.assertProjectFullyFunded(project);
     const brief = await this.briefRepo.findOne({ where: { projectId } });
 
     let candidate: MatchingCandidate | null = null;
@@ -115,6 +120,11 @@ export class RoleAssignmentsService {
         'Only approved freelancers can be assigned',
       );
     }
+    const compensation = this.assertPlanningCompensationCoverage(
+      project,
+      dto.roleKey,
+      profile,
+    );
 
     const assignment = await this.dataSource.transaction(async (manager) => {
       await this.assertNoActiveAssignment(manager, projectId, dto.roleKey);
@@ -137,6 +147,9 @@ export class RoleAssignmentsService {
           sourceCandidateId: candidate?.id ?? null,
           assignedBy: adminUserId,
           hourlyRateSnapshot: profile.hourlyRate ?? null,
+          budgetAmount: compensation.amount,
+          currency: compensation.currency,
+          estimatedHours: compensation.estimatedHours,
           availabilityHoursSnapshot: profile.availabilityHoursPerWeek ?? null,
           scoreSnapshot: candidate
             ? {
@@ -357,8 +370,11 @@ export class RoleAssignmentsService {
         phase: assignment.phase,
         roleKey: assignment.roleKey,
         status: assignment.status,
-        allocatedAmount: null,
-        currency: project?.currency ?? null,
+        allocatedAmount:
+          assignment.budgetAmount == null
+            ? null
+            : Number(assignment.budgetAmount),
+        currency: assignment.currency ?? project?.currency ?? null,
         deadline: project?.deadline ?? null,
         briefSummary: briefs.get(assignment.projectId) ?? null,
         roleBriefSummary: this.assignmentRoleBriefSummary(assignment),
@@ -1093,12 +1109,73 @@ export class RoleAssignmentsService {
       roleBriefGeneratedAt: assignment.roleBriefGeneratedAt,
       roleBriefError: assignment.roleBriefError,
       hourlyRateSnapshot: assignment.hourlyRateSnapshot,
+      allocatedAmount:
+        assignment.budgetAmount == null
+          ? null
+          : Number(assignment.budgetAmount),
+      budgetAmount: assignment.budgetAmount,
+      currency: assignment.currency,
+      estimatedHours: assignment.estimatedHours,
       availabilityHoursSnapshot: assignment.availabilityHoursSnapshot,
       scoreSnapshot: assignment.scoreSnapshot,
       startedAt: assignment.startedAt,
       completedAt: assignment.completedAt,
       declinedAt: assignment.declinedAt,
       endedAt: assignment.endedAt,
+    };
+  }
+
+  private assertProjectFullyFunded(project: Project) {
+    const quote = Number(project.quotedAmount);
+    const held = Number(project.heldAmount);
+    if (!Number.isFinite(quote) || quote <= 0 || !project.budgetAllocation) {
+      throw new ConflictException(
+        'Project compensation is not allocated yet. Confirm the brief and generate a valid quote before assigning planning roles.',
+      );
+    }
+    if (!Number.isFinite(held) || held + 0.005 < quote) {
+      const remaining = Math.max(quote - (Number.isFinite(held) ? held : 0), 0);
+      throw new ConflictException(
+        `Planning assignments require fully funded escrow. Fund the remaining ${remaining.toFixed(2)} ${project.quotedCurrency ?? project.currency} first.`,
+      );
+    }
+  }
+
+  private assertPlanningCompensationCoverage(
+    project: Project,
+    roleKey: string,
+    profile: FreelancerProfile,
+  ) {
+    const allocation = planningRoleAllocation(
+      project.budgetAllocation,
+      roleKey,
+    );
+    if (!allocation) {
+      throw new ConflictException(
+        `No compensation allocation exists for the ${roleKey} role`,
+      );
+    }
+    const hourlyRate = Number(profile.hourlyRate);
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+      throw new ConflictException(
+        'The selected freelancer must set a positive hourly rate before budget coverage can be verified',
+      );
+    }
+    const expectedCost = hourlyRate * allocation.estimatedHours;
+    if (expectedCost > Number(allocation.amount) + 0.005) {
+      const requiredTotal = requiredProjectTotalForRate(
+        hourlyRate,
+        roleKey as 'architect' | 'ui_ux',
+        allocation.estimatedHours,
+      );
+      throw new ConflictException(
+        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the ${allocation.amount} allocation. Increase the project total to at least ${requiredTotal} or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
+      );
+    }
+    return {
+      amount: allocation.amount,
+      currency: project.quotedCurrency ?? project.currency,
+      estimatedHours: allocation.estimatedHours,
     };
   }
 

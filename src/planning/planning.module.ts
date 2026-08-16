@@ -20,6 +20,7 @@ import { areQueuesEnabled } from 'src/queues/queue-runtime';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
 import { MatchingModule } from 'src/matching/matching.module';
 import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
+import { PaymentsModule } from 'src/payments/payments.module';
 
 const queueProcessors = areQueuesEnabled()
   ? [ProjectPlanGenerationProcessor, PlanningSubmissionEvaluationProcessor]
@@ -33,6 +34,7 @@ const queueProcessors = areQueuesEnabled()
     QueuesModule,
     AgentsModule,
     MatchingModule,
+    PaymentsModule,
   ],
   controllers: [
     ProjectPlanningController,

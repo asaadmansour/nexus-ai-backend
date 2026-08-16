@@ -298,9 +298,7 @@ export class PlanningEvaluationSandboxService {
     if (!line) return {};
     try {
       const value: unknown = JSON.parse(
-        Buffer.from(line.slice(AUDIT_MARKER.length), 'base64').toString(
-          'utf8',
-        ),
+        Buffer.from(line.slice(AUDIT_MARKER.length), 'base64').toString('utf8'),
       );
       return this.asRecord(value);
     } catch {
@@ -410,10 +408,7 @@ export class PlanningEvaluationSandboxService {
     return `{${Object.keys(record)
       .filter((key) => record[key] !== undefined)
       .sort()
-      .map(
-        (key) =>
-          `${JSON.stringify(key)}:${this.canonicalJson(record[key])}`,
-      )
+      .map((key) => `${JSON.stringify(key)}:${this.canonicalJson(record[key])}`)
       .join(',')}}`;
   }
 

@@ -40,7 +40,11 @@ import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
 import { UpdateTaskDto } from './dtos/update-task.dto';
 import { assessPlanningRequirementProfile } from './planning-evaluation-requirements';
-import { allocateTaskBudgets } from './task-budget-allocation';
+import {
+  createProjectBudgetAllocation,
+  implementationBudgetAmount,
+} from './project-budget-allocation';
+import { allocateProjectTaskBudgets } from './task-budget-allocation';
 
 interface Requester {
   userId: string;
@@ -161,16 +165,20 @@ export class ProjectPlansService {
       planningTeam,
       notes: dto.notes,
     });
-    const generatedTaskAllocations = allocateTaskBudgets(
+    const generatedTaskAllocations = this.allocateImplementationTasks(
+      project,
       generated.milestones,
       generated.tasks,
-      project.quotedCurrency ?? project.currency,
     );
     const generatedTasks: ProjectPlanTask[] = generated.tasks.map((task) => ({
       ...task,
       budgetAmount: generatedTaskAllocations.get(task.key)?.amount ?? null,
       currency: generatedTaskAllocations.get(task.key)?.currency ?? null,
     }));
+    const generatedMilestones = this.applyMilestoneAllocations(
+      generated.milestones,
+      generatedTasks,
+    );
 
     const plan = await this.dataSource.transaction(async (manager) => {
       await manager
@@ -202,7 +210,7 @@ export class ProjectPlansService {
           summary: generated.summary,
           assumptions: this.toJson(generated.assumptions),
           timeline: generated.timeline,
-          milestones: this.toJson(generated.milestones),
+          milestones: this.toJson(generatedMilestones),
           tasks: this.toJson(generatedTasks),
           dependencies: this.toJson(
             generated.dependencies.length
@@ -223,7 +231,7 @@ export class ProjectPlansService {
       status: plan.status,
       isCurrent: plan.isCurrent,
       summary: plan.summary,
-      milestoneCount: generated.milestones.length,
+      milestoneCount: generatedMilestones.length,
       taskCount: generatedTasks.length,
       createdAt: plan.createdAt,
     };
@@ -420,10 +428,10 @@ export class ProjectPlansService {
     const milestones = (plan.milestones ??
       []) as unknown as ProjectPlanMilestone[];
     const tasks = (plan.tasks ?? []) as unknown as ProjectPlanTask[];
-    const taskAllocations = allocateTaskBudgets(
+    const taskAllocations = this.allocateImplementationTasks(
+      project,
       milestones,
       tasks,
-      project.quotedCurrency ?? project.currency,
     );
     const tasksWithAllocations = tasks.map((task) => ({
       ...task,
@@ -443,12 +451,16 @@ export class ProjectPlansService {
       summary: plan.summary,
       assumptions: plan.assumptions,
       timeline: plan.timeline,
-      milestones: plan.milestones,
+      milestones: this.applyMilestoneAllocations(
+        milestones,
+        tasksWithAllocations,
+      ),
       tasks: tasksWithAllocations,
       dependencies: plan.dependencies,
       projectSpec: plan.projectSpec,
       teamPlan: plan.teamPlan,
       riskRegister: plan.riskRegister,
+      budgetAllocation: project.budgetAllocation,
       adminNotes:
         requester.role === UserRole.ADMIN ? plan.adminNotes : undefined,
       approvedBy: plan.approvedBy,
@@ -538,10 +550,10 @@ export class ProjectPlansService {
             'A plan cannot be approved without implementation tasks',
           );
         }
-        const allocations = allocateTaskBudgets(
+        const allocations = this.allocateImplementationTasks(
+          project,
           milestones,
           tasks,
-          project.quotedCurrency ?? project.currency,
         );
         const unallocatedTask = tasks.find((task) => {
           const allocation = allocations.get(task.key);
@@ -556,6 +568,12 @@ export class ProjectPlansService {
             `Plan approval requires positive compensation for every task. Missing allocation for: ${unallocatedTask.title}`,
           );
         }
+        await this.assertImplementationBudgetFeasible(
+          manager,
+          project,
+          tasks,
+          allocations,
+        );
       }
 
       lockedPlan.status = dto.status;
@@ -621,10 +639,19 @@ export class ProjectPlansService {
           .where('project.id = :projectId', { projectId: plan.projectId })
           .getOne();
         if (!project) throw new NotFoundException('Project not found');
-        const taskBudgetAllocations = allocateTaskBudgets(
+        const taskBudgetAllocations = this.allocateImplementationTasks(
+          project,
           milestones,
           tasks,
-          project.quotedCurrency ?? project.currency,
+        );
+        const budgetedTasks = tasks.map((task) => ({
+          ...task,
+          budgetAmount: taskBudgetAllocations.get(task.key)?.amount ?? null,
+          currency: taskBudgetAllocations.get(task.key)?.currency ?? null,
+        }));
+        const budgetedMilestones = this.applyMilestoneAllocations(
+          milestones,
+          budgetedTasks,
         );
 
         const lockedPlan = await manager
@@ -703,7 +730,7 @@ export class ProjectPlansService {
         const milestoneIdByKey = new Map<string, string>();
         let quotedAmount = 0;
         let quotedCurrency: string | null = null;
-        for (const milestone of milestones) {
+        for (const milestone of budgetedMilestones) {
           const milestoneBudgetAmount =
             milestone.budgetAmount != null
               ? Number(milestone.budgetAmount)
@@ -832,6 +859,12 @@ export class ProjectPlansService {
           project.quoteStatus = quote.status;
           project.quoteGeneratedAt = quote.generatedAt;
           project.quoteNotes = quote.notes;
+          if (quote.amount && quote.currency) {
+            project.budgetAllocation = createProjectBudgetAllocation(
+              quote.amount,
+              quote.currency,
+            );
+          }
         }
         project.status = ProjectStatus.IMPLEMENTATION_READY;
         project.planningStatus = 'completed';
@@ -1196,6 +1229,122 @@ export class ProjectPlansService {
     const value = new Date(planCreatedAt);
     value.setUTCDate(value.getUTCDate() + Math.max(0, Math.floor(day)));
     return value;
+  }
+
+  private allocateImplementationTasks(
+    project: Project,
+    milestones: ProjectPlanMilestone[],
+    tasks: ProjectPlanTask[],
+  ) {
+    const milestoneKeys = new Set(milestones.map((milestone) => milestone.key));
+    const taskKeys = new Set(tasks.map((task) => task.key));
+    if (milestoneKeys.size !== milestones.length) {
+      throw new BadRequestException('Plan milestone keys must be unique');
+    }
+    if (taskKeys.size !== tasks.length) {
+      throw new BadRequestException('Plan task keys must be unique');
+    }
+    const orphanTask = tasks.find(
+      (task) => !milestoneKeys.has(task.milestoneKey),
+    );
+    if (orphanTask) {
+      throw new BadRequestException(
+        `Task "${orphanTask.title}" references an unknown milestone`,
+      );
+    }
+    const allocatedPool = implementationBudgetAmount(project.budgetAllocation);
+    const quotedAmount = Number(project.quotedAmount);
+    const generatedMilestoneTotal = milestones.reduce((sum, milestone) => {
+      const amount = Number(milestone.budgetAmount);
+      return Number.isFinite(amount) && amount > 0 ? sum + amount : sum;
+    }, 0);
+    const implementationPool =
+      allocatedPool && allocatedPool > 0
+        ? allocatedPool
+        : Number.isFinite(quotedAmount) && quotedAmount > 0
+          ? quotedAmount * 0.5
+          : generatedMilestoneTotal;
+
+    return allocateProjectTaskBudgets(
+      implementationPool,
+      tasks,
+      project.quotedCurrency ?? project.currency,
+    );
+  }
+
+  private applyMilestoneAllocations(
+    milestones: ProjectPlanMilestone[],
+    tasks: ProjectPlanTask[],
+  ): ProjectPlanMilestone[] {
+    const totals = new Map<
+      string,
+      { cents: number; currency: string | null }
+    >();
+    for (const task of tasks) {
+      const amount = Number(task.budgetAmount);
+      if (!Number.isFinite(amount) || amount < 0) continue;
+      const current = totals.get(task.milestoneKey) ?? {
+        cents: 0,
+        currency: task.currency?.trim().toUpperCase() ?? null,
+      };
+      current.cents += Math.round(amount * 100);
+      current.currency =
+        current.currency ?? task.currency?.trim().toUpperCase() ?? null;
+      totals.set(task.milestoneKey, current);
+    }
+    return milestones.map((milestone) => {
+      const total = totals.get(milestone.key);
+      return {
+        ...milestone,
+        budgetAmount: total ? total.cents / 100 : null,
+        currency: total?.currency ?? milestone.currency ?? null,
+      };
+    });
+  }
+
+  private async assertImplementationBudgetFeasible(
+    manager: EntityManager,
+    project: Project,
+    tasks: ProjectPlanTask[],
+    allocations: Map<
+      string,
+      { amount: string | null; currency: string | null }
+    >,
+  ) {
+    const profiles = await manager.find(FreelancerProfile, {
+      where: { verificationStatus: 'approved', isAvailable: true },
+      select: { id: true, hourlyRate: true },
+    });
+    const rates = profiles
+      .map((profile) => Number(profile.hourlyRate))
+      .filter((rate) => Number.isFinite(rate) && rate > 0)
+      .sort((left, right) => left - right);
+    if (!rates.length) {
+      throw new ConflictException(
+        'No approved available developer has a usable hourly rate. Add an eligible freelancer before approving this plan.',
+      );
+    }
+
+    for (const task of tasks) {
+      const allocation = allocations.get(task.key);
+      const amount = Number(allocation?.amount);
+      const hours = Number(task.estimatedHours);
+      if (!Number.isFinite(amount) || amount <= 0 || !hours || hours <= 0) {
+        throw new BadRequestException(
+          `Task "${task.title}" needs positive compensation and estimated hours before plan approval.`,
+        );
+      }
+      const maxRate = Math.floor((amount / hours) * 100) / 100;
+      if (rates.some((rate) => rate <= maxRate)) continue;
+
+      const currentTotal = Number(project.quotedAmount) || amount * 2;
+      const expectedCost = rates[0] * hours;
+      const requiredTotal =
+        Math.ceil(((expectedCost * currentTotal) / amount) * 100) / 100;
+      throw new ConflictException(
+        `Task "${task.title}" is allocated ${amount.toFixed(2)} ${allocation?.currency ?? project.currency} (${maxRate.toFixed(2)}/hour), below every available developer rate. Increase the project total to about ${requiredTotal.toFixed(2)} (an increase of ${Math.max(requiredTotal - currentTotal, 0).toFixed(2)}) before approving the plan.`,
+      );
+    }
   }
 
   private async resolveApprovedSubmission(

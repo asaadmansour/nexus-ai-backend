@@ -6,6 +6,8 @@ import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity
 import { Project } from 'src/projects/entities/project.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
@@ -31,6 +33,8 @@ describe('PaymentsService', () => {
   let submissionsRepository: ReturnType<typeof repositoryMock>;
   let releaseRequestsRepository: ReturnType<typeof repositoryMock>;
   let ledgerRepository: ReturnType<typeof repositoryMock>;
+  let roleAssignmentsRepository: ReturnType<typeof repositoryMock>;
+  let planningSubmissionsRepository: ReturnType<typeof repositoryMock>;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -67,6 +71,14 @@ describe('PaymentsService', () => {
           useFactory: repositoryMock,
         },
         {
+          provide: getRepositoryToken(ProjectRoleAssignment),
+          useFactory: repositoryMock,
+        },
+        {
+          provide: getRepositoryToken(ProjectPlanningSubmission),
+          useFactory: repositoryMock,
+        },
+        {
           provide: getRepositoryToken(StripeWebhookEvent),
           useFactory: repositoryMock,
         },
@@ -86,6 +98,12 @@ describe('PaymentsService', () => {
       getRepositoryToken(PaymentReleaseRequest),
     );
     ledgerRepository = module.get(getRepositoryToken(EscrowLedgerEntry));
+    roleAssignmentsRepository = module.get(
+      getRepositoryToken(ProjectRoleAssignment),
+    );
+    planningSubmissionsRepository = module.get(
+      getRepositoryToken(ProjectPlanningSubmission),
+    );
   });
 
   it('should be defined', () => {
@@ -108,6 +126,8 @@ describe('PaymentsService', () => {
       { id: 'task-open', budgetAmount: '33.33', currency: 'EGP' },
     ]);
     submissionsRepository.find.mockResolvedValue([{ taskId: 'task-approved' }]);
+    roleAssignmentsRepository.find.mockResolvedValue([]);
+    planningSubmissionsRepository.find.mockResolvedValue([]);
     releaseRequestsRepository.find.mockResolvedValue([
       { amount: '66.67', currency: 'EGP' },
     ]);

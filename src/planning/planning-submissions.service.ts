@@ -19,6 +19,7 @@ import { CreatePlanningSubmissionDto } from './dtos/create-planning-submission.d
 import { ReviewPlanningSubmissionDto } from './dtos/review-planning-submission.dto';
 import { ProjectPlansService } from './project-plans.service';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
+import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requests.service';
 
 interface Requester {
   userId: string;
@@ -86,6 +87,7 @@ export class PlanningSubmissionsService {
     private readonly notificationsService: NotificationsService,
     private readonly projectPlansService: ProjectPlansService,
     private readonly planningEvaluationsService: PlanningEvaluationsService,
+    private readonly paymentReleaseRequestsService: PaymentReleaseRequestsService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -386,7 +388,15 @@ export class PlanningSubmissionsService {
       await manager.save(ProjectPlanningSubmission, submission);
 
       let planUnlocked = false;
+      let paymentReleaseRequestId: string | null = null;
       if (dto.status === 'approved') {
+        const paymentReleaseRequest =
+          await this.paymentReleaseRequestsService.createForApprovedPlanningSubmission(
+            submission,
+            { sub: adminUserId, role: UserRole.ADMIN },
+            manager,
+          );
+        paymentReleaseRequestId = paymentReleaseRequest.id;
         planUnlocked = await this.maybeUnlockPlanGeneration(
           manager,
           submission.projectId,
@@ -398,6 +408,7 @@ export class PlanningSubmissionsService {
         submission,
         notifyUserId: submission.freelancerProfile?.userId ?? null,
         planUnlocked,
+        paymentReleaseRequestId,
       };
     });
 
@@ -408,6 +419,11 @@ export class PlanningSubmissionsService {
         title: 'Planning submission reviewed',
         body: `Your ${result.submission.submissionType} submission was ${dto.status.replace('_', ' ')}.`,
       });
+    }
+    if (result.paymentReleaseRequestId) {
+      await this.paymentReleaseRequestsService.notifyPlanningReleaseRequested(
+        result.paymentReleaseRequestId,
+      );
     }
 
     const planGenerationJob = result.planUnlocked
@@ -437,6 +453,7 @@ export class PlanningSubmissionsService {
       planGenerationUnlocked: result.planUnlocked,
       planGenerationJob,
       uiuxEvaluationJob,
+      paymentReleaseRequestId: result.paymentReleaseRequestId,
     };
   }
 

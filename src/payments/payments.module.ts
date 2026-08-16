@@ -16,6 +16,8 @@ import { MatchingModule } from 'src/matching/matching.module';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { NotificationsModule } from 'src/notifications/notifications.module';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { PaymentReleaseRequestsService } from './payment-release-requests.service';
 import {
   AdminPaymentReleaseRequestsController,
@@ -38,6 +40,8 @@ import {
       ProjectMilestone,
       ProjectTask,
       ProjectSubmission,
+      ProjectRoleAssignment,
+      ProjectPlanningSubmission,
     ]),
   ],
   exports: [TypeOrmModule, PaymentReleaseRequestsService],

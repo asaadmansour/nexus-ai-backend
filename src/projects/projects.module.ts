@@ -23,6 +23,7 @@ import { ProjectStatusHistory } from './entities/project-status-history.entity';
 import { BriefController } from './brief.controller';
 import { BriefService } from './brief.service';
 import { AgentsModule } from 'src/agents/agents.module';
+import { ProjectPayment } from 'src/payments/entities/project-payment.entity';
 @Module({
   imports: [
     AgentsModule,
@@ -45,6 +46,7 @@ import { AgentsModule } from 'src/agents/agents.module';
       EvaluationRun,
       ProjectRepository,
       RepositoryCollaborator,
+      ProjectPayment,
     ]),
   ],
   controllers: [ProjectsController, BriefController],

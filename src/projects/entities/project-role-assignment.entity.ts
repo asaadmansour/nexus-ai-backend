@@ -95,6 +95,21 @@ export class ProjectRoleAssignment {
   })
   hourlyRateSnapshot!: string | null;
 
+  @Column({
+    name: 'budget_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+  })
+  budgetAmount!: string | null;
+
+  @Column({ type: 'char', length: 3, nullable: true })
+  currency!: string | null;
+
+  @Column({ name: 'estimated_hours', type: 'int', nullable: true })
+  estimatedHours!: number | null;
+
   @Column({ name: 'availability_hours_snapshot', type: 'int', nullable: true })
   availabilityHoursSnapshot!: number | null;
 

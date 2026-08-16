@@ -25,6 +25,10 @@ import { Project } from 'src/projects/entities/project.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import {
+  planningRoleAllocation,
+  requiredProjectTotalForRate,
+} from 'src/planning/project-budget-allocation';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from './entities/matching-candidate.entity';
 import { MatchingRun } from './entities/matching-run.entity';
@@ -40,13 +44,7 @@ import { ReviewRunDto } from './dtos/review-run.dto';
 const PLANNING_ROLES = ['architect', 'ui_ux'];
 const DEFAULT_LIMIT = 10;
 
-// Budget-aware rate cap for planning matching. The project budget is a total
-// lump sum, so we convert it into an affordable hourly rate: planning takes a
-// share of the budget, split across the planning roles, over a rough per-role
-// effort. These are tunable product assumptions.
-const PLANNING_BUDGET_SHARE = 0.2; // planning ≈ 20% of the total project budget
-const PLANNING_HOURS_PER_ROLE = 40; // a planning deliverable ≈ one focused week
-const MIN_AFFORDABLE_POOL = 3; // below this, relax the cap so the pool isn't empty
+const MIN_AFFORDABLE_POOL = 3;
 
 // Sensible default required-skills per planning role, used when the admin does
 // not pass explicit `filters.skills`. Lets the architect and ui_ux runs rank
@@ -84,11 +82,6 @@ const MATCH_START_ALLOWED_STATUSES = new Set<ProjectStatus>([
 const ASSIGNMENT_ACTIVE_STATUSES = ['assigned', 'accepted', 'in_progress'];
 
 // --- Implementation-task matching -------------------------------------------
-
-// Implementation work takes the rest of the budget after planning. As with
-// planning, the lump sum is turned into an affordable hourly rate, here using
-// the total estimated hours of the project's implementation tasks.
-const IMPLEMENTATION_BUDGET_SHARE = 0.7;
 
 // A task can only be matched from these statuses (per the delivery contract).
 const MATCHABLE_TASK_STATUSES = ['todo', 'blocked', 'changes_requested'];
@@ -199,6 +192,7 @@ export class MatchingService {
         'Planning matching can only start after the brief is complete',
       );
     }
+    this.assertProjectFullyFunded(project);
 
     const roles = dto.roles?.length
       ? Array.from(new Set(dto.roles))
@@ -394,6 +388,7 @@ export class MatchingService {
         'Implementation matching can only start once the project plan is materialized',
       );
     }
+    this.assertProjectFullyFunded(project);
 
     await this.recoverStaleImplementationRuns(projectId);
     const tasks = await this.resolveMatchableTasks(projectId, dto);
@@ -406,12 +401,15 @@ export class MatchingService {
     const brief = await this.briefRepo.findOne({ where: { projectId } });
     const briefSnapshot = this.buildBriefSnapshot(brief);
     const limit = dto.filters?.limit ?? DEFAULT_LIMIT;
-    const maxRate =
-      dto.filters?.maxHourlyRate ?? (await this.affordableTaskRate(project));
+    const explicitMaxRate = dto.filters?.maxHourlyRate ?? null;
 
     const runs = await this.dataSource.transaction(async (manager) => {
       const created: MatchingRun[] = [];
       for (const task of tasks) {
+        const taskMaxRate = this.effectiveRateCap(
+          explicitMaxRate,
+          this.affordableTaskRate(task),
+        );
         created.push(
           await manager.save(
             MatchingRun,
@@ -425,7 +423,7 @@ export class MatchingService {
               filters: dto.filters ? { ...dto.filters } : null,
               inputSnapshot: {
                 taskTitle: task.title,
-                maxHourlyRate: maxRate,
+                maxHourlyRate: taskMaxRate,
                 filters: dto.filters ?? null,
               },
               startedAt: new Date(),
@@ -447,7 +445,7 @@ export class MatchingService {
         project,
         briefSnapshot,
         limit,
-        maxRate,
+        maxRate: explicitMaxRate,
         filters: dto.filters,
         tasks,
         runs,
@@ -513,7 +511,7 @@ export class MatchingService {
         const candidates = await this.buildTaskCandidatePool(
           task,
           input.filters,
-          input.maxRate,
+          this.effectiveRateCap(input.maxRate, this.affordableTaskRate(task)),
         );
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
@@ -631,6 +629,12 @@ export class MatchingService {
           'This freelancer is not currently available for assignment',
         );
       }
+
+      const project = await manager.findOne(Project, {
+        where: { id: task.projectId },
+      });
+      if (!project) throw new NotFoundException('Project not found');
+      this.assertTaskCompensationCoverage(task, profile, project);
 
       let sourceRun: MatchingRun | null = candidate?.matchingRun ?? null;
       if (!candidate && dto.sourceMatchingRunId) {
@@ -1078,6 +1082,16 @@ export class MatchingService {
       );
     }
 
+    const project = await manager.findOne(Project, {
+      where: { id: run.projectId },
+    });
+    if (!project) throw new NotFoundException('Project not found');
+    const compensation = this.assertPlanningCompensationCoverage(
+      project,
+      roleKey,
+      profile,
+    );
+
     const existing = await manager.findOne(ProjectRoleAssignment, {
       where: {
         projectId: run.projectId,
@@ -1103,6 +1117,9 @@ export class MatchingService {
         sourceCandidateId: candidate.id,
         assignedBy: adminUserId,
         hourlyRateSnapshot: profile?.hourlyRate ?? null,
+        budgetAmount: compensation.amount,
+        currency: compensation.currency,
+        estimatedHours: compensation.estimatedHours,
         availabilityHoursSnapshot: profile?.availabilityHoursPerWeek ?? null,
         scoreSnapshot: {
           matchingCandidateId: candidate.id,
@@ -1183,15 +1200,102 @@ export class MatchingService {
     }
   }
 
-  // Max hourly rate the budget can afford for a planning role. Returns null if
-  // the project has no usable budget (then no budget cap is applied).
   private affordablePlanningRate(project: Project): number | null {
-    const budgetMax =
-      project.budgetMax != null ? Number(project.budgetMax) : null;
-    if (!budgetMax || budgetMax <= 0) return null;
-    const perRoleBudget =
-      (budgetMax * PLANNING_BUDGET_SHARE) / PLANNING_ROLES.length;
-    return Math.round(perRoleBudget / PLANNING_HOURS_PER_ROLE);
+    const role = planningRoleAllocation(project.budgetAllocation, 'architect');
+    const rate = Number(role?.maxHourlyRate);
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  }
+
+  private assertProjectFullyFunded(project: Project) {
+    const quote = Number(project.quotedAmount);
+    const held = Number(project.heldAmount);
+    if (!Number.isFinite(quote) || quote <= 0 || !project.budgetAllocation) {
+      throw new ConflictException(
+        'Project compensation is not allocated yet. Confirm the brief and generate a valid quote before matching.',
+      );
+    }
+    if (!Number.isFinite(held) || held + 0.005 < quote) {
+      const remaining = Math.max(quote - (Number.isFinite(held) ? held : 0), 0);
+      throw new ConflictException(
+        `Matching requires fully funded escrow. Fund the remaining ${remaining.toFixed(2)} ${project.quotedCurrency ?? project.currency} before assigning freelancers.`,
+      );
+    }
+  }
+
+  private assertPlanningCompensationCoverage(
+    project: Project,
+    roleKey: string,
+    profile: FreelancerProfile,
+  ) {
+    const allocation = planningRoleAllocation(
+      project.budgetAllocation,
+      roleKey,
+    );
+    if (!allocation) {
+      throw new ConflictException(
+        `No compensation allocation exists for the ${roleKey} role`,
+      );
+    }
+    const hourlyRate = Number(profile.hourlyRate);
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+      throw new ConflictException(
+        'The selected freelancer must set a positive hourly rate before the system can verify budget coverage',
+      );
+    }
+    const amount = Number(allocation.amount);
+    const expectedCost = hourlyRate * allocation.estimatedHours;
+    if (expectedCost > amount + 0.005) {
+      const role = roleKey as 'architect' | 'ui_ux';
+      const requiredTotal = requiredProjectTotalForRate(
+        hourlyRate,
+        role,
+        allocation.estimatedHours,
+      );
+      const currentTotal = Number(project.quotedAmount) || 0;
+      throw new ConflictException(
+        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the role allocation of ${allocation.amount}. Increase the project total to at least ${requiredTotal} (an increase of ${(Number(requiredTotal) - currentTotal).toFixed(2)}) or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
+      );
+    }
+    return {
+      amount: allocation.amount,
+      currency: project.quotedCurrency ?? project.currency,
+      estimatedHours: allocation.estimatedHours,
+    };
+  }
+
+  private assertTaskCompensationCoverage(
+    task: ProjectTask,
+    profile: FreelancerProfile,
+    project: Project,
+  ) {
+    const amount = Number(task.budgetAmount);
+    const hours = Number(task.estimatedHours);
+    if (
+      !task.currency ||
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      !Number.isFinite(hours) ||
+      hours <= 0
+    ) {
+      throw new ConflictException(
+        'Task compensation and estimated hours must be allocated before assignment',
+      );
+    }
+    const hourlyRate = Number(profile.hourlyRate);
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+      throw new ConflictException(
+        'The selected freelancer must set a positive hourly rate before the system can verify task budget coverage',
+      );
+    }
+    const expectedCost = hourlyRate * hours;
+    if (expectedCost <= amount + 0.005) return;
+
+    const currentTotal = Number(project.quotedAmount) || amount * 2;
+    const requiredTotal =
+      Math.ceil(((expectedCost * currentTotal) / amount) * 100) / 100;
+    throw new ConflictException(
+      `The selected freelancer is expected to cost ${expectedCost.toFixed(2)} ${task.currency}, above this task's ${amount.toFixed(2)} allocation. Increase the project total to about ${requiredTotal.toFixed(2)} ${task.currency} (an increase of ${(requiredTotal - currentTotal).toFixed(2)}) or choose a freelancer within ${this.affordableTaskRate(task)?.toFixed(2)}/hour.`,
+    );
   }
 
   // Approved, available freelancers, narrowed by the admin's explicit filters.
@@ -1232,29 +1336,23 @@ export class MatchingService {
 
     // Budget-aware rate cap: only match freelancers the budget can afford. An
     // explicit admin maxHourlyRate wins; otherwise derive one from the budget.
-    const maxRate =
-      filters?.maxHourlyRate ?? this.affordablePlanningRate(project);
+    const maxRate = this.effectiveRateCap(
+      filters?.maxHourlyRate ?? null,
+      this.affordablePlanningRate(project),
+    );
     const cappedQb = qb.clone();
     if (maxRate != null) {
-      cappedQb.andWhere('(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)', {
-        maxRate,
-      });
+      cappedQb.andWhere('p.hourlyRate IS NOT NULL');
+      cappedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
     }
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
-    let profiles = await cappedQb.take(poolCap).getMany();
+    const profiles = await cappedQb.take(poolCap).getMany();
 
-    // If the budget cap left too few options, relax it — never return an empty
-    // pool just because rates are high; the admin still needs candidates.
-    if (
-      maxRate != null &&
-      filters?.maxHourlyRate == null &&
-      profiles.length < MIN_AFFORDABLE_POOL
-    ) {
-      this.logger.warn(
-        `Budget rate cap (${maxRate}) matched only ${profiles.length} freelancers for project ${project.id}; relaxing.`,
+    if (!profiles.length && maxRate != null) {
+      throw new ConflictException(
+        `No planning freelancer fits the allocated maximum rate of ${maxRate.toFixed(2)} ${project.quotedCurrency ?? project.currency}/hour. Increase the project budget or add an affordable approved freelancer before matching.`,
       );
-      profiles = await qb.take(poolCap).getMany();
     }
 
     // Dense retrieval signal: cosine of the brief embedding vs. each freelancer
@@ -1283,12 +1381,8 @@ export class MatchingService {
 
     const narrowedQb = qb.clone();
     if (maxRate != null) {
-      narrowedQb.andWhere(
-        '(p.hourlyRate IS NULL OR p.hourlyRate <= :maxRate)',
-        {
-          maxRate,
-        },
-      );
+      narrowedQb.andWhere('p.hourlyRate IS NOT NULL');
+      narrowedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
     }
     if (skills.length) {
       narrowedQb.andWhere(
@@ -1300,13 +1394,23 @@ export class MatchingService {
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
     let profiles = await narrowedQb.take(poolCap).getMany();
 
-    // Never hand the admin an empty pool: if the skill/rate prefilter was too
-    // strict, fall back to the unnarrowed pool and let the reranker sort it out.
+    // Relax skill matching when necessary, but never discard the compensation
+    // ceiling: an unaffordable recommendation cannot become an assignment.
     if (profiles.length < MIN_AFFORDABLE_POOL) {
       this.logger.warn(
         `Task ${task.id} prefilter matched only ${profiles.length} freelancers; relaxing.`,
       );
-      profiles = await qb.take(poolCap).getMany();
+      const affordableQb = qb.clone();
+      if (maxRate != null) {
+        affordableQb.andWhere('p.hourlyRate IS NOT NULL');
+        affordableQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
+      }
+      profiles = await affordableQb.take(poolCap).getMany();
+    }
+    if (!profiles.length && maxRate != null) {
+      throw new ConflictException(
+        `No approved freelancer fits task "${task.title}" at the allocated maximum rate of ${maxRate.toFixed(2)} ${task.currency ?? 'project currency'}/hour. Increase the project budget or add an affordable freelancer.`,
+      );
     }
 
     const profileIds = profiles.map((profile) => profile.id);
@@ -1457,22 +1561,22 @@ export class MatchingService {
     }
   }
 
-  // Max hourly rate the implementation budget affords, spread across the total
-  // estimated hours of the project's tasks. Null when either is unknown.
-  private async affordableTaskRate(project: Project): Promise<number | null> {
-    const budgetMax =
-      project.budgetMax != null ? Number(project.budgetMax) : null;
-    if (!budgetMax || budgetMax <= 0) return null;
+  private affordableTaskRate(task: ProjectTask): number | null {
+    const amount = Number(task.budgetAmount);
+    const hours = Number(task.estimatedHours);
+    if (!Number.isFinite(amount) || amount <= 0 || !hours || hours <= 0) {
+      return null;
+    }
+    return Math.floor((amount / hours) * 100) / 100;
+  }
 
-    const row = await this.taskRepo
-      .createQueryBuilder('t')
-      .select('COALESCE(SUM(t.estimated_hours), 0)', 'hours')
-      .where('t.project_id = :projectId', { projectId: project.id })
-      .getRawOne<{ hours: string }>();
-
-    const hours = Number(row?.hours ?? 0);
-    if (!hours) return null;
-    return Math.round((budgetMax * IMPLEMENTATION_BUDGET_SHARE) / hours);
+  private effectiveRateCap(
+    requested: number | null | undefined,
+    allocated: number | null | undefined,
+  ) {
+    if (requested == null) return allocated ?? null;
+    if (allocated == null) return requested;
+    return Math.min(requested, allocated);
   }
 
   private briefText(brief: Brief | null) {

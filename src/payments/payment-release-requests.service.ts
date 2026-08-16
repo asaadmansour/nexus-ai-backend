@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
@@ -16,6 +16,8 @@ import { NotificationsService } from 'src/notifications/notifications.service';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { CreatePaymentReleaseRequestDto } from './dtos/create-payment-release-request.dto';
@@ -232,6 +234,119 @@ export class PaymentReleaseRequestsService {
     );
   }
 
+  async createForApprovedPlanningSubmission(
+    submission: ProjectPlanningSubmission,
+    requester: JwtPayload,
+    transactionManager?: EntityManager,
+  ) {
+    const operation = async (manager: EntityManager) => {
+      if (submission.status !== 'approved') {
+        throw new ConflictException(
+          'Planning payment release requires an approved submission',
+        );
+      }
+      if (!submission.assignmentId || !submission.freelancerProfileId) {
+        throw new ConflictException(
+          'Approved planning submission has no responsible assignment',
+        );
+      }
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId: submission.projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      const assignment = await manager.findOne(ProjectRoleAssignment, {
+        where: {
+          id: submission.assignmentId,
+          projectId: submission.projectId,
+        },
+      });
+      if (
+        !assignment ||
+        assignment.freelancerProfileId !== submission.freelancerProfileId
+      ) {
+        throw new ConflictException(
+          'Planning submission owner must match the role assignment',
+        );
+      }
+      const amount = Number(assignment.budgetAmount);
+      if (!assignment.currency || !Number.isFinite(amount) || amount <= 0) {
+        throw new ConflictException(
+          'Planning compensation must be allocated before approval',
+        );
+      }
+      const existing = await manager.findOne(PaymentReleaseRequest, {
+        where: {
+          planningSubmissionId: submission.id,
+          freelancerProfileId: submission.freelancerProfileId,
+          status: In(['pending', 'approved', 'released']),
+        },
+      });
+      if (existing) return { request: existing, created: false };
+
+      const amountCents = this.toCents(amount);
+      const availableCents = await this.availableHeldCents(manager, project);
+      if (amountCents > availableCents) {
+        throw new ConflictException(
+          'Allocated planning payment exceeds unreserved held escrow',
+        );
+      }
+      const payment = await manager
+        .getRepository(ProjectPayment)
+        .createQueryBuilder('payment')
+        .where('payment.projectId = :projectId', {
+          projectId: submission.projectId,
+        })
+        .andWhere('payment.status = :status', { status: 'succeeded' })
+        .orderBy('payment.paidAt', 'DESC', 'NULLS LAST')
+        .addOrderBy('payment.createdAt', 'DESC')
+        .getOne();
+      if (!payment) {
+        throw new ConflictException('No funded escrow payment was found');
+      }
+
+      const request = await manager.save(
+        PaymentReleaseRequest,
+        manager.create(PaymentReleaseRequest, {
+          projectId: submission.projectId,
+          milestoneId: null,
+          submissionId: null,
+          planningSubmissionId: submission.id,
+          roleAssignmentId: assignment.id,
+          paymentId: payment.id,
+          freelancerProfileId: submission.freelancerProfileId,
+          amount: assignment.budgetAmount!,
+          currency: assignment.currency,
+          status: 'pending',
+          reason: `Approved ${submission.submissionType} planning deliverable`,
+          requestedBy: requester.sub,
+          metadata: {
+            transferMode: 'ledger_only',
+            workType: 'planning',
+            roleKey: assignment.roleKey,
+          },
+        }),
+      );
+      return { request, created: true };
+    };
+
+    if (transactionManager) {
+      return (await operation(transactionManager)).request;
+    }
+    const result = await this.dataSource.transaction(operation);
+    if (result.created) await this.notifyReleaseRequested(result.request);
+    return result.request;
+  }
+
+  async notifyPlanningReleaseRequested(requestId: string) {
+    const request = await this.releaseRequestsRepository.findOne({
+      where: { id: requestId },
+    });
+    if (request) await this.notifyReleaseRequested(request);
+  }
+
   async listProject(
     projectId: string,
     query: ListPaymentReleaseRequestsDto,
@@ -266,6 +381,7 @@ export class PaymentReleaseRequestsService {
         .setLock('pessimistic_write', undefined, ['request'])
         .leftJoinAndSelect('request.project', 'project')
         .leftJoinAndSelect('request.submission', 'submission')
+        .leftJoinAndSelect('request.planningSubmission', 'planningSubmission')
         .where('request.id = :requestId', { requestId })
         .getOne();
       if (!releaseRequest) {
@@ -309,7 +425,11 @@ export class PaymentReleaseRequestsService {
         return { releaseRequest, ledgerEntry: null };
       }
 
-      if (releaseRequest.submission?.status !== 'approved') {
+      const approvedImplementation =
+        releaseRequest.submission?.status === 'approved';
+      const approvedPlanning =
+        releaseRequest.planningSubmission?.status === 'approved';
+      if (!approvedImplementation && !approvedPlanning) {
         throw new ConflictException(
           'The linked submission is no longer approved',
         );

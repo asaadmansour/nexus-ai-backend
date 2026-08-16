@@ -18,8 +18,14 @@ import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
+import {
+  planningRoleAllocation,
+  requiredProjectTotalForRate,
+} from 'src/planning/project-budget-allocation';
 import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
@@ -56,6 +62,10 @@ export class PaymentsService {
     private readonly submissionsRepository: Repository<ProjectSubmission>,
     @InjectRepository(PaymentReleaseRequest)
     private readonly releaseRequestsRepository: Repository<PaymentReleaseRequest>,
+    @InjectRepository(ProjectRoleAssignment)
+    private readonly roleAssignmentsRepository: Repository<ProjectRoleAssignment>,
+    @InjectRepository(ProjectPlanningSubmission)
+    private readonly planningSubmissionsRepository: Repository<ProjectPlanningSubmission>,
     @InjectRepository(StripeWebhookEvent)
     private readonly webhookEventsRepository: Repository<StripeWebhookEvent>,
     private readonly stripeService: StripeService,
@@ -355,42 +365,64 @@ export class PaymentsService {
   }
 
   private async getFreelancerEarnings(freelancerProfileId: string) {
-    const [tasks, approvedSubmissions, pendingReleases, releasedEntries] =
-      await Promise.all([
-        this.tasksRepository.find({
-          where: {
-            assignedFreelancerProfileId: freelancerProfileId,
-            status: Not('cancelled'),
-          },
-          select: {
-            id: true,
-            budgetAmount: true,
-            currency: true,
-          },
-        }),
-        this.submissionsRepository.find({
-          where: {
-            freelancerProfileId,
-            status: 'approved',
-          },
-          select: { taskId: true },
-        }),
-        this.releaseRequestsRepository.find({
-          where: {
-            freelancerProfileId,
-            status: In(['pending', 'approved']),
-          },
-          select: { amount: true, currency: true },
-        }),
-        this.ledgerRepository.find({
-          where: {
-            freelancerProfileId,
-            entryType: 'release',
-            status: 'posted',
-          },
-          select: { amount: true, currency: true },
-        }),
-      ]);
+    const [
+      tasks,
+      approvedSubmissions,
+      planningAssignments,
+      approvedPlanningSubmissions,
+      pendingReleases,
+      releasedEntries,
+    ] = await Promise.all([
+      this.tasksRepository.find({
+        where: {
+          assignedFreelancerProfileId: freelancerProfileId,
+          status: Not('cancelled'),
+        },
+        select: {
+          id: true,
+          budgetAmount: true,
+          currency: true,
+        },
+      }),
+      this.submissionsRepository.find({
+        where: {
+          freelancerProfileId,
+          status: 'approved',
+        },
+        select: { taskId: true },
+      }),
+      this.roleAssignmentsRepository.find({
+        where: {
+          freelancerProfileId,
+          phase: 'planning',
+          status: In(['assigned', 'accepted', 'in_progress', 'completed']),
+        },
+        select: {
+          id: true,
+          budgetAmount: true,
+          currency: true,
+        },
+      }),
+      this.planningSubmissionsRepository.find({
+        where: { freelancerProfileId, status: 'approved' },
+        select: { assignmentId: true },
+      }),
+      this.releaseRequestsRepository.find({
+        where: {
+          freelancerProfileId,
+          status: In(['pending', 'approved']),
+        },
+        select: { amount: true, currency: true },
+      }),
+      this.ledgerRepository.find({
+        where: {
+          freelancerProfileId,
+          entryType: 'release',
+          status: 'posted',
+        },
+        select: { amount: true, currency: true },
+      }),
+    ]);
 
     type Totals = {
       allocatedCents: number;
@@ -416,6 +448,13 @@ export class PaymentsService {
         .map((submission) => submission.taskId)
         .filter((taskId): taskId is string => Boolean(taskId)),
     );
+    const approvedPlanningAssignmentIds = new Set(
+      approvedPlanningSubmissions
+        .map((submission) => submission.assignmentId)
+        .filter((assignmentId): assignmentId is string =>
+          Boolean(assignmentId),
+        ),
+    );
 
     for (const task of tasks) {
       if (task.budgetAmount == null) continue;
@@ -424,6 +463,16 @@ export class PaymentsService {
       const cents = this.toCents(task.budgetAmount);
       totals.allocatedCents += cents;
       if (approvedTaskIds.has(task.id)) totals.approvedCents += cents;
+    }
+    for (const assignment of planningAssignments) {
+      if (assignment.budgetAmount == null) continue;
+      const totals = totalsFor(assignment.currency);
+      if (!totals) continue;
+      const cents = this.toCents(assignment.budgetAmount);
+      totals.allocatedCents += cents;
+      if (approvedPlanningAssignmentIds.has(assignment.id)) {
+        totals.approvedCents += cents;
+      }
     }
     for (const release of pendingReleases) {
       const totals = totalsFor(release.currency);
@@ -1178,6 +1227,7 @@ export class PaymentsService {
         notes: project.quoteNotes,
         isOutOfBudget: quoteStatus === 'out_of_budget',
       },
+      budgetAllocation: project.budgetAllocation,
       totals: {
         paidAmount,
         pendingAmount,
@@ -1257,6 +1307,10 @@ export class PaymentsService {
       throw new ConflictException('This project is already fully funded');
     }
 
+    if (dto.purpose === 'full_project_deposit') {
+      await this.assertPlanningBudgetFeasible(project);
+    }
+
     if (amount > remainingAmount) {
       throw new BadRequestException(
         `Payment amount cannot exceed the remaining escrow amount of ${remainingAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}`,
@@ -1264,6 +1318,67 @@ export class PaymentsService {
     }
 
     return amount;
+  }
+
+  private async assertPlanningBudgetFeasible(project: Project) {
+    const architect = planningRoleAllocation(
+      project.budgetAllocation,
+      'architect',
+    );
+    const uiux = planningRoleAllocation(project.budgetAllocation, 'ui_ux');
+    if (!architect || !uiux) {
+      throw new ConflictException(
+        'The project price has no valid planning compensation allocation. Reconfirm the brief before funding escrow.',
+      );
+    }
+
+    const profiles = await this.freelancerProfilesRepository
+      .createQueryBuilder('profile')
+      .select(['profile.id', 'profile.hourlyRate'])
+      .where('profile.verificationStatus = :approved', {
+        approved: 'approved',
+      })
+      .andWhere('profile.isAvailable = true')
+      .andWhere('profile.deletedAt IS NULL')
+      .andWhere('profile.hourlyRate IS NOT NULL')
+      .andWhere('profile.hourlyRate > 0')
+      .orderBy('profile.hourlyRate', 'ASC')
+      .getMany();
+    const rates = profiles
+      .map((profile) => Number(profile.hourlyRate))
+      .filter((rate) => Number.isFinite(rate) && rate > 0);
+    const architectMax = Number(architect.maxHourlyRate);
+    const uiuxMax = Number(uiux.maxHourlyRate);
+
+    // Rate-qualified sets are nested, so assigning the narrower role first is
+    // a complete two-role feasibility check while preserving role separation.
+    const caps = [architectMax, uiuxMax].sort((left, right) => left - right);
+    const firstIndex = rates.findIndex((rate) => rate <= caps[0]);
+    const secondIndex = rates.findIndex(
+      (rate, index) => index !== firstIndex && rate <= caps[1],
+    );
+    if (firstIndex >= 0 && secondIndex >= 0) return;
+
+    if (rates.length < 2) {
+      throw new ConflictException(
+        'At least two distinct approved freelancers with hourly rates are required for architecture and UI/UX planning before escrow can be funded.',
+      );
+    }
+    const requiredForArchitect = Number(
+      requiredProjectTotalForRate(
+        rates[0],
+        'architect',
+        architect.estimatedHours,
+      ),
+    );
+    const requiredForUiux = Number(
+      requiredProjectTotalForRate(rates[1], 'ui_ux', uiux.estimatedHours),
+    );
+    const requiredTotal = Math.max(requiredForArchitect, requiredForUiux);
+    const currentTotal = Number(project.quotedAmount) || 0;
+    throw new ConflictException(
+      `The current planning allocation cannot cover two available freelancers. Increase the project total to at least ${requiredTotal.toFixed(2)} ${project.quotedCurrency ?? project.currency} (an increase of ${Math.max(requiredTotal - currentTotal, 0).toFixed(2)}) before funding escrow.`,
+    );
   }
 
   private paymentBlockedReason(
