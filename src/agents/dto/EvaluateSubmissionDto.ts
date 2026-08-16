@@ -1,5 +1,22 @@
 // Internal gateway DTO — built by EvaluationsService and passed straight to the
 // FastAPI /agents/evaluate-submission agent (not validated via HTTP pipe).
+export interface EvaluateSubmissionCriterion {
+  key: string;
+  criterion: string;
+  category: string;
+  mandatory: boolean;
+  allowNotApplicable: boolean;
+  rationale: string;
+}
+
+export interface EvaluateSubmissionProfile {
+  version: number;
+  complexity: 'trivial' | 'standard' | 'complex';
+  requiresAutomatedTests: boolean;
+  capabilities: Record<string, boolean>;
+  rationale: string[];
+}
+
 export interface EvaluateSubmissionTask {
   taskId: string;
   title: string;
@@ -10,6 +27,9 @@ export interface EvaluateSubmissionTask {
   integrationChecks?: string[];
   contractReferences?: string[];
   ownedPaths?: string[];
+  evaluationCriteria?: EvaluateSubmissionCriterion[];
+  evaluationProfile?: EvaluateSubmissionProfile;
+  /** Compatibility field for older evaluation-service deployments. */
   qualityCriteria?: string[];
 }
 

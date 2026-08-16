@@ -42,4 +42,32 @@ describe('AiService submission result normalization', () => {
     expect(result.passed).toBe(false);
     expect(result.requiresHumanReview).toBe(true);
   });
+
+  it('treats a normalized not-applicable row as satisfied', () => {
+    const result = service.normalizeEvaluateSubmissionSandboxResult({
+      passed: true,
+      score: 88,
+      revisionRequested: false,
+      revisionNotes: '',
+      requiresHumanReview: false,
+      rubric: [
+        {
+          key: 'contract_compatibility',
+          criterion: 'Touched contracts remain compatible',
+          category: 'contract',
+          status: 'not_applicable',
+          met: false,
+          evidence: 'The inspected static change does not touch any contract.',
+        },
+      ],
+      findings: [],
+      risks: [],
+    });
+
+    expect(result.passed).toBe(true);
+    expect(result.rubric[0]).toMatchObject({
+      status: 'not_applicable',
+      met: true,
+    });
+  });
 });

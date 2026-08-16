@@ -31,8 +31,8 @@ import type {
   SubmissionEvaluationDispatchResult,
 } from 'src/delivery/submission-evaluation-dispatcher';
 import {
-  IMPLEMENTATION_QUALITY_CRITERIA,
-  IMPLEMENTATION_SUBMISSION_TYPES,
+  buildImplementationEvaluationRubric,
+  type ImplementationRubricSnapshot,
 } from './submission-quality-criteria';
 import { ImplementationEvaluationSandboxService } from './implementation-evaluation-sandbox.service';
 
@@ -117,6 +117,13 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       };
     }
 
+    // Freeze the task-aware rubric on the first run for this submission. A
+    // retry or GitHub follow-up must judge the same assignment by the same
+    // criteria even if project metadata changes while the freelancer revises.
+    const rubricSnapshot =
+      this.readRubricSnapshot(existing?.acceptanceCoverage) ??
+      (await this.buildRubricSnapshot(submission));
+
     let run: EvaluationRun;
     try {
       run = await this.runRepo.save(
@@ -126,8 +133,17 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           taskId: submission.taskId,
           milestoneId: submission.milestoneId,
           status: 'queued',
-          promptVersion: 'submission-evaluation-v3',
+          promptVersion: 'submission-evaluation-v4-adaptive',
           trigger: dto.reason ?? 'manual',
+          acceptanceCoverage: {
+            total: rubricSnapshot.criteria.length,
+            met: 0,
+            notApplicable: 0,
+            unmet: 0,
+            pending: rubricSnapshot.criteria.length,
+            items: [],
+            rubricSnapshot,
+          },
         }),
       );
     } catch (error) {
@@ -283,7 +299,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       run.startedAt = run.startedAt ?? new Date();
       await this.runRepo.save(run);
 
-      const payload = await this.buildEvaluationPayload(submission, run.id);
+      const payload = await this.buildEvaluationPayload(submission, run);
       const execution = await this.implementationSandbox.evaluate(
         payload,
         data.agentJobId,
@@ -376,7 +392,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
 
   private async buildEvaluationPayload(
     submission: ProjectSubmission,
-    currentRunId: string,
+    currentRun: EvaluationRun,
   ): Promise<EvaluateSubmissionDto> {
     const [project, task, brief, spec, evaluationHistory] = await Promise.all([
       this.projectRepo.findOne({ where: { id: submission.projectId } }),
@@ -391,7 +407,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
               projectId: submission.projectId,
               taskId: submission.taskId,
               status: 'completed',
-              id: Not(currentRunId),
+              id: Not(currentRun.id),
             },
             order: { completedAt: 'DESC' },
             take: 5,
@@ -400,6 +416,14 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     ]);
 
     const submissionArtifact = this.buildSubmissionArtifact(submission);
+    const projectSpec = this.buildProjectSpecPayload(spec);
+    const rubricSnapshot =
+      this.readRubricSnapshot(currentRun.acceptanceCoverage) ??
+      buildImplementationEvaluationRubric({
+        submissionType: submissionArtifact.submissionType,
+        task: this.buildTaskRequirementInput(task, submission),
+        projectSpec,
+      });
 
     return {
       project: {
@@ -410,6 +434,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
         task,
         submission,
         submissionArtifact.submissionType,
+        rubricSnapshot,
       ),
       submission: submissionArtifact,
       brief: brief
@@ -421,15 +446,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
             acceptanceCriteria: this.toStringArray(brief.acceptanceCriteria),
           }
         : null,
-      projectSpec: spec
-        ? {
-            architecture: spec.architecture,
-            designSystem: spec.designSystem,
-            apiContract: spec.apiContract,
-            dataModel: spec.dataModel,
-            conventions: spec.conventions,
-          }
-        : null,
+      projectSpec,
       evaluationHistory: evaluationHistory.map((historyRun) => ({
         evaluationRunId: historyRun.id,
         submissionId: historyRun.submissionId,
@@ -462,10 +479,22 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     task: ProjectTask | null,
     submission: ProjectSubmission,
     submissionType: string,
+    frozenRubric?: ImplementationRubricSnapshot,
   ): EvaluateSubmissionDto['task'] {
-    const qualityCriteria = IMPLEMENTATION_SUBMISSION_TYPES.has(submissionType)
-      ? [...IMPLEMENTATION_QUALITY_CRITERIA]
-      : [];
+    const taskInput = this.buildTaskRequirementInput(task, submission);
+    const rubric =
+      frozenRubric ??
+      buildImplementationEvaluationRubric({
+        submissionType,
+        task: taskInput,
+      });
+    const qualityCriteria = rubric.criteria
+      .filter((criterion) =>
+        ['quality', 'verification', 'security', 'operations'].includes(
+          criterion.category,
+        ),
+      )
+      .map((criterion) => criterion.criterion);
     if (!task) {
       return {
         taskId: submission.taskId ?? submission.id,
@@ -477,6 +506,8 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
         integrationChecks: [],
         contractReferences: [],
         ownedPaths: [],
+        evaluationCriteria: rubric.criteria,
+        evaluationProfile: rubric.profile,
         qualityCriteria,
       };
     }
@@ -491,8 +522,87 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       integrationChecks: this.toStringArray(metadata.integrationChecks),
       contractReferences: this.toStringArray(metadata.contractReferences),
       ownedPaths: this.toStringArray(metadata.ownedPaths),
+      evaluationCriteria: rubric.criteria,
+      evaluationProfile: rubric.profile,
       qualityCriteria,
     };
+  }
+
+  private buildTaskRequirementInput(
+    task: ProjectTask | null,
+    submission: ProjectSubmission,
+  ) {
+    if (!task) {
+      return {
+        title: submission.title ?? 'Deliverable',
+        description: submission.summary ?? '',
+        deliverables: [] as string[],
+        acceptanceCriteria: [] as string[],
+        integrationChecks: [] as string[],
+        contractReferences: [] as string[],
+        ownedPaths: [] as string[],
+      };
+    }
+    const metadata = this.asRecord(task.metadata);
+    return {
+      title: task.title,
+      description: task.description ?? '',
+      deliverables: this.toStringArray(metadata.deliverables),
+      acceptanceCriteria: this.toStringArray(task.acceptanceCriteria),
+      integrationChecks: this.toStringArray(metadata.integrationChecks),
+      contractReferences: this.toStringArray(metadata.contractReferences),
+      ownedPaths: this.toStringArray(metadata.ownedPaths),
+    };
+  }
+
+  private buildProjectSpecPayload(
+    spec: ProjectSpec | null,
+  ): Record<string, unknown> | null {
+    return spec
+      ? {
+          architecture: spec.architecture,
+          designSystem: spec.designSystem,
+          apiContract: spec.apiContract,
+          dataModel: spec.dataModel,
+          conventions: spec.conventions,
+        }
+      : null;
+  }
+
+  private async buildRubricSnapshot(
+    submission: ProjectSubmission,
+  ): Promise<ImplementationRubricSnapshot> {
+    const [task, spec] = await Promise.all([
+      submission.taskId
+        ? this.taskRepo.findOne({ where: { id: submission.taskId } })
+        : Promise.resolve(null),
+      this.specRepo.findOne({ where: { projectId: submission.projectId } }),
+    ]);
+    const submissionType =
+      this.buildSubmissionArtifact(submission).submissionType;
+    return buildImplementationEvaluationRubric({
+      submissionType,
+      task: this.buildTaskRequirementInput(task, submission),
+      projectSpec: this.buildProjectSpecPayload(spec),
+    });
+  }
+
+  private readRubricSnapshot(
+    coverage: Record<string, unknown> | null | undefined,
+  ): ImplementationRubricSnapshot | null {
+    const value = coverage?.rubricSnapshot;
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return null;
+    const candidate = value as Record<string, unknown>;
+    if (
+      candidate.schemaVersion !== 1 ||
+      !Array.isArray(candidate.criteria) ||
+      !candidate.profile ||
+      typeof candidate.profile !== 'object'
+    ) {
+      return null;
+    }
+    return value as ImplementationRubricSnapshot;
   }
 
   private buildSubmissionArtifact(
@@ -543,7 +653,14 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       : result.requiresHumanReview
         ? 'manual_review'
         : 'approve';
-    const metCount = result.rubric.filter((item) => item.met).length;
+    const notApplicableCount = result.rubric.filter(
+      (item) => item.status === 'not_applicable',
+    ).length;
+    const metCount = result.rubric.filter(
+      (item) => item.met && item.status !== 'not_applicable',
+    ).length;
+    const unmetCount = result.rubric.filter((item) => !item.met).length;
+    const rubricSnapshot = this.readRubricSnapshot(run.acceptanceCoverage);
 
     run.status = 'completed';
     run.score = String(result.score);
@@ -564,8 +681,11 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     run.acceptanceCoverage = {
       total: result.rubric.length,
       met: metCount,
-      unmet: result.rubric.length - metCount,
+      notApplicable: notApplicableCount,
+      unmet: unmetCount,
+      pending: 0,
       items: result.rubric,
+      ...(rubricSnapshot ? { rubricSnapshot } : {}),
     };
     run.riskFlags = [
       ...(result.requiresHumanReview ? ['requires_human_review'] : []),

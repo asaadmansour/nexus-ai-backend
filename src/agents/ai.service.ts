@@ -214,7 +214,10 @@ export type ProjectQuoteResult = {
 };
 
 export type EvaluateSubmissionRubricItem = {
+  key?: string;
   criterion: string;
+  category?: string;
+  status: 'met' | 'not_applicable' | 'unmet';
   met: boolean;
   evidence: string;
 };
@@ -1392,12 +1395,26 @@ export class AiService {
   private normalizeEvaluationRubric(
     value: unknown,
   ): EvaluateSubmissionRubricItem[] {
-    return this.toRecordArray(value).map((item, index) => ({
-      criterion:
-        this.optionalString(item.criterion) ?? `Criterion ${index + 1}`,
-      met: item.met === true,
-      evidence: this.optionalString(item.evidence) ?? '',
-    }));
+    return this.toRecordArray(value).map((item, index) => {
+      const returnedStatus = this.optionalString(item.status);
+      const status: EvaluateSubmissionRubricItem['status'] =
+        returnedStatus === 'not_applicable'
+          ? 'not_applicable'
+          : returnedStatus === 'met' || item.met === true
+            ? 'met'
+            : 'unmet';
+      return {
+        key: this.optionalString(item.key) ?? undefined,
+        criterion:
+          this.optionalString(item.criterion) ?? `Criterion ${index + 1}`,
+        category: this.optionalString(item.category) ?? undefined,
+        status,
+        // Keep the compatibility boolean true for a justified N/A row so old
+        // consumers do not turn it into a revision.
+        met: status !== 'unmet',
+        evidence: this.optionalString(item.evidence) ?? '',
+      };
+    });
   }
 
   private clampScore(value: number) {
@@ -1414,16 +1431,27 @@ export class AiService {
     const configuredQualityCriteria = this.toStringArray(
       dto.task.qualityCriteria,
     );
+    const configuredEvaluationCriteria = this.toRecordArray(
+      dto.task.evaluationCriteria,
+    )
+      .map((item) => this.optionalString(item.criterion))
+      .filter((item): item is string => Boolean(item));
     const criteria = Array.from(
       new Set([
-        ...this.toStringArray(dto.task.acceptanceCriteria),
-        ...this.toStringArray(dto.task.deliverables),
-        ...this.toStringArray(dto.task.integrationChecks),
-        ...(configuredQualityCriteria.length
-          ? configuredQualityCriteria
-          : isImplementationSubmission
-            ? [...IMPLEMENTATION_QUALITY_CRITERIA]
-            : []),
+        ...(configuredEvaluationCriteria.length
+          ? configuredEvaluationCriteria
+          : [
+              ...this.toStringArray(dto.task.acceptanceCriteria),
+              ...this.toStringArray(dto.task.deliverables),
+              ...this.toStringArray(dto.task.integrationChecks),
+            ]),
+        ...(configuredEvaluationCriteria.length
+          ? []
+          : configuredQualityCriteria.length
+            ? configuredQualityCriteria
+            : isImplementationSubmission
+              ? [...IMPLEMENTATION_QUALITY_CRITERIA]
+              : []),
       ]),
     );
     const effectiveCriteria = criteria.length
@@ -1442,6 +1470,7 @@ export class AiService {
     const rubric: EvaluateSubmissionRubricItem[] = effectiveCriteria.map(
       (criterion) => ({
         criterion,
+        status: canVerify ? ('met' as const) : ('unmet' as const),
         met: canVerify,
         evidence: canVerify
           ? 'Mock evaluation: submission artifact present.'
