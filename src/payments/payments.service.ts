@@ -8,13 +8,15 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, Not, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import Stripe from 'stripe';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
+import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
+import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
@@ -22,6 +24,7 @@ import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
+import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
 import { StripeService } from './stripe.service';
 
@@ -47,6 +50,12 @@ export class PaymentsService {
     private readonly paymentsRepository: Repository<ProjectPayment>,
     @InjectRepository(EscrowLedgerEntry)
     private readonly ledgerRepository: Repository<EscrowLedgerEntry>,
+    @InjectRepository(ProjectTask)
+    private readonly tasksRepository: Repository<ProjectTask>,
+    @InjectRepository(ProjectSubmission)
+    private readonly submissionsRepository: Repository<ProjectSubmission>,
+    @InjectRepository(PaymentReleaseRequest)
+    private readonly releaseRequestsRepository: Repository<PaymentReleaseRequest>,
     @InjectRepository(StripeWebhookEvent)
     private readonly webhookEventsRepository: Repository<StripeWebhookEvent>,
     private readonly stripeService: StripeService,
@@ -294,6 +303,7 @@ export class PaymentsService {
 
   async getFreelancerAccount(userId: string) {
     const profile = await this.getFreelancerProfileOrThrow(userId);
+    const earnings = await this.getFreelancerEarnings(profile.id);
 
     if (!profile.stripeAccountId) {
       return {
@@ -305,6 +315,7 @@ export class PaymentsService {
           payoutsEnabled: false,
           requirementsDue: null,
           onboardedAt: null,
+          earnings,
         },
       };
     }
@@ -338,7 +349,102 @@ export class PaymentsService {
         payoutsEnabled: onboarded,
         requirementsDue: this.accountRequirements(account),
         onboardedAt,
+        earnings,
       },
+    };
+  }
+
+  private async getFreelancerEarnings(freelancerProfileId: string) {
+    const [tasks, approvedSubmissions, pendingReleases, releasedEntries] =
+      await Promise.all([
+        this.tasksRepository.find({
+          where: {
+            assignedFreelancerProfileId: freelancerProfileId,
+            status: Not('cancelled'),
+          },
+          select: {
+            id: true,
+            budgetAmount: true,
+            currency: true,
+          },
+        }),
+        this.submissionsRepository.find({
+          where: {
+            freelancerProfileId,
+            status: 'approved',
+          },
+          select: { taskId: true },
+        }),
+        this.releaseRequestsRepository.find({
+          where: {
+            freelancerProfileId,
+            status: In(['pending', 'approved']),
+          },
+          select: { amount: true, currency: true },
+        }),
+        this.ledgerRepository.find({
+          where: {
+            freelancerProfileId,
+            entryType: 'release',
+            status: 'posted',
+          },
+          select: { amount: true, currency: true },
+        }),
+      ]);
+
+    type Totals = {
+      allocatedCents: number;
+      approvedCents: number;
+      pendingReleaseCents: number;
+      releasedCents: number;
+    };
+    const totalsByCurrency = new Map<string, Totals>();
+    const totalsFor = (currencyValue: string | null | undefined) => {
+      const currency = currencyValue?.trim().toUpperCase();
+      if (!currency) return null;
+      const totals = totalsByCurrency.get(currency) ?? {
+        allocatedCents: 0,
+        approvedCents: 0,
+        pendingReleaseCents: 0,
+        releasedCents: 0,
+      };
+      totalsByCurrency.set(currency, totals);
+      return totals;
+    };
+    const approvedTaskIds = new Set(
+      approvedSubmissions
+        .map((submission) => submission.taskId)
+        .filter((taskId): taskId is string => Boolean(taskId)),
+    );
+
+    for (const task of tasks) {
+      if (task.budgetAmount == null) continue;
+      const totals = totalsFor(task.currency);
+      if (!totals) continue;
+      const cents = this.toCents(task.budgetAmount);
+      totals.allocatedCents += cents;
+      if (approvedTaskIds.has(task.id)) totals.approvedCents += cents;
+    }
+    for (const release of pendingReleases) {
+      const totals = totalsFor(release.currency);
+      if (totals) totals.pendingReleaseCents += this.toCents(release.amount);
+    }
+    for (const entry of releasedEntries) {
+      const totals = totalsFor(entry.currency);
+      if (totals) totals.releasedCents += this.toCents(entry.amount);
+    }
+
+    return {
+      currencies: [...totalsByCurrency.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([currency, totals]) => ({
+          currency,
+          allocatedAmount: this.fromCents(totals.allocatedCents),
+          approvedAmount: this.fromCents(totals.approvedCents),
+          pendingReleaseAmount: this.fromCents(totals.pendingReleaseCents),
+          releasedAmount: this.fromCents(totals.releasedCents),
+        })),
+      updatedAt: new Date().toISOString(),
     };
   }
 
@@ -1225,6 +1331,14 @@ export class PaymentsService {
     if (value === null || value === undefined) return null;
     const number = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  private toCents(value: string | number) {
+    return Math.round((this.toNumber(value) ?? 0) * 100);
+  }
+
+  private fromCents(value: number) {
+    return (value / 100).toFixed(2);
   }
 
   private async ensureStripeCustomer(user: User) {

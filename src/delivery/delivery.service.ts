@@ -551,7 +551,7 @@ export class DeliveryService {
 
     let releaseRequest: unknown = null;
     let releaseError: string | null = null;
-    if (dto.decision === 'approved' && dto.releasePayment) {
+    if (dto.decision === 'approved') {
       try {
         releaseRequest =
           await this.paymentReleaseRequestsService.createForApprovedSubmission(

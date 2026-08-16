@@ -193,51 +193,40 @@ export class PaymentReleaseRequestsService {
     submission: ProjectSubmission,
     requester: JwtPayload,
   ) {
-    if (!submission.milestoneId) {
-      throw new BadRequestException(
-        'Automatic release requests require a milestone submission',
+    if (!submission.taskId) {
+      throw new BadRequestException('Automatic release requires a task');
+    }
+    const task = await this.dataSource.getRepository(ProjectTask).findOne({
+      where: { id: submission.taskId, projectId: submission.projectId },
+    });
+    if (!task) throw new NotFoundException('Submission task not found');
+    if (
+      !submission.freelancerProfileId ||
+      task.assignedFreelancerProfileId !== submission.freelancerProfileId
+    ) {
+      throw new ConflictException(
+        'Submission owner must match the current task assignee',
       );
     }
-    const milestone = await this.dataSource
-      .getRepository(ProjectMilestone)
-      .findOne({ where: { id: submission.milestoneId } });
-    if (!milestone?.budgetAmount) {
+    if (!task.budgetAmount || !task.currency) {
       throw new BadRequestException(
-        'Milestone budget is required for automatic release requests',
+        'Task compensation must be allocated before approval can create a release request',
       );
     }
     const project = await this.getProjectOrThrow(submission.projectId);
-    const milestoneTasks = await this.dataSource
-      .getRepository(ProjectTask)
-      .find({ where: { milestoneId: submission.milestoneId } });
-    const assignees = new Set(
-      milestoneTasks
-        .map((task) => task.assignedFreelancerProfileId)
-        .filter((id): id is string => Boolean(id)),
-    );
-    if (
-      assignees.size !== 1 ||
-      !submission.freelancerProfileId ||
-      !assignees.has(submission.freelancerProfileId)
-    ) {
-      throw new BadRequestException(
-        'Use an explicit release request amount for milestones shared by multiple freelancers',
-      );
-    }
-    const amount = Number(milestone.budgetAmount);
+    const amount = Number(task.budgetAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      throw new BadRequestException('Milestone budget is invalid');
+      throw new BadRequestException('Task compensation is invalid');
     }
     return this.create(
       submission.projectId,
       {
-        milestoneId: submission.milestoneId,
+        milestoneId: task.milestoneId ?? undefined,
         submissionId: submission.id,
         freelancerProfileId: submission.freelancerProfileId ?? undefined,
         amount,
-        currency:
-          milestone.currency ?? project.quotedCurrency ?? project.currency,
-        reason: `Approved submission: ${submission.title ?? submission.id}`,
+        currency: task.currency ?? project.quotedCurrency ?? project.currency,
+        reason: `Approved task: ${task.title}`,
       },
       requester,
     );

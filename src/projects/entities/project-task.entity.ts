@@ -146,6 +146,18 @@ export class ProjectTask {
   })
   estimatedHours!: string | null;
 
+  @Column({
+    name: 'budget_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+  })
+  budgetAmount!: string | null;
+
+  @Column({ type: 'char', length: 3, nullable: true })
+  currency!: string | null;
+
   @Column({ name: 'order_index', type: 'int', default: 0 })
   orderIndex!: number;
 

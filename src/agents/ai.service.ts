@@ -120,6 +120,8 @@ export type ProjectPlanTask = {
   roleKey?: string;
   requiredSkills?: string[];
   estimatedHours?: number | null;
+  budgetAmount?: string | number | null;
+  currency?: string | null;
   orderIndex: number;
   startDay?: number;
   durationDays?: number;

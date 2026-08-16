@@ -26,6 +26,7 @@ import {
 } from 'src/planning/planning-evaluation-requirements';
 import { CreateRoleAssignmentDto } from './dtos/create-role-assignment.dto';
 import { UpdateAssignmentStatusDto } from './dtos/update-assignment-status.dto';
+import { confirmedBriefValue } from './confirmed-brief-value';
 
 interface Requester {
   userId: string;
@@ -356,8 +357,7 @@ export class RoleAssignmentsService {
         phase: assignment.phase,
         roleKey: assignment.roleKey,
         status: assignment.status,
-        budgetMin: project ? Number(project.budgetMin) : null,
-        budgetMax: project ? Number(project.budgetMax) : null,
+        allocatedAmount: null,
         currency: project?.currency ?? null,
         deadline: project?.deadline ?? null,
         briefSummary: briefs.get(assignment.projectId) ?? null,
@@ -381,6 +381,7 @@ export class RoleAssignmentsService {
                 'in_progress',
                 'review',
                 'changes_requested',
+                'done',
               ]),
             },
             order: { assignedAt: 'DESC', createdAt: 'DESC' },
@@ -406,11 +407,31 @@ export class RoleAssignmentsService {
               .filter((roleKey): roleKey is string => Boolean(roleKey)),
           ),
         ];
-        const status = tasks.some((task) =>
-          ['in_progress', 'review', 'changes_requested'].includes(task.status),
-        )
-          ? 'in_progress'
-          : 'assigned';
+        const status = tasks.every((task) => task.status === 'done')
+          ? 'completed'
+          : tasks.some((task) =>
+                ['in_progress', 'review', 'changes_requested'].includes(
+                  task.status,
+                ),
+              )
+            ? 'in_progress'
+            : 'assigned';
+        const budgetedTasks = tasks.filter(
+          (task) => task.budgetAmount != null && task.currency != null,
+        );
+        const allocatedAmount = budgetedTasks.length
+          ? budgetedTasks.reduce(
+              (sum, task) => sum + (Number(task.budgetAmount) || 0),
+              0,
+            )
+          : null;
+        const taskCurrencies = [
+          ...new Set(
+            tasks
+              .map((task) => task.currency?.trim().toUpperCase())
+              .filter((currency): currency is string => Boolean(currency)),
+          ),
+        ];
         return {
           assignmentId: `implementation:${projectId}`,
           projectId,
@@ -418,9 +439,11 @@ export class RoleAssignmentsService {
           phase: 'implementation',
           roleKey: roleKeys.length === 1 ? roleKeys[0] : 'implementation',
           status,
-          budgetMin: project ? Number(project.budgetMin) : null,
-          budgetMax: project ? Number(project.budgetMax) : null,
-          currency: project?.currency ?? null,
+          allocatedAmount,
+          currency:
+            taskCurrencies.length === 1
+              ? taskCurrencies[0]
+              : (project?.currency ?? null),
           deadline: project?.deadline ?? null,
           briefSummary: `${tasks.length} assigned implementation task${tasks.length === 1 ? '' : 's'}`,
           roleBriefSummary: tasks
@@ -458,7 +481,7 @@ export class RoleAssignmentsService {
       order: { createdAt: 'DESC' },
       relations: ['project', 'freelancerProfile', 'freelancerProfile.user'],
     });
-    const implementationTask = await this.taskRepo.findOne({
+    const implementationTasks = await this.taskRepo.find({
       where: {
         projectId,
         assignedFreelancerProfileId: profile.id,
@@ -466,7 +489,7 @@ export class RoleAssignmentsService {
       order: { assignedAt: 'DESC', createdAt: 'DESC' },
       relations: ['project'],
     });
-    if (!assignments.length && !implementationTask) {
+    if (!assignments.length && !implementationTasks.length) {
       throw new NotFoundException('Assigned project not found');
     }
 
@@ -475,7 +498,7 @@ export class RoleAssignmentsService {
       const roleBriefVersion = (
         assignment.roleBrief as { generationVersion?: unknown } | null
       )?.generationVersion;
-      if (!assignment.roleBrief || roleBriefVersion !== 2) {
+      if (!assignment.roleBrief || roleBriefVersion !== 3) {
         assignment.roleBrief = this.buildLocalRoleBrief(
           assignment.roleKey,
           assignment.project,
@@ -488,7 +511,23 @@ export class RoleAssignmentsService {
       }
     }
 
-    const project = assignments[0]?.project ?? implementationTask!.project;
+    const project = assignments[0]?.project ?? implementationTasks[0].project;
+    const budgetedImplementationTasks = implementationTasks.filter(
+      (task) => task.budgetAmount != null && task.currency != null,
+    );
+    const implementationAllocatedAmount = budgetedImplementationTasks.length
+      ? budgetedImplementationTasks.reduce(
+          (sum, task) => sum + (Number(task.budgetAmount) || 0),
+          0,
+        )
+      : null;
+    const implementationCurrencies = [
+      ...new Set(
+        implementationTasks
+          .map((task) => task.currency?.trim().toUpperCase())
+          .filter((currency): currency is string => Boolean(currency)),
+      ),
+    ];
 
     return {
       project: {
@@ -497,31 +536,33 @@ export class RoleAssignmentsService {
         description: project.description,
         status: project.status,
         planningStatus: project.planningStatus,
-        budgetMin: Number(project.budgetMin),
-        budgetMax: Number(project.budgetMax),
         currency: project.currency,
         deadline: project.deadline,
         isDeadlineFlexible: project.isDeadlineFlexible,
       },
       brief: {
-        summary: brief?.summary ?? null,
-        briefText: brief?.briefText ?? null,
-        businessDomain: brief?.domain ?? null,
-        mainGoal: brief?.mainGoal ?? null,
-        targetUsers: brief?.targetUsers ?? null,
-        coreFeatures: brief?.coreFeatures ?? null,
-        platforms: brief?.platforms ?? null,
-        constraintsPreferences: brief?.constraintsPreferences ?? null,
+        summary: confirmedBriefValue(brief?.summary),
+        briefText: confirmedBriefValue(brief?.briefText),
+        businessDomain: confirmedBriefValue(brief?.domain),
+        mainGoal: confirmedBriefValue(brief?.mainGoal),
+        targetUsers: confirmedBriefValue(brief?.targetUsers),
+        coreFeatures: confirmedBriefValue(brief?.coreFeatures),
+        platforms: confirmedBriefValue(brief?.platforms),
+        constraintsPreferences: confirmedBriefValue(
+          brief?.constraintsPreferences,
+        ),
       },
       assignments: assignments.map((assignment) =>
         this.toAssignmentDto(assignment, assignment.freelancerProfile),
       ),
-      implementationTaskCount: await this.taskRepo.count({
-        where: {
-          projectId,
-          assignedFreelancerProfileId: profile.id,
-        },
-      }),
+      implementationTaskCount: implementationTasks.length,
+      implementationCompensation: {
+        allocatedAmount: implementationAllocatedAmount,
+        currency:
+          implementationCurrencies.length === 1
+            ? implementationCurrencies[0]
+            : project.currency,
+      },
     };
   }
 
@@ -722,7 +763,7 @@ export class RoleAssignmentsService {
       where: { projectId: In(projectIds) },
     });
     for (const brief of briefs) {
-      summaries.set(brief.projectId, brief.summary ?? null);
+      summaries.set(brief.projectId, confirmedBriefValue(brief.summary));
     }
     return summaries;
   }
@@ -768,7 +809,7 @@ export class RoleAssignmentsService {
       const update: QueryDeepPartialEntity<ProjectRoleAssignment> = {
         roleBrief: {
           ...result,
-          generationVersion: 2,
+          generationVersion: 3,
           requirementProfile,
         },
         roleBriefStatus: result.source === 'fastapi' ? 'generated' : 'fallback',
@@ -799,7 +840,10 @@ export class RoleAssignmentsService {
   ) {
     const roleLabel = this.roleLabel(roleKey);
     const projectName = project.title || 'this project';
-    const domain = brief?.domain ? ` in ${brief.domain}` : '';
+    const domainValue = confirmedBriefValue(brief?.domain);
+    const summaryValue = confirmedBriefValue(brief?.summary);
+    const mainGoalValue = confirmedBriefValue(brief?.mainGoal);
+    const domain = domainValue ? ` in ${domainValue}` : '';
     const requirementProfile = assessPlanningRequirementProfile(project, brief);
     const complexity = requirementProfile.complexity;
     const commonInputs = [
@@ -809,7 +853,7 @@ export class RoleAssignmentsService {
     ];
 
     return {
-      generationVersion: 2,
+      generationVersion: 3,
       requirementProfile,
       title: `${roleLabel} planning brief for ${projectName}`,
       summary: [
@@ -817,8 +861,8 @@ export class RoleAssignmentsService {
         project.description
           ? `Project description: ${project.description}.`
           : null,
-        brief?.summary ? `Brief summary: ${brief.summary}.` : null,
-        brief?.mainGoal ? `Main goal: ${brief.mainGoal}.` : null,
+        summaryValue ? `Brief summary: ${summaryValue}.` : null,
+        mainGoalValue ? `Main goal: ${mainGoalValue}.` : null,
       ]
         .filter(Boolean)
         .join(' '),
@@ -866,17 +910,17 @@ export class RoleAssignmentsService {
     if (!brief) return null;
     return {
       id: brief.id,
-      summary: brief.summary,
-      briefText: brief.briefText,
-      projectType: brief.projectType,
-      businessDomain: brief.domain,
-      mainGoal: brief.mainGoal,
-      targetUsers: brief.targetUsers,
+      summary: confirmedBriefValue(brief.summary),
+      briefText: confirmedBriefValue(brief.briefText),
+      projectType: confirmedBriefValue(brief.projectType),
+      businessDomain: confirmedBriefValue(brief.domain),
+      mainGoal: confirmedBriefValue(brief.mainGoal),
+      targetUsers: confirmedBriefValue(brief.targetUsers),
       coreFeatures: this.textToList(brief.coreFeatures),
       platforms: this.textToList(brief.platforms),
       deliverables: this.textToList(brief.deliverablesText),
       constraintsPreferences: this.textToList(brief.constraintsPreferences),
-      clientBackground: brief.clientBackground,
+      clientBackground: confirmedBriefValue(brief.clientBackground),
       requiredSkills: brief.requiredSkills,
       preferredSkills: brief.preferredSkills,
       technical: brief.technical,
@@ -1000,11 +1044,12 @@ export class RoleAssignmentsService {
   }
 
   private textToList(value?: string | null) {
-    if (!value) return [];
-    return value
+    const confirmed = confirmedBriefValue(value);
+    if (!confirmed) return [];
+    return confirmed
       .split(/[\n,;]+/)
       .map((item) => item.trim())
-      .filter(Boolean);
+      .filter((item) => confirmedBriefValue(item) !== null);
   }
 
   private optionalString(value: unknown) {

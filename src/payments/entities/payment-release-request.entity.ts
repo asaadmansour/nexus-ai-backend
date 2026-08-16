@@ -28,12 +28,11 @@ import { ProjectPayment } from './project-payment.entity';
   'status',
 ])
 @Index(
-  'payment_release_requests_pending_milestone_uidx',
-  ['milestoneId', 'freelancerProfileId'],
+  'payment_release_requests_milestone_freelancer_status_idx',
+  ['milestoneId', 'freelancerProfileId', 'status'],
   {
-    unique: true,
     where:
-      '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL AND "status" IN (\'pending\', \'approved\')',
+      '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
   },
 )
 @Index(

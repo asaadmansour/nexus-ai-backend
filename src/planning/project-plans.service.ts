@@ -40,6 +40,7 @@ import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
 import { UpdateTaskDto } from './dtos/update-task.dto';
 import { assessPlanningRequirementProfile } from './planning-evaluation-requirements';
+import { allocateTaskBudgets } from './task-budget-allocation';
 
 interface Requester {
   userId: string;
@@ -156,6 +157,16 @@ export class ProjectPlansService {
       planningTeam,
       notes: dto.notes,
     });
+    const generatedTaskAllocations = allocateTaskBudgets(
+      generated.milestones,
+      generated.tasks,
+      project.quotedCurrency ?? project.currency,
+    );
+    const generatedTasks: ProjectPlanTask[] = generated.tasks.map((task) => ({
+      ...task,
+      budgetAmount: generatedTaskAllocations.get(task.key)?.amount ?? null,
+      currency: generatedTaskAllocations.get(task.key)?.currency ?? null,
+    }));
 
     const plan = await this.dataSource.transaction(async (manager) => {
       await manager
@@ -188,11 +199,11 @@ export class ProjectPlansService {
           assumptions: this.toJson(generated.assumptions),
           timeline: generated.timeline,
           milestones: this.toJson(generated.milestones),
-          tasks: this.toJson(generated.tasks),
+          tasks: this.toJson(generatedTasks),
           dependencies: this.toJson(
             generated.dependencies.length
               ? generated.dependencies
-              : this.extractDependencies(generated.tasks),
+              : this.extractDependencies(generatedTasks),
           ),
           projectSpec: this.toJson(generated.projectSpec),
           teamPlan: generated.teamPlan,
@@ -209,7 +220,7 @@ export class ProjectPlansService {
       isCurrent: plan.isCurrent,
       summary: plan.summary,
       milestoneCount: generated.milestones.length,
-      taskCount: generated.tasks.length,
+      taskCount: generatedTasks.length,
       createdAt: plan.createdAt,
     };
   }
@@ -380,14 +391,27 @@ export class ProjectPlansService {
   async getById(planId: string, requester: Requester) {
     const plan = await this.planRepo.findOne({ where: { id: planId } });
     if (!plan) throw new NotFoundException('Plan not found');
+    const project = await this.getProject(plan.projectId);
 
     if (requester.role === UserRole.CUSTOMER) {
-      const project = await this.getProject(plan.projectId);
       await this.assertProjectVisibility(project, requester);
       if (plan.status !== 'approved') {
         throw new ForbiddenException('This plan is not available yet');
       }
     }
+    const milestones = (plan.milestones ??
+      []) as unknown as ProjectPlanMilestone[];
+    const tasks = (plan.tasks ?? []) as unknown as ProjectPlanTask[];
+    const taskAllocations = allocateTaskBudgets(
+      milestones,
+      tasks,
+      project.quotedCurrency ?? project.currency,
+    );
+    const tasksWithAllocations = tasks.map((task) => ({
+      ...task,
+      budgetAmount: taskAllocations.get(task.key)?.amount ?? null,
+      currency: taskAllocations.get(task.key)?.currency ?? null,
+    }));
 
     return {
       id: plan.id,
@@ -402,7 +426,7 @@ export class ProjectPlansService {
       assumptions: plan.assumptions,
       timeline: plan.timeline,
       milestones: plan.milestones,
-      tasks: plan.tasks,
+      tasks: tasksWithAllocations,
       dependencies: plan.dependencies,
       projectSpec: plan.projectSpec,
       teamPlan: plan.teamPlan,
@@ -483,6 +507,39 @@ export class ProjectPlansService {
         );
       }
 
+      if (dto.status === 'approved') {
+        const project = await manager.findOne(Project, {
+          where: { id: lockedPlan.projectId },
+        });
+        if (!project) throw new NotFoundException('Project not found');
+        const milestones = (lockedPlan.milestones ??
+          []) as unknown as ProjectPlanMilestone[];
+        const tasks = (lockedPlan.tasks ?? []) as unknown as ProjectPlanTask[];
+        if (!tasks.length) {
+          throw new BadRequestException(
+            'A plan cannot be approved without implementation tasks',
+          );
+        }
+        const allocations = allocateTaskBudgets(
+          milestones,
+          tasks,
+          project.quotedCurrency ?? project.currency,
+        );
+        const unallocatedTask = tasks.find((task) => {
+          const allocation = allocations.get(task.key);
+          return (
+            !allocation?.currency ||
+            allocation.amount == null ||
+            Number(allocation.amount) <= 0
+          );
+        });
+        if (unallocatedTask) {
+          throw new BadRequestException(
+            `Plan approval requires positive compensation for every task. Missing allocation for: ${unallocatedTask.title}`,
+          );
+        }
+      }
+
       lockedPlan.status = dto.status;
       lockedPlan.adminNotes = dto.adminNotes ?? lockedPlan.adminNotes ?? null;
       if (dto.status === 'approved') {
@@ -546,6 +603,11 @@ export class ProjectPlansService {
           .where('project.id = :projectId', { projectId: plan.projectId })
           .getOne();
         if (!project) throw new NotFoundException('Project not found');
+        const taskBudgetAllocations = allocateTaskBudgets(
+          milestones,
+          tasks,
+          project.quotedCurrency ?? project.currency,
+        );
 
         const lockedPlan = await manager
           .getRepository(ProjectPlan)
@@ -601,6 +663,25 @@ export class ProjectPlansService {
           await manager.delete(ProjectSpec, { projectId: plan.projectId });
         }
 
+        if (!tasks.length) {
+          throw new BadRequestException(
+            'An approved plan must contain at least one budgeted implementation task',
+          );
+        }
+        const unallocatedTask = tasks.find((task) => {
+          const allocation = taskBudgetAllocations.get(task.key);
+          return (
+            !allocation?.currency ||
+            allocation.amount == null ||
+            Number(allocation.amount) <= 0
+          );
+        });
+        if (unallocatedTask) {
+          throw new BadRequestException(
+            `Every implementation task must have a positive share of its milestone budget before materialization. Missing allocation for: ${unallocatedTask.title}`,
+          );
+        }
+
         const milestoneIdByKey = new Map<string, string>();
         let quotedAmount = 0;
         let quotedCurrency: string | null = null;
@@ -647,6 +728,7 @@ export class ProjectPlansService {
 
         const taskIdByKey = new Map<string, string>();
         for (const task of tasks) {
+          const budgetAllocation = taskBudgetAllocations.get(task.key);
           const saved = await manager.save(
             ProjectTask,
             manager.create(ProjectTask, {
@@ -665,6 +747,8 @@ export class ProjectPlansService {
                 task.estimatedHours != null
                   ? String(task.estimatedHours)
                   : null,
+              budgetAmount: budgetAllocation?.amount ?? null,
+              currency: budgetAllocation?.currency ?? null,
               orderIndex: task.orderIndex ?? 0,
               startsAt: this.dateAtPlanDay(plan.createdAt, task.startDay),
               dueAt: this.dateAtPlanDay(
