@@ -12,6 +12,10 @@ import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { ProjectRepository } from 'src/projects/entities/project-repository.entity';
+import { GithubWebhookEvent } from 'src/projects/entities/github-webhook-event.entity';
+import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
+import { RepositoriesModule } from 'src/repositories/repositories.module';
 import { EvaluationsService } from './evaluations.service';
 import {
   AdminEvaluationsController,
@@ -20,6 +24,9 @@ import {
 } from './evaluations.controller';
 import { SubmissionEvaluationProcessor } from './jobs/submission-evaluation.processor';
 import { SUBMISSION_EVALUATION_DISPATCHER } from 'src/delivery/submission-evaluation-dispatcher';
+import { ImplementationEvaluationSandboxService } from './implementation-evaluation-sandbox.service';
+import { GithubWebhookService } from './github-webhook.service';
+import { GithubWebhookController } from './github-webhook.controller';
 
 const queueProcessors = areQueuesEnabled()
   ? [SubmissionEvaluationProcessor]
@@ -30,6 +37,7 @@ const queueProcessors = areQueuesEnabled()
     QueuesModule,
     AgentsModule,
     NotificationsModule,
+    RepositoriesModule,
     TypeOrmModule.forFeature([
       EvaluationRun,
       ProjectSubmission,
@@ -39,15 +47,21 @@ const queueProcessors = areQueuesEnabled()
       ProjectSpec,
       FreelancerProfile,
       AgentJob,
+      ProjectRepository,
+      GithubWebhookEvent,
+      ProjectRevisionRequest,
     ]),
   ],
   controllers: [
+    GithubWebhookController,
     SubmissionEvaluationsController,
     EvaluationRunsController,
     AdminEvaluationsController,
   ],
   providers: [
     EvaluationsService,
+    ImplementationEvaluationSandboxService,
+    GithubWebhookService,
     {
       provide: SUBMISSION_EVALUATION_DISPATCHER,
       useExisting: EvaluationsService,

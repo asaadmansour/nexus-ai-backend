@@ -25,6 +25,8 @@ import { ProjectTaskDependency } from 'src/projects/entities/project-task-depend
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { EvaluationRun } from 'src/projects/entities/evaluation-run.entity';
+import { GithubService } from 'src/repositories/github.service';
 import { CreateRevisionRequestDto } from './dtos/create-revision-request.dto';
 import { CreateSubmissionDto } from './dtos/create-submission.dto';
 import { ListRevisionRequestsDto } from './dtos/list-revision-requests.dto';
@@ -74,6 +76,54 @@ export function assertSubmissionMatchesCurrentTask(
   }
 }
 
+export function assertSubmissionApprovalEvaluation(
+  submission: Pick<ProjectSubmission, 'submissionType' | 'commitSha'>,
+  evaluation: Pick<
+    EvaluationRun,
+    'id' | 'status' | 'recommendation' | 'evaluatedCommitSha'
+  > | null,
+  input: Pick<ReviewSubmissionDto, 'manualReviewAcknowledged' | 'feedback'>,
+) {
+  if (!evaluation || evaluation.status !== 'completed') {
+    throw new ConflictException(
+      'Approval is blocked until the latest evaluation completes',
+    );
+  }
+  if (
+    ['pull_request', 'repository'].includes(submission.submissionType) &&
+    (!submission.commitSha ||
+      !evaluation.evaluatedCommitSha ||
+      submission.commitSha.toLowerCase() !==
+        evaluation.evaluatedCommitSha.toLowerCase())
+  ) {
+    throw new ConflictException(
+      'Approval is blocked because the evaluation does not match the current submitted commit',
+    );
+  }
+  if (evaluation.recommendation === 'changes_requested') {
+    throw new ConflictException(
+      'Approval is blocked because the latest evaluation requested changes',
+    );
+  }
+  if (evaluation.recommendation === 'manual_review') {
+    if (
+      input.manualReviewAcknowledged !== true ||
+      !input.feedback ||
+      input.feedback.trim().length < 20
+    ) {
+      throw new ConflictException(
+        'Manual-review evaluations require acknowledgement and at least 20 characters of review evidence',
+      );
+    }
+    return;
+  }
+  if (evaluation.recommendation !== 'approve') {
+    throw new ConflictException(
+      'Approval is blocked because the evaluation has no approving verdict',
+    );
+  }
+}
+
 @Injectable()
 export class DeliveryService {
   private readonly logger = new Logger(DeliveryService.name);
@@ -94,6 +144,7 @@ export class DeliveryService {
     private readonly usersRepository: Repository<User>,
     private readonly notificationsService: NotificationsService,
     private readonly paymentReleaseRequestsService: PaymentReleaseRequestsService,
+    private readonly githubService: GithubService,
     @Optional()
     @Inject(SUBMISSION_EVALUATION_DISPATCHER)
     private readonly evaluationDispatcher?: SubmissionEvaluationDispatcher,
@@ -182,7 +233,9 @@ export class DeliveryService {
       task: submission.task,
       milestone: submission.milestone,
       repository: submission.repository,
-      latestEvaluationRun: evaluationRuns[0] ?? null,
+      latestEvaluationRun: evaluationRuns[0]
+        ? this.toSubmissionEvaluationView(evaluationRuns[0], requester)
+        : null,
       reviews: [...(submission.reviews ?? [])].sort(
         (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
       ),
@@ -345,6 +398,7 @@ export class DeliveryService {
       }
 
       if (dto.summary !== undefined) submission.summary = dto.summary;
+      await this.ensureImplementationRepository(manager, submission);
       this.assertSubmissionHasEvidence(submission);
       await this.markSubmissionSubmitted(manager, submission);
       submission = await repo.save(submission);
@@ -378,6 +432,10 @@ export class DeliveryService {
     dto: ReviewSubmissionDto,
     requester: JwtPayload,
   ) {
+    const pullRequestAtReview =
+      dto.decision === 'approved'
+        ? await this.assertPullRequestHeadIsCurrent(submissionId, requester)
+        : null;
     const result = await this.dataSource.transaction(async (manager) => {
       const submissionRepo = manager.getRepository(ProjectSubmission);
       const submission = await submissionRepo
@@ -397,6 +455,27 @@ export class DeliveryService {
         );
       }
 
+      const latestEvaluation = await manager
+        .getRepository(EvaluationRun)
+        .createQueryBuilder('evaluation')
+        .where('evaluation.submissionId = :submissionId', {
+          submissionId: submission.id,
+        })
+        .orderBy('evaluation.createdAt', 'DESC')
+        .getOne();
+      if (dto.decision === 'approved') {
+        assertSubmissionApprovalEvaluation(submission, latestEvaluation, dto);
+        if (
+          pullRequestAtReview &&
+          latestEvaluation?.evidenceBundle?.baseCommitSha !==
+            pullRequestAtReview.baseSha
+        ) {
+          throw new ConflictException(
+            'Approval is blocked because the pull-request base changed after its latest evaluation',
+          );
+        }
+      }
+
       const now = new Date();
       const review = await manager.getRepository(ProjectSubmissionReview).save({
         projectId: submission.projectId,
@@ -409,7 +488,15 @@ export class DeliveryService {
         feedback: dto.feedback ?? null,
         requestedChanges: dto.requestedChanges ?? null,
         score: dto.score !== undefined ? dto.score.toFixed(2) : null,
-        metadata: null,
+        metadata: latestEvaluation
+          ? {
+              evaluationRunId: latestEvaluation.id,
+              evaluationStatus: latestEvaluation.status,
+              evaluationRecommendation: latestEvaluation.recommendation,
+              evaluatedCommitSha: latestEvaluation.evaluatedCommitSha,
+              manualReviewAcknowledged: dto.manualReviewAcknowledged === true,
+            }
+          : null,
       });
 
       submission.status = dto.decision;
@@ -484,6 +571,59 @@ export class DeliveryService {
       await this.notifyRevisionCreated(result.revisionRequest);
     }
     return { ...result, releaseRequest, releaseError };
+  }
+
+  private async assertPullRequestHeadIsCurrent(
+    submissionId: string,
+    requester: JwtPayload,
+  ) {
+    const submission = await this.submissionsRepository.findOne({
+      where: { id: submissionId },
+      relations: { repository: true, project: true },
+    });
+    if (!submission) throw new NotFoundException('Submission not found');
+    this.assertReviewerAccess(submission.project, requester);
+    if (submission.submissionType !== 'pull_request') return null;
+    if (!submission.repository || !submission.pullRequestUrl) {
+      throw new ConflictException(
+        'Approval is blocked because the pull request is not linked to the project repository',
+      );
+    }
+    let parts: string[] = [];
+    try {
+      parts = new URL(submission.pullRequestUrl).pathname
+        .split('/')
+        .filter(Boolean);
+    } catch {
+      throw new ConflictException(
+        'Approval is blocked because the pull-request URL is invalid',
+      );
+    }
+    const number = Number(parts[3]);
+    if (!Number.isSafeInteger(number) || number <= 0) {
+      throw new ConflictException(
+        'Approval is blocked because the pull-request URL is invalid',
+      );
+    }
+    const pullRequest = await this.githubService.getPullRequest({
+      owner: submission.repository.owner,
+      repoName: submission.repository.repoName,
+      number,
+    });
+    if (pullRequest.state !== 'open' || pullRequest.draft) {
+      throw new ConflictException(
+        'Approval is blocked until the pull request is open and marked ready for review',
+      );
+    }
+    if (
+      !submission.commitSha ||
+      pullRequest.headSha !== submission.commitSha.toLowerCase()
+    ) {
+      throw new ConflictException(
+        'Approval is blocked because the pull request advanced after its latest evaluation',
+      );
+    }
+    return pullRequest;
   }
 
   async createRevisionRequest(
@@ -661,6 +801,7 @@ export class DeliveryService {
       approvedAt: null,
       rejectedAt: null,
     });
+    await this.ensureImplementationRepository(manager, submission);
 
     const shouldSubmit = submission.status === 'submitted';
     if (shouldSubmit) {
@@ -1110,6 +1251,80 @@ export class DeliveryService {
         'pullRequestUrl is required for pull-request submissions',
       );
     }
+    if (submission.submissionType === 'repository' && !submission.commitSha) {
+      throw new BadRequestException(
+        'commitSha is required for repository submissions',
+      );
+    }
+    if (
+      ['pull_request', 'repository'].includes(submission.submissionType) &&
+      (!submission.repositoryId || !submission.repoUrl)
+    ) {
+      throw new BadRequestException(
+        'GitHub submissions must be linked to the project repository',
+      );
+    }
+  }
+
+  private async ensureImplementationRepository(
+    manager: EntityManager,
+    submission: ProjectSubmission,
+  ) {
+    if (!['pull_request', 'repository'].includes(submission.submissionType)) {
+      return;
+    }
+    const repository = submission.repositoryId
+      ? await manager.getRepository(ProjectRepository).findOne({
+          where: {
+            id: submission.repositoryId,
+            projectId: submission.projectId,
+            status: 'active',
+          },
+        })
+      : await manager.getRepository(ProjectRepository).findOne({
+          where: {
+            projectId: submission.projectId,
+            provider: 'github',
+            status: 'active',
+          },
+        });
+    if (!repository) {
+      throw new ConflictException(
+        'The project needs an active GitHub repository before code can be submitted',
+      );
+    }
+    submission.repositoryId = repository.id;
+    submission.repoUrl = repository.repoUrl;
+    if (
+      submission.submissionType === 'pull_request' &&
+      submission.pullRequestUrl
+    ) {
+      let pullRequestMatches = false;
+      let pullRequestNumber: string | null = null;
+      try {
+        const url = new URL(submission.pullRequestUrl ?? '');
+        const parts = url.pathname.split('/').filter(Boolean);
+        pullRequestMatches =
+          url.protocol === 'https:' &&
+          ['github.com', 'www.github.com'].includes(
+            url.hostname.toLowerCase(),
+          ) &&
+          parts[0]?.toLowerCase() === repository.owner.toLowerCase() &&
+          parts[1]?.replace(/\.git$/i, '').toLowerCase() ===
+            repository.repoName.toLowerCase() &&
+          parts[2] === 'pull' &&
+          /^\d+$/.test(parts[3] ?? '');
+        pullRequestNumber = pullRequestMatches ? (parts[3] ?? null) : null;
+      } catch {
+        pullRequestMatches = false;
+      }
+      if (!pullRequestMatches || !pullRequestNumber) {
+        throw new BadRequestException(
+          'The pull request must belong to the active project GitHub repository',
+        );
+      }
+      submission.pullRequestUrl = `https://github.com/${repository.owner}/${repository.repoName}/pull/${pullRequestNumber}`;
+    }
   }
 
   private async assertRevisionHasResolutionSubmission(
@@ -1223,6 +1438,38 @@ export class DeliveryService {
         ? { pullRequestUrl: dto.pullRequestUrl }
         : {}),
       ...(dto.commitSha !== undefined ? { commitSha: dto.commitSha } : {}),
+    };
+  }
+
+  private toSubmissionEvaluationView(
+    run: EvaluationRun,
+    requester: JwtPayload,
+  ) {
+    if (requester.role === UserRole.ADMIN) return run;
+    const findings = run.findings ? { ...run.findings } : null;
+    if (findings) {
+      delete findings.source;
+      delete findings.auditBundle;
+    }
+    return {
+      id: run.id,
+      projectId: run.projectId,
+      submissionId: run.submissionId,
+      taskId: run.taskId,
+      milestoneId: run.milestoneId,
+      status: run.status,
+      score: run.score,
+      recommendation: run.recommendation,
+      summary: run.summary,
+      findings,
+      acceptanceCoverage: run.acceptanceCoverage,
+      riskFlags: run.riskFlags,
+      trigger: run.trigger,
+      evaluatedCommitSha: run.evaluatedCommitSha,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
     };
   }
 

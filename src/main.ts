@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import cookieParser from 'cookie-parser';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { DatabaseExceptionFilter } from './common/filters/database-exception.filter';
 
 function normalizeOrigin(value?: string) {
@@ -14,7 +15,12 @@ function normalizeOrigin(value?: string) {
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+    bodyParser: false,
+  });
+  app.useBodyParser('json', { limit: '5mb' });
+  app.useBodyParser('urlencoded', { limit: '1mb', extended: true });
   app.setGlobalPrefix('api');
   app.useGlobalPipes(
     new ValidationPipe({

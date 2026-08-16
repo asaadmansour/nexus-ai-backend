@@ -14,6 +14,9 @@ const validConfig = {
   CLOUDINARY_API_SECRET: 'secret',
   STRIPE_SECRET_KEY: 'stripe-secret',
   EVALUATION_SANDBOX_MODE: 'http',
+  GITHUB_TOKEN: 'github-token',
+  GITHUB_OWNER: 'nexus-owner',
+  GITHUB_WEBHOOK_SECRET: 'github-webhook-secret',
 };
 
 describe('environment validation', () => {

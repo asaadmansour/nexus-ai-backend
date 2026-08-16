@@ -5,8 +5,10 @@ import {
   IsString,
   IsUrl,
   IsUUID,
+  Matches,
   MaxLength,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
 
 export const SUBMISSION_TYPES = [
   'pull_request',
@@ -64,8 +66,13 @@ export class CreateSubmissionDto {
   pullRequestUrl?: string;
 
   @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value,
+  )
   @IsString()
-  @MaxLength(80)
+  @Matches(/^[a-fA-F0-9]{40}$/, {
+    message: 'commitSha must be a full 40-character Git commit SHA',
+  })
   commitSha?: string;
 
   @IsOptional()

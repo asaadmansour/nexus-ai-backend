@@ -18,6 +18,6 @@ import { RepositoriesService } from './repositories.service';
     AdminRepositoriesController,
   ],
   providers: [RepositoriesService, GithubService],
-  exports: [RepositoriesService],
+  exports: [RepositoriesService, GithubService],
 })
 export class RepositoriesModule {}

@@ -6,9 +6,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Not, QueryFailedError, Repository } from 'typeorm';
+import { DataSource, In, Not, QueryFailedError, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
-import { AiService } from 'src/agents/ai.service';
 import type { EvaluateSubmissionResult } from 'src/agents/ai.service';
 import type { EvaluateSubmissionDto } from 'src/agents/dto/EvaluateSubmissionDto';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
@@ -23,6 +22,7 @@ import { Project } from 'src/projects/entities/project.entity';
 import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { QueueEvaluationDto } from './dtos/queue-evaluation.dto';
 import { RetryEvaluationDto } from './dtos/retry-evaluation.dto';
@@ -30,19 +30,25 @@ import type {
   SubmissionEvaluationDispatcher,
   SubmissionEvaluationDispatchResult,
 } from 'src/delivery/submission-evaluation-dispatcher';
+import {
+  IMPLEMENTATION_QUALITY_CRITERIA,
+  IMPLEMENTATION_SUBMISSION_TYPES,
+} from './submission-quality-criteria';
+import { ImplementationEvaluationSandboxService } from './implementation-evaluation-sandbox.service';
 
 interface Requester {
   userId: string;
   role: UserRole;
 }
 
-const ACTIVE_RUN_STATUSES = ['queued', 'running', 'completed'];
+const ACTIVE_RUN_STATUSES = ['queued', 'running'];
 
 @Injectable()
 export class EvaluationsService implements SubmissionEvaluationDispatcher {
   private readonly logger = new Logger(EvaluationsService.name);
 
   constructor(
+    private readonly dataSource: DataSource,
     @InjectRepository(EvaluationRun)
     private readonly runRepo: Repository<EvaluationRun>,
     @InjectRepository(ProjectSubmission)
@@ -60,7 +66,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     @InjectRepository(AgentJob)
     private readonly agentJobRepo: Repository<AgentJob>,
     private readonly aiJobsProducer: AiJobsProducer,
-    private readonly aiService: AiService,
+    private readonly implementationSandbox: ImplementationEvaluationSandboxService,
     private readonly notificationsService: NotificationsService,
   ) {}
 
@@ -120,7 +126,8 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           taskId: submission.taskId,
           milestoneId: submission.milestoneId,
           status: 'queued',
-          promptVersion: 'submission-evaluation-v1',
+          promptVersion: 'submission-evaluation-v3',
+          trigger: dto.reason ?? 'manual',
         }),
       );
     } catch (error) {
@@ -160,6 +167,9 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     if (!submission) {
       throw new NotFoundException('Submission for this run no longer exists');
     }
+    if (ACTIVE_RUN_STATUSES.includes(run.status)) {
+      throw new ConflictException('This evaluation run is already active');
+    }
 
     // Another run may already be active for this submission (the partial unique
     // index allows only one). Refuse rather than 409 on the DB constraint.
@@ -170,17 +180,16 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       );
     }
 
-    // Cancel the run's previous agent job so the recovery scanner cannot later
-    // resurrect it as a duplicate of the new one.
-    await this.cancelAgentJob(run.agentJobId, 'superseded_by_retry');
-
-    run.status = 'queued';
-    run.error = null;
-    run.startedAt = null;
-    run.completedAt = null;
-    await this.runRepo.save(run);
-
-    return this.enqueueRun(run, submission);
+    // Keep the previous run immutable: its verdict is part of the consistency
+    // history supplied to the next evaluator. A retry is always a new run.
+    return this.queueForSubmission(
+      submission.id,
+      {
+        mode: 'async',
+        reason: dto.reason ?? `retry_of_${run.id}`,
+      },
+      adminUserId,
+    );
   }
 
   private async enqueueRun(run: EvaluationRun, submission: ProjectSubmission) {
@@ -235,6 +244,15 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
         });
         return;
       }
+      if (
+        !ACTIVE_RUN_STATUSES.includes(run.status) ||
+        run.agentJobId !== data.agentJobId
+      ) {
+        await this.markJobCancelled(data.agentJobId, {
+          reason: 'superseded_evaluation_run',
+        });
+        return;
+      }
 
       const submission = await this.submissionRepo.findOne({
         where: { id: data.submissionId },
@@ -265,17 +283,70 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       run.startedAt = run.startedAt ?? new Date();
       await this.runRepo.save(run);
 
-      const payload = await this.buildEvaluationPayload(submission);
-      const result = await this.aiService.evaluateSubmission(payload);
+      const payload = await this.buildEvaluationPayload(submission, run.id);
+      const execution = await this.implementationSandbox.evaluate(
+        payload,
+        data.agentJobId,
+      );
+      const result = execution.result;
+      const currentRun = await this.runRepo.findOne({
+        where: { id: run.id },
+      });
+      if (
+        !currentRun ||
+        currentRun.status !== 'running' ||
+        currentRun.agentJobId !== data.agentJobId
+      ) {
+        await this.markJobCancelled(data.agentJobId, {
+          reason: 'superseded_during_evaluation',
+        });
+        return;
+      }
 
-      await this.saveEvaluationResult(run, result);
-      await this.notifySubmissionOwner(submission, result);
+      if (
+        execution.evaluatedCommitSha &&
+        submission.commitSha !== execution.evaluatedCommitSha
+      ) {
+        await this.submissionRepo
+          .createQueryBuilder()
+          .update(ProjectSubmission)
+          .set({ commitSha: execution.evaluatedCommitSha })
+          .where('id = :id', { id: submission.id })
+          .andWhere('(commit_sha IS NULL OR commit_sha = :originalCommitSha)', {
+            originalCommitSha: submission.commitSha,
+          })
+          .execute();
+        submission.commitSha = execution.evaluatedCommitSha;
+      }
+
+      currentRun.evaluatedCommitSha = execution.evaluatedCommitSha;
+      await this.applyRevisionVerdict(submission, currentRun, result);
+      await this.saveEvaluationResult(
+        currentRun,
+        result,
+        execution.auditBundle,
+        execution.evaluatedCommitSha,
+      );
+      await this.notifySubmissionOwner(submission, result).catch(
+        (error: unknown) =>
+          this.logger.error(
+            `Could not notify owner of submission ${submission.id}: ${this.getErrorMessage(error)}`,
+          ),
+      );
 
       await this.markJobCompleted(data.agentJobId, {
         evaluationRunId: run.id,
         submissionId: run.submissionId,
-        recommendation: run.recommendation,
+        recommendation: currentRun.recommendation,
       });
+      await this.queuePendingRepositoryEvaluation(
+        submission.id,
+        currentRun.id,
+      ).catch((error: unknown) =>
+        this.logger.error(
+          `Could not queue pending GitHub re-evaluation for submission ${submission.id}: ${this.getErrorMessage(error)}`,
+        ),
+      );
     } catch (error) {
       if (this.isFinalAttempt(attemptsMade, maxAttempts)) {
         await this.markEvaluationRunFailedById(
@@ -283,6 +354,14 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           this.getErrorMessage(error),
         );
         await this.markJobFailed(data.agentJobId, error, maxAttempts);
+        await this.queuePendingRepositoryEvaluation(
+          data.submissionId,
+          data.evaluationRunId,
+        ).catch((queueError: unknown) =>
+          this.logger.error(
+            `Could not recover pending GitHub re-evaluation for submission ${data.submissionId}: ${this.getErrorMessage(queueError)}`,
+          ),
+        );
       } else {
         await this.markJobRetrying(
           data.agentJobId,
@@ -297,23 +376,42 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
 
   private async buildEvaluationPayload(
     submission: ProjectSubmission,
+    currentRunId: string,
   ): Promise<EvaluateSubmissionDto> {
-    const [project, task, brief, spec] = await Promise.all([
+    const [project, task, brief, spec, evaluationHistory] = await Promise.all([
       this.projectRepo.findOne({ where: { id: submission.projectId } }),
       submission.taskId
         ? this.taskRepo.findOne({ where: { id: submission.taskId } })
         : Promise.resolve(null),
       this.briefRepo.findOne({ where: { projectId: submission.projectId } }),
       this.specRepo.findOne({ where: { projectId: submission.projectId } }),
+      submission.taskId
+        ? this.runRepo.find({
+            where: {
+              projectId: submission.projectId,
+              taskId: submission.taskId,
+              status: 'completed',
+              id: Not(currentRunId),
+            },
+            order: { completedAt: 'DESC' },
+            take: 5,
+          })
+        : Promise.resolve([]),
     ]);
+
+    const submissionArtifact = this.buildSubmissionArtifact(submission);
 
     return {
       project: {
         projectId: submission.projectId,
         title: project?.title ?? null,
       },
-      task: this.buildTaskPayload(task, submission),
-      submission: this.buildSubmissionArtifact(submission),
+      task: this.buildTaskPayload(
+        task,
+        submission,
+        submissionArtifact.submissionType,
+      ),
+      submission: submissionArtifact,
       brief: brief
         ? {
             briefId: brief.id,
@@ -332,13 +430,42 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
             conventions: spec.conventions,
           }
         : null,
+      evaluationHistory: evaluationHistory.map((historyRun) => ({
+        evaluationRunId: historyRun.id,
+        submissionId: historyRun.submissionId,
+        commitSha: historyRun.evaluatedCommitSha,
+        score: historyRun.score,
+        recommendation: historyRun.recommendation,
+        summary: historyRun.summary,
+        unmetCriteria: this.evaluationUnmetCriteria(historyRun),
+        completedAt: historyRun.completedAt?.toISOString() ?? null,
+      })),
     };
+  }
+
+  private evaluationUnmetCriteria(run: EvaluationRun): string[] {
+    const items = run.acceptanceCoverage?.items;
+    if (!Array.isArray(items)) return [];
+    return (items as unknown[])
+      .filter(
+        (item: unknown): item is Record<string, unknown> =>
+          Boolean(item) &&
+          typeof item === 'object' &&
+          (item as Record<string, unknown>).met === false,
+      )
+      .map((item) => item.criterion)
+      .filter((criterion): criterion is string => typeof criterion === 'string')
+      .slice(0, 100);
   }
 
   private buildTaskPayload(
     task: ProjectTask | null,
     submission: ProjectSubmission,
+    submissionType: string,
   ): EvaluateSubmissionDto['task'] {
+    const qualityCriteria = IMPLEMENTATION_SUBMISSION_TYPES.has(submissionType)
+      ? [...IMPLEMENTATION_QUALITY_CRITERIA]
+      : [];
     if (!task) {
       return {
         taskId: submission.taskId ?? submission.id,
@@ -347,6 +474,10 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
         isSpecTask: false,
         deliverables: [],
         acceptanceCriteria: [],
+        integrationChecks: [],
+        contractReferences: [],
+        ownedPaths: [],
+        qualityCriteria,
       };
     }
     const metadata = this.asRecord(task.metadata);
@@ -357,6 +488,10 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       isSpecTask: metadata.isSpecTask === true || metadata.type === 'spec',
       deliverables: this.toStringArray(metadata.deliverables),
       acceptanceCriteria: this.toStringArray(task.acceptanceCriteria),
+      integrationChecks: this.toStringArray(metadata.integrationChecks),
+      contractReferences: this.toStringArray(metadata.contractReferences),
+      ownedPaths: this.toStringArray(metadata.ownedPaths),
+      qualityCriteria,
     };
   }
 
@@ -380,6 +515,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       commitSha: submission.commitSha,
       submissionText,
       notes: submission.summary,
+      repositoryId: submission.repositoryId,
     };
   }
 
@@ -399,12 +535,14 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
   private async saveEvaluationResult(
     run: EvaluationRun,
     result: EvaluateSubmissionResult,
+    auditBundle: Record<string, unknown>,
+    evaluatedCommitSha: string | null,
   ) {
-    const recommendation = result.requiresHumanReview
-      ? 'manual_review'
-      : result.passed
-        ? 'approve'
-        : 'changes_requested';
+    const recommendation = !result.passed
+      ? 'changes_requested'
+      : result.requiresHumanReview
+        ? 'manual_review'
+        : 'approve';
     const metCount = result.rubric.filter((item) => item.met).length;
 
     run.status = 'completed';
@@ -419,6 +557,8 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       requiresHumanReview: result.requiresHumanReview,
       revisionNotes: result.revisionNotes,
       rubric: result.rubric,
+      findings: result.findings,
+      risks: result.risks,
       source: result.source,
     };
     run.acceptanceCoverage = {
@@ -431,9 +571,239 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       ...(result.requiresHumanReview ? ['requires_human_review'] : []),
       ...(result.revisionRequested ? ['revision_requested'] : []),
     ];
+    run.evaluatedCommitSha = evaluatedCommitSha;
+    run.evidenceBundle = auditBundle;
     run.modelName = result.source;
     run.completedAt = new Date();
     await this.runRepo.save(run);
+  }
+
+  private async applyRevisionVerdict(
+    evaluatedSubmission: ProjectSubmission,
+    run: EvaluationRun,
+    result: EvaluateSubmissionResult,
+  ) {
+    if (result.passed) return;
+    await this.dataSource.transaction(async (manager) => {
+      const submissionRepo = manager.getRepository(ProjectSubmission);
+      const submission = await submissionRepo
+        .createQueryBuilder('submission')
+        .setLock('pessimistic_write')
+        .where('submission.id = :submissionId', {
+          submissionId: evaluatedSubmission.id,
+        })
+        .getOne();
+      if (
+        !submission ||
+        !['submitted', 'under_review'].includes(submission.status)
+      ) {
+        return;
+      }
+      if (
+        ['pull_request', 'repository'].includes(submission.submissionType) &&
+        (!submission.commitSha ||
+          !run.evaluatedCommitSha ||
+          submission.commitSha.toLowerCase() !==
+            run.evaluatedCommitSha.toLowerCase())
+      ) {
+        return;
+      }
+
+      submission.status = 'changes_requested';
+      await submissionRepo.save(submission);
+      if (submission.taskId) {
+        await manager.getRepository(ProjectTask).update(submission.taskId, {
+          status: 'changes_requested',
+        });
+      }
+
+      const revisionRepo = manager.getRepository(ProjectRevisionRequest);
+      const existing = await revisionRepo.findOne({
+        where: {
+          submissionId: submission.id,
+          status: In(['open', 'in_progress']),
+        },
+      });
+      if (existing) return;
+      const unmetRubric = result.rubric.filter((item) => !item.met);
+      await revisionRepo.save(
+        revisionRepo.create({
+          projectId: submission.projectId,
+          milestoneId: submission.milestoneId,
+          taskId: submission.taskId,
+          submissionId: submission.id,
+          requestedBy: null,
+          assignedToFreelancerProfileId: submission.freelancerProfileId,
+          status: 'open',
+          priority: 'high',
+          title: `Automated revision: ${submission.title ?? 'implementation submission'}`,
+          description:
+            result.revisionNotes ||
+            'Address the unmet evaluation criteria and submit a new version.',
+          requestedChanges: {
+            evaluationRunId: run.id,
+            rubric: unmetRubric,
+            findings: result.findings,
+            risks: result.risks,
+          },
+          metadata: {
+            generatedBy: 'submission_evaluation_agent',
+            evaluationRunId: run.id,
+            evaluatedCommitSha: run.evaluatedCommitSha,
+          },
+          dueAt: null,
+          resolvedAt: null,
+        }),
+      );
+    });
+  }
+
+  async requeueForRepositoryUpdate(input: {
+    submissionId: string;
+    commitSha: string;
+    reason: string;
+  }) {
+    const commitSha = input.commitSha.toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(commitSha)) {
+      throw new ConflictException(
+        'GitHub webhook supplied an invalid commit SHA',
+      );
+    }
+
+    const outcome = await this.dataSource.transaction(async (manager) => {
+      const submissionRepo = manager.getRepository(ProjectSubmission);
+      const submission = await submissionRepo
+        .createQueryBuilder('submission')
+        .setLock('pessimistic_write')
+        .where('submission.id = :submissionId', {
+          submissionId: input.submissionId,
+        })
+        .getOne();
+      if (
+        !submission ||
+        !['submitted', 'under_review'].includes(submission.status)
+      ) {
+        return { kind: 'ignored' as const };
+      }
+
+      const runRepo = manager.getRepository(EvaluationRun);
+      const activeRuns = await runRepo.find({
+        where: {
+          submissionId: submission.id,
+          status: In(ACTIVE_RUN_STATUSES),
+        },
+      });
+      const activeForSameCommit =
+        submission.commitSha?.toLowerCase() === commitSha
+          ? activeRuns[0]
+          : undefined;
+
+      submission.commitSha = commitSha;
+      submission.status = 'under_review';
+      const metadata: Record<string, unknown> = {
+        ...(submission.metadata ?? {}),
+        githubEvaluationTrigger: {
+          reason: input.reason,
+          commitSha,
+          receivedAt: new Date().toISOString(),
+          coalescedIntoEvaluationRunId: activeForSameCommit?.id ?? null,
+        },
+      };
+      if (activeForSameCommit) {
+        metadata.githubEvaluationPendingTrigger = {
+          reason: input.reason,
+          commitSha,
+          evaluationRunId: activeForSameCommit.id,
+          receivedAt: new Date().toISOString(),
+        };
+      } else {
+        delete metadata.githubEvaluationPendingTrigger;
+      }
+      submission.metadata = metadata;
+      await submissionRepo.save(submission);
+
+      // A push can generate several check/status webhooks for the same SHA. Let
+      // the in-flight run finish instead of repeatedly cancelling expensive
+      // sandbox work. A terminal event received after completion still creates
+      // a fresh run so the final GitHub checks are captured.
+      if (activeForSameCommit) {
+        return {
+          kind: 'reused' as const,
+          run: activeForSameCommit,
+        };
+      }
+
+      for (const active of activeRuns) {
+        active.status = 'superseded';
+        active.error = `Superseded by ${input.reason}`;
+        active.completedAt = new Date();
+      }
+      if (activeRuns.length) await runRepo.save(activeRuns);
+      return {
+        kind: 'queue' as const,
+        submissionId: submission.id,
+        agentJobIds: activeRuns
+          .map((active) => active.agentJobId)
+          .filter((id): id is string => Boolean(id)),
+      };
+    });
+
+    if (outcome.kind === 'ignored') return null;
+    if (outcome.kind === 'reused') {
+      return {
+        evaluationRunId: outcome.run.id,
+        agentJobId: outcome.run.agentJobId,
+        status: outcome.run.status,
+        reused: true,
+      };
+    }
+    for (const agentJobId of outcome.agentJobIds) {
+      await this.cancelAgentJob(agentJobId, 'superseded_by_github_update');
+    }
+    return this.queueForSubmission(
+      outcome.submissionId,
+      { mode: 'async', reason: input.reason },
+      'github-webhook',
+    );
+  }
+
+  private async queuePendingRepositoryEvaluation(
+    submissionId: string,
+    completedRunId: string,
+  ) {
+    const pending = await this.dataSource.transaction(async (manager) => {
+      const repository = manager.getRepository(ProjectSubmission);
+      const submission = await repository
+        .createQueryBuilder('submission')
+        .setLock('pessimistic_write')
+        .where('submission.id = :submissionId', { submissionId })
+        .getOne();
+      if (
+        !submission ||
+        !['submitted', 'under_review'].includes(submission.status)
+      ) {
+        return null;
+      }
+      const metadata = { ...(submission.metadata ?? {}) };
+      const value = metadata.githubEvaluationPendingTrigger;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+      }
+      const trigger = value as Record<string, unknown>;
+      if (trigger.evaluationRunId !== completedRunId) return null;
+      const reason =
+        typeof trigger.reason === 'string' ? trigger.reason : 'github_followup';
+      delete metadata.githubEvaluationPendingTrigger;
+      submission.metadata = metadata;
+      await repository.save(submission);
+      return { reason };
+    });
+    if (!pending) return null;
+    return this.queueForSubmission(
+      submissionId,
+      { mode: 'async', reason: `${pending.reason}_followup` },
+      'github-webhook',
+    );
   }
 
   private async notifySubmissionOwner(
@@ -570,6 +940,8 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       requiresHumanReview: Boolean(
         run.riskFlags?.includes('requires_human_review'),
       ),
+      trigger: run.trigger,
+      evaluatedCommitSha: run.evaluatedCommitSha,
       createdAt: run.createdAt,
       completedAt: run.completedAt,
     };
@@ -586,6 +958,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       agentJobId: isAdmin ? run.agentJobId : undefined,
       error: isAdmin ? run.error : undefined,
       startedAt: run.startedAt,
+      evidenceBundle: isAdmin ? run.evidenceBundle : undefined,
     };
   }
 
@@ -596,6 +969,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     if (!findings || isAdmin) return findings;
     const safe = { ...findings };
     delete safe.source;
+    delete safe.auditBundle;
     return safe;
   }
 

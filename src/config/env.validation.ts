@@ -21,6 +21,9 @@ export function validateEnv(config: Env): Env {
       'SMTP_USER',
       'SMTP_PASSWORD',
       'EVALUATION_SANDBOX_MODE',
+      'GITHUB_TOKEN',
+      'GITHUB_OWNER',
+      'GITHUB_WEBHOOK_SECRET',
     );
   }
   const missingKeys = requiredKeys.filter((key) => !config[key]);
@@ -50,6 +53,8 @@ export function validateEnv(config: Env): Env {
       'STRIPE_SECRET_KEY',
       'STRIPE_WEBHOOK_SECRET',
       'SMTP_PASSWORD',
+      'GITHUB_TOKEN',
+      'GITHUB_WEBHOOK_SECRET',
     ].filter((key) => config[key] === 'change-me');
     if (placeholderKeys.length > 0) {
       throw new Error(

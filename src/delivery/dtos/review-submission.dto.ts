@@ -34,4 +34,8 @@ export class ReviewSubmissionDto {
   @IsOptional()
   @IsBoolean()
   releasePayment?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  manualReviewAcknowledged?: boolean;
 }

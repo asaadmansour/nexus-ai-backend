@@ -25,7 +25,7 @@ import { Project } from './project.entity';
 @Index('evaluation_runs_submission_active_uidx', ['submissionId'], {
   unique: true,
   where:
-    "\"submission_id\" IS NOT NULL AND \"status\" IN ('queued', 'running', 'completed')",
+    '"submission_id" IS NOT NULL AND "status" IN (\'queued\', \'running\')',
 })
 export class EvaluationRun {
   @PrimaryGeneratedColumn('uuid')
@@ -116,6 +116,20 @@ export class EvaluationRun {
     nullable: true,
   })
   promptVersion!: string | null;
+
+  @Column({ type: 'varchar', length: 120, nullable: true })
+  trigger!: string | null;
+
+  @Column({
+    name: 'evaluated_commit_sha',
+    type: 'varchar',
+    length: 64,
+    nullable: true,
+  })
+  evaluatedCommitSha!: string | null;
+
+  @Column({ name: 'evidence_bundle', type: 'jsonb', nullable: true })
+  evidenceBundle!: Record<string, unknown> | null;
 
   @Column({ type: 'text', nullable: true })
   error!: string | null;

@@ -15,6 +15,10 @@ import {
 import { GenerateProjectPlanDto } from './dto/GenerateProjectPlanDto';
 import { EvaluateSubmissionDto } from './dto/EvaluateSubmissionDto';
 import { EvaluatePlanningSubmissionDto } from './dto/EvaluatePlanningSubmissionDto';
+import {
+  IMPLEMENTATION_QUALITY_CRITERIA,
+  IMPLEMENTATION_SUBMISSION_TYPES,
+} from 'src/evaluations/submission-quality-criteria';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -222,6 +226,8 @@ export type EvaluateSubmissionResult = {
   revisionNotes: string;
   requiresHumanReview: boolean;
   rubric: EvaluateSubmissionRubricItem[];
+  findings: string[];
+  risks: string[];
   source: 'fastapi' | 'local_mock' | 'local_fallback';
 };
 
@@ -232,6 +238,8 @@ type FastApiEvaluateSubmissionResponse = {
   revisionNotes?: unknown;
   requiresHumanReview?: unknown;
   rubric?: unknown;
+  findings?: unknown;
+  risks?: unknown;
 };
 
 export type PlanningEvaluationCheck = {
@@ -1036,6 +1044,12 @@ export class AiService {
     return this.normalizeEvaluateSubmissionResult(result, 'fastapi');
   }
 
+  normalizeEvaluateSubmissionSandboxResult(
+    result: Record<string, unknown>,
+  ): EvaluateSubmissionResult {
+    return this.normalizeEvaluateSubmissionResult(result, 'fastapi');
+  }
+
   async evaluatePlanningSubmission(
     dto: EvaluatePlanningSubmissionDto,
   ): Promise<PlanningEvaluationResult> {
@@ -1270,22 +1284,30 @@ export class AiService {
     source: EvaluateSubmissionResult['source'],
   ): EvaluateSubmissionResult {
     const rubric = this.normalizeEvaluationRubric(result.rubric);
-    const passed = result.passed === true;
+    const passed =
+      result.passed === true &&
+      rubric.length > 0 &&
+      rubric.every((item) => item.met);
     const revisionRequested =
       result.revisionRequested === true ||
       (!passed && rubric.some((item) => !item.met));
 
     return {
       passed,
-      score: this.clampScore(this.toNumber(result.score) ?? 0),
+      score: passed
+        ? this.clampScore(this.toNumber(result.score) ?? 0)
+        : Math.min(69, this.clampScore(this.toNumber(result.score) ?? 0)),
       revisionRequested,
       revisionNotes:
         this.optionalString(result.revisionNotes) ??
         (revisionRequested
           ? 'Revision requested. See rubric for unmet criteria.'
           : ''),
-      requiresHumanReview: result.requiresHumanReview === true,
+      requiresHumanReview:
+        result.requiresHumanReview === true || rubric.length === 0,
       rubric,
+      findings: this.toStringArray(result.findings),
+      risks: this.toStringArray(result.risks),
       source,
     };
   }
@@ -1309,26 +1331,49 @@ export class AiService {
     dto: EvaluateSubmissionDto,
     source: EvaluateSubmissionResult['source'] = 'local_mock',
   ): EvaluateSubmissionResult {
-    const criteria = this.ensureStringArray(dto.task.acceptanceCriteria, [
-      'Deliverable meets the task description',
-      'Work is complete and reviewable',
-    ]);
+    const isImplementationSubmission = IMPLEMENTATION_SUBMISSION_TYPES.has(
+      dto.submission.submissionType,
+    );
+    const configuredQualityCriteria = this.toStringArray(
+      dto.task.qualityCriteria,
+    );
+    const criteria = Array.from(
+      new Set([
+        ...this.toStringArray(dto.task.acceptanceCriteria),
+        ...this.toStringArray(dto.task.deliverables),
+        ...this.toStringArray(dto.task.integrationChecks),
+        ...(configuredQualityCriteria.length
+          ? configuredQualityCriteria
+          : isImplementationSubmission
+            ? [...IMPLEMENTATION_QUALITY_CRITERIA]
+            : []),
+      ]),
+    );
+    const effectiveCriteria = criteria.length
+      ? criteria
+      : [
+          'Deliverable meets the task description',
+          'Work is complete and reviewable',
+        ];
     const hasArtifact = Boolean(
       this.optionalString(dto.submission.submissionUrl) ??
       this.optionalString(dto.submission.repositoryUrl) ??
       this.optionalString(dto.submission.pullRequestUrl) ??
       this.optionalString(dto.submission.submissionText),
     );
-    const rubric: EvaluateSubmissionRubricItem[] = criteria.map(
+    const canVerify = hasArtifact && !isImplementationSubmission;
+    const rubric: EvaluateSubmissionRubricItem[] = effectiveCriteria.map(
       (criterion) => ({
         criterion,
-        met: hasArtifact,
-        evidence: hasArtifact
+        met: canVerify,
+        evidence: canVerify
           ? 'Mock evaluation: submission artifact present.'
-          : 'Mock evaluation: no reviewable artifact was provided.',
+          : isImplementationSubmission
+            ? 'Mock evaluation cannot inspect source code or test evidence for this criterion.'
+            : 'Mock evaluation: no reviewable artifact was provided.',
       }),
     );
-    const passed = hasArtifact;
+    const passed = canVerify;
 
     return {
       passed,
@@ -1336,9 +1381,15 @@ export class AiService {
       revisionRequested: !passed,
       revisionNotes: passed
         ? ''
-        : 'Mock evaluation: attach the deliverable (URL, repository, or written submission) before resubmitting.',
-      requiresHumanReview: dto.task.isSpecTask,
+        : isImplementationSubmission
+          ? 'Mock evaluation cannot verify implementation requirements or engineering quality. Use the evaluation service or complete a human code review.'
+          : 'Mock evaluation: attach the deliverable (URL, repository, or written submission) before resubmitting.',
+      requiresHumanReview: dto.task.isSpecTask || isImplementationSubmission,
       rubric,
+      findings: [],
+      risks: isImplementationSubmission
+        ? ['Implementation evidence was not inspected in mock mode.']
+        : [],
       source,
     };
   }

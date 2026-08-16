@@ -12,6 +12,7 @@ import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { EvaluationsModule } from 'src/evaluations/evaluations.module';
+import { RepositoriesModule } from 'src/repositories/repositories.module';
 import {
   AdminSubmissionsController,
   FreelancerSubmissionsController,
@@ -27,6 +28,7 @@ import { DeliveryService } from './delivery.service';
     NotificationsModule,
     PaymentsModule,
     EvaluationsModule,
+    RepositoriesModule,
     TypeOrmModule.forFeature([
       Project,
       ProjectMilestone,

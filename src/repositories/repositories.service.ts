@@ -65,6 +65,8 @@ export class RepositoriesService {
     const project = await this.getProject(projectId);
     const existing = await this.findProjectRepository(projectId);
     if (existing && existing.status !== 'failed') {
+      await this.syncEvaluationWebhook(existing);
+      await this.repoRepo.save(existing);
       return this.toRepositoryResponse(existing);
     }
 
@@ -102,6 +104,7 @@ export class RepositoriesService {
       row.status = 'active';
       row.lastSyncedAt = new Date();
       row.metadata = { visibility };
+      await this.syncEvaluationWebhook(row);
     } catch (error) {
       // Never silently mock: keep the failure visible and retryable.
       const message = error instanceof Error ? error.message : String(error);
@@ -113,6 +116,51 @@ export class RepositoriesService {
     }
 
     return this.toRepositoryResponse(await this.repoRepo.save(row));
+  }
+
+  private async syncEvaluationWebhook(repository: ProjectRepository) {
+    try {
+      const webhook = await this.github.ensureEvaluationWebhook({
+        owner: repository.owner,
+        repoName: repository.repoName,
+      });
+      repository.metadata = {
+        ...(repository.metadata ?? {}),
+        evaluationWebhook: {
+          status: webhook.active ? 'active' : 'inactive',
+          id: webhook.id,
+          url: webhook.url,
+          syncedAt: new Date().toISOString(),
+        },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        `GitHub evaluation webhook sync failed for ${repository.owner}/${repository.repoName}: ${message}`,
+      );
+      repository.metadata = {
+        ...(repository.metadata ?? {}),
+        evaluationWebhook: {
+          status: 'failed',
+          error: message,
+          syncedAt: new Date().toISOString(),
+        },
+      };
+    }
+  }
+
+  async syncProjectEvaluationWebhook(projectId: string) {
+    const repository = await this.findProjectRepository(projectId);
+    if (!repository) {
+      throw new NotFoundException('This project has no repository yet');
+    }
+    if (repository.status !== 'active') {
+      throw new BadRequestException(
+        'The project repository must be active before its webhook can be synced',
+      );
+    }
+    await this.syncEvaluationWebhook(repository);
+    return this.toRepositoryResponse(await this.repoRepo.save(repository));
   }
 
   async getProjectRepository(projectId: string, requester: Requester) {
@@ -185,6 +233,8 @@ export class RepositoriesService {
         'The project repository is not active yet; create or retry it first',
       );
     }
+    await this.syncEvaluationWebhook(repository);
+    await this.repoRepo.save(repository);
 
     const permission = dto.permission ?? DEFAULT_PERMISSION;
     const profileIds = await this.resolveCollaboratorProfileIds(projectId, dto);
@@ -427,6 +477,9 @@ export class RepositoriesService {
       defaultBranch: row.defaultBranch,
       status: row.status,
       error: (row.metadata?.error as string | undefined) ?? null,
+      evaluationWebhook:
+        (row.metadata?.evaluationWebhook as
+          Record<string, unknown> | undefined) ?? null,
       lastSyncedAt: row.lastSyncedAt,
       createdAt: row.createdAt,
     };

@@ -72,6 +72,16 @@ export class ProjectRepositoryController {
     );
     return { status: 'success', data };
   }
+
+  @Post('evaluation-webhook/sync')
+  @Roles(UserRole.ADMIN)
+  async syncEvaluationWebhook(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+  ) {
+    const data =
+      await this.repositoriesService.syncProjectEvaluationWebhook(projectId);
+    return { status: 'success', data };
+  }
 }
 
 @Controller('repository-collaborators')

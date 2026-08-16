@@ -7,6 +7,10 @@ export interface EvaluateSubmissionTask {
   isSpecTask: boolean;
   deliverables?: string[];
   acceptanceCriteria?: string[];
+  integrationChecks?: string[];
+  contractReferences?: string[];
+  ownedPaths?: string[];
+  qualityCriteria?: string[];
 }
 
 export interface EvaluateSubmissionArtifact {
@@ -18,6 +22,12 @@ export interface EvaluateSubmissionArtifact {
   commitSha?: string | null;
   submissionText?: string | null;
   notes?: string | null;
+  repositoryId?: string | null;
+  repositoryOwner?: string | null;
+  repositoryName?: string | null;
+  pullRequestNumber?: number | null;
+  baseCommitSha?: string | null;
+  inspection?: Record<string, unknown> | null;
 }
 
 export class EvaluateSubmissionDto {
@@ -26,4 +36,14 @@ export class EvaluateSubmissionDto {
   submission!: EvaluateSubmissionArtifact;
   brief?: Record<string, unknown> | null;
   projectSpec?: Record<string, unknown> | null;
+  evaluationHistory?: Array<{
+    evaluationRunId: string;
+    submissionId: string | null;
+    commitSha: string | null;
+    score: string | null;
+    recommendation: string | null;
+    summary: string | null;
+    unmetCriteria: string[];
+    completedAt: string | null;
+  }>;
 }
