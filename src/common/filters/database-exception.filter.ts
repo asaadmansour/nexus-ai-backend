@@ -67,6 +67,12 @@ export class DatabaseExceptionFilter implements ExceptionFilter<QueryFailedError
       return 'This phone number is already registered.';
     }
 
+    if (
+      constraint === 'project_role_assignments_planning_freelancer_uidx'
+    ) {
+      return 'Architecture and UI/UX planning roles must be assigned to different freelancers.';
+    }
+
     return 'This record already exists.';
   }
 }

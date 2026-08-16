@@ -113,6 +113,12 @@ export class RoleAssignmentsService {
 
     const assignment = await this.dataSource.transaction(async (manager) => {
       await this.assertNoActiveAssignment(manager, projectId, dto.roleKey);
+      await this.assertPlanningRoleSeparation(
+        manager,
+        projectId,
+        freelancerProfileId!,
+        dto.roleKey,
+      );
 
       const created = await manager.save(
         ProjectRoleAssignment,
@@ -527,6 +533,27 @@ export class RoleAssignmentsService {
     if (existing && ACTIVE_STATUSES.includes(existing.status)) {
       throw new ConflictException(
         `An active ${roleKey} planning assignment already exists for this project`,
+      );
+    }
+  }
+
+  private async assertPlanningRoleSeparation(
+    manager: EntityManager,
+    projectId: string,
+    freelancerProfileId: string,
+    roleKey: string,
+  ) {
+    const conflicting = await manager.findOne(ProjectRoleAssignment, {
+      where: {
+        projectId,
+        phase: 'planning',
+        freelancerProfileId,
+        status: In(['assigned', 'accepted', 'in_progress', 'completed']),
+      },
+    });
+    if (conflicting && conflicting.roleKey !== roleKey) {
+      throw new ConflictException(
+        'Architecture and UI/UX planning roles must be assigned to different freelancers',
       );
     }
   }

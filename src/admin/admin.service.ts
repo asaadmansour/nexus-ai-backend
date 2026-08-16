@@ -23,6 +23,7 @@ import { UpdateAdminUserDto } from './dtos/update-admin-user.dto';
 import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
 import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
 import { UpdateFreelancerSkillScoreDto } from './dtos/update-freelancer-skill-score.dto';
+import { AiOperationsMonitorService } from './ai-operations-monitor.service';
 
 @Injectable()
 export class AdminService {
@@ -31,8 +32,11 @@ export class AdminService {
     'cv_extraction',
     'assessment_generation',
     'assessment_grading',
+    'profile_embedding',
     'matching',
     'project_plan_generation',
+    'planning_submission_evaluation',
+    'submission_evaluation',
     'evaluation',
   ];
   private readonly warningEventTypes = [
@@ -71,6 +75,7 @@ export class AdminService {
     private refreshTokenRepository: Repository<RefreshToken>,
     private readonly notificationsService: NotificationsService,
     private readonly aiJobRecoveryService: AiJobRecoveryService,
+    private readonly aiOperationsMonitorService: AiOperationsMonitorService,
   ) {}
 
   private getAiRecommendation(feedback: Record<string, unknown> | null) {
@@ -1156,7 +1161,11 @@ export class AdminService {
       failing: healthTotals.failing,
     };
 
-    return { agents, totals };
+    return {
+      agents,
+      totals,
+      operations: await this.aiOperationsMonitorService.snapshot(),
+    };
   }
 
   // ===== Agent Jobs =====

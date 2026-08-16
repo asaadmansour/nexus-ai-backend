@@ -25,6 +25,42 @@ interface Requester {
   role: UserRole;
 }
 
+export function assertPlanningApprovalPolicy(
+  submission: Pick<
+    ProjectPlanningSubmission,
+    'evaluationStatus' | 'evaluationRecommendation'
+  >,
+  dto: ReviewPlanningSubmissionDto,
+) {
+  if (dto.status !== 'approved') {
+    if (dto.aiOverride || dto.aiOverrideReason) {
+      throw new BadRequestException(
+        'AI override fields are only valid when approving a submission',
+      );
+    }
+    return false;
+  }
+  if (submission.evaluationStatus !== 'completed') {
+    throw new ConflictException(
+      'Admin approval requires a completed AI evaluation',
+    );
+  }
+  if (submission.evaluationRecommendation === 'approve') {
+    if (dto.aiOverride || dto.aiOverrideReason) {
+      throw new BadRequestException(
+        'AI override is unnecessary when the evaluation recommends approval',
+      );
+    }
+    return false;
+  }
+  if (!dto.aiOverride || (dto.aiOverrideReason?.trim().length ?? 0) < 20) {
+    throw new ConflictException(
+      'Approving against the AI recommendation requires an explicit override reason of at least 20 characters',
+    );
+  }
+  return true;
+}
+
 const ROLE_TO_SUBMISSION_TYPE: Record<string, string> = {
   architect: 'architecture',
   ui_ux: 'ui_ux',
@@ -258,7 +294,23 @@ export class PlanningSubmissionsService {
 
     const detail = this.toDetail(submission, submission.freelancerProfile);
     if (requester.role === UserRole.CUSTOMER) {
-      return { ...detail, adminNotes: undefined };
+      return {
+        ...detail,
+        adminNotes: undefined,
+        evaluationAuditBundle: this.publicAuditBundle(
+          submission.evaluationAuditBundle,
+        ),
+        aiOverriddenBy: undefined,
+      };
+    }
+    if (requester.role === UserRole.FREELANCER) {
+      return {
+        ...detail,
+        evaluationAuditBundle: this.publicAuditBundle(
+          submission.evaluationAuditBundle,
+        ),
+        aiOverriddenBy: undefined,
+      };
     }
     return detail;
   }
@@ -310,20 +362,18 @@ export class PlanningSubmissionsService {
         );
       }
 
-      if (
-        dto.status === 'approved' &&
-        (submission.evaluationStatus !== 'completed' ||
-          submission.evaluationRecommendation !== 'approve')
-      ) {
-        throw new ConflictException(
-          'Admin approval requires a completed AI evaluation with an approve recommendation',
-        );
-      }
+      const isAiOverride = assertPlanningApprovalPolicy(submission, dto);
 
       submission.status = dto.status;
       submission.adminNotes = dto.adminNotes ?? submission.adminNotes ?? null;
       submission.reviewedBy = adminUserId;
       submission.reviewedAt = new Date();
+      submission.aiOverride = isAiOverride;
+      submission.aiOverrideReason = isAiOverride
+        ? dto.aiOverrideReason!.trim()
+        : null;
+      submission.aiOverriddenBy = isAiOverride ? adminUserId : null;
+      submission.aiOverriddenAt = isAiOverride ? new Date() : null;
       await manager.save(ProjectPlanningSubmission, submission);
 
       let planUnlocked = false;
@@ -371,6 +421,10 @@ export class PlanningSubmissionsService {
       status: result.submission.status,
       reviewedBy: result.submission.reviewedBy,
       reviewedAt: result.submission.reviewedAt,
+      aiOverride: result.submission.aiOverride,
+      aiOverrideReason: result.submission.aiOverrideReason,
+      aiOverriddenBy: result.submission.aiOverriddenBy,
+      aiOverriddenAt: result.submission.aiOverriddenAt,
       planGenerationUnlocked: result.planUnlocked,
       planGenerationJob,
       uiuxEvaluationJob,
@@ -589,8 +643,13 @@ export class PlanningSubmissionsService {
       reviewedBy: submission.reviewedBy,
       evaluationRequirements: submission.evaluationRequirements,
       evaluationResult: submission.evaluationResult,
+      evaluationAuditBundle: submission.evaluationAuditBundle,
       evaluationError: submission.evaluationError,
       evaluationAgentJobId: submission.evaluationAgentJobId,
+      aiOverride: submission.aiOverride,
+      aiOverrideReason: submission.aiOverrideReason,
+      aiOverriddenBy: submission.aiOverriddenBy,
+      aiOverriddenAt: submission.aiOverriddenAt,
     };
   }
 
@@ -601,6 +660,13 @@ export class PlanningSubmissionsService {
       name: this.fullName(profile.user),
       headline: profile.headline,
     };
+  }
+
+  private publicAuditBundle(bundle: Record<string, unknown> | null) {
+    if (!bundle) return null;
+    const copy = { ...bundle };
+    delete copy.sandboxLog;
+    return copy;
   }
 
   private fullName(user?: { firstName?: string; lastName?: string } | null) {

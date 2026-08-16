@@ -6,7 +6,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { readFile } from 'node:fs/promises';
 import { request as httpsRequest } from 'node:https';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   AiService,
   type PlanningEvaluationResult,
@@ -14,6 +14,12 @@ import {
 import type { EvaluatePlanningSubmissionDto } from 'src/agents/dto/EvaluatePlanningSubmissionDto';
 
 const RESULT_MARKER = 'NEXUS_EVALUATION_RESULT:';
+const AUDIT_MARKER = 'NEXUS_EVALUATION_AUDIT:';
+
+export interface PlanningEvaluationExecution {
+  result: PlanningEvaluationResult;
+  auditBundle: Record<string, unknown>;
+}
 
 @Injectable()
 export class PlanningEvaluationSandboxService {
@@ -27,19 +33,41 @@ export class PlanningEvaluationSandboxService {
   async evaluate(
     dto: EvaluatePlanningSubmissionDto,
     agentJobId: string,
-  ): Promise<PlanningEvaluationResult> {
+  ): Promise<PlanningEvaluationExecution> {
     if (this.config.get<string>('EVALUATION_SANDBOX_MODE') !== 'kubernetes') {
-      return this.aiService.evaluatePlanningSubmission(dto);
+      const result = await this.aiService.evaluatePlanningSubmission(dto);
+      return {
+        result,
+        auditBundle: this.buildAuditBundle(dto, result, agentJobId, 'http'),
+      };
     }
 
-    const raw = await this.runKubernetesJob(dto, agentJobId);
-    return this.aiService.normalizePlanningEvaluationSandboxResult(dto, raw);
+    const execution = await this.runKubernetesJob(dto, agentJobId);
+    const result = this.aiService.normalizePlanningEvaluationSandboxResult(
+      dto,
+      execution.raw,
+    );
+    return {
+      result,
+      auditBundle: this.buildAuditBundle(
+        dto,
+        result,
+        agentJobId,
+        'kubernetes',
+        execution.logs,
+        execution.audit,
+      ),
+    };
   }
 
   private async runKubernetesJob(
     dto: EvaluatePlanningSubmissionDto,
     agentJobId: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<{
+    raw: Record<string, unknown>;
+    logs: string;
+    audit: Record<string, unknown>;
+  }> {
     const namespace = await this.namespace();
     const jobName = `planning-eval-${agentJobId.replaceAll('-', '').slice(0, 20)}-${randomUUID().slice(0, 8)}`;
     const encoded = Buffer.from(JSON.stringify(dto)).toString('base64');
@@ -181,7 +209,11 @@ export class PlanningEvaluationSandboxService {
   private async waitForResult(
     namespace: string,
     jobName: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<{
+    raw: Record<string, unknown>;
+    logs: string;
+    audit: Record<string, unknown>;
+  }> {
     const timeoutMs = Number(
       this.config.get<string>('EVALUATION_SANDBOX_TIMEOUT_MS') ?? 300_000,
     );
@@ -193,7 +225,11 @@ export class PlanningEvaluationSandboxService {
       const status = this.asRecord(job.status);
       if (Number(status.succeeded ?? 0) > 0) {
         const logs = await this.podLogs(namespace, jobName);
-        return this.parseResult(logs);
+        return {
+          raw: this.parseResult(logs),
+          logs,
+          audit: this.parseAudit(logs),
+        };
       }
       if (Number(status.failed ?? 0) > 0) {
         const logs = await this.podLogs(namespace, jobName).catch(() => '');
@@ -252,6 +288,133 @@ export class PlanningEvaluationSandboxService {
         `Evaluation sandbox returned an invalid result: ${this.errorMessage(error)}`,
       );
     }
+  }
+
+  private parseAudit(logs: string): Record<string, unknown> {
+    const line = logs
+      .split(/\r?\n/)
+      .reverse()
+      .find((candidate) => candidate.startsWith(AUDIT_MARKER));
+    if (!line) return {};
+    try {
+      const value: unknown = JSON.parse(
+        Buffer.from(line.slice(AUDIT_MARKER.length), 'base64').toString(
+          'utf8',
+        ),
+      );
+      return this.asRecord(value);
+    } catch {
+      return {};
+    }
+  }
+
+  private buildAuditBundle(
+    dto: EvaluatePlanningSubmissionDto,
+    result: PlanningEvaluationResult,
+    agentJobId: string,
+    executionMode: 'http' | 'kubernetes',
+    logs = '',
+    runnerAudit: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    const serializedVerdict = this.canonicalJson(result);
+    const artifactManifest = result.artifactManifest ?? {};
+    const artifactManifestHash =
+      result.artifactManifestHash ||
+      this.hash(this.canonicalJson(artifactManifest));
+    const evaluationInputHash =
+      result.evaluationInputHash || this.hash(this.canonicalJson(dto));
+    const contextHash =
+      result.contextHash ||
+      this.hash(
+        this.canonicalJson({
+          project: dto.project,
+          brief: dto.brief,
+          requirements: dto.requirements,
+          approvedArchitecture: dto.approvedArchitecture,
+        }),
+      );
+    const sanitizedLogs = this.sanitizeLogs(logs);
+    const summaryMarkdown =
+      typeof runnerAudit.summaryMarkdown === 'string'
+        ? runnerAudit.summaryMarkdown
+        : this.summaryMarkdown(result);
+    return {
+      schemaVersion: 1,
+      capturedAt: new Date().toISOString(),
+      executionMode,
+      agentJobId,
+      submissionId: dto.submission.submissionId,
+      submissionVersion: dto.submission.submissionVersion,
+      summaryMarkdown,
+      verdict: result,
+      verdictSha256: this.hash(serializedVerdict),
+      artifactManifest,
+      artifactManifestHash,
+      evaluationInputHash,
+      contextHash,
+      promptVersion: result.promptVersion,
+      modelName: result.modelName,
+      runnerVerdictSha256:
+        typeof runnerAudit.verdictSha256 === 'string'
+          ? runnerAudit.verdictSha256
+          : null,
+      sandboxLog: logs
+        ? {
+            sha256: this.hash(logs),
+            excerpt: sanitizedLogs.value,
+            truncated: sanitizedLogs.truncated,
+            redacted: sanitizedLogs.redacted,
+          }
+        : null,
+    };
+  }
+
+  private summaryMarkdown(result: PlanningEvaluationResult) {
+    const issues = result.openIssues?.length
+      ? result.openIssues
+          .map((issue) => `- [${issue.criterionKey}] ${issue.message}`)
+          .join('\n')
+      : '- None';
+    return `# Planning evaluation\n\n- Recommendation: ${result.recommendation}\n- Score: ${result.score}\n- Input hash: ${result.evaluationInputHash}\n\n${result.summary}\n\n## Open issues\n${issues}\n`;
+  }
+
+  private sanitizeLogs(logs: string) {
+    let value = logs
+      .replace(
+        new RegExp(`(${RESULT_MARKER}|${AUDIT_MARKER})[^\\r\\n]+`, 'g'),
+        '$1[redacted structured payload]',
+      )
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]')
+      .replace(
+        /(api[_-]?key|token|secret)(\s*[=:]\s*)[^\s,;]+/gi,
+        '$1$2[redacted]',
+      );
+    const redacted = value !== logs;
+    const truncated = value.length > 20_000;
+    if (truncated) value = value.slice(-20_000);
+    return { value, truncated, redacted };
+  }
+
+  private hash(value: string) {
+    return createHash('sha256').update(value).digest('hex');
+  }
+
+  private canonicalJson(value: unknown): string {
+    if (value === null || typeof value !== 'object') {
+      return JSON.stringify(value) ?? 'null';
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.canonicalJson(item)).join(',')}]`;
+    }
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${this.canonicalJson(record[key])}`,
+      )
+      .join(',')}}`;
   }
 
   private async resolveAiImage(namespace: string) {

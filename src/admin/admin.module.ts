@@ -14,6 +14,7 @@ import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { NotificationsModule } from 'src/notifications/notifications.module';
 import { QueuesModule } from 'src/queues/queues.module';
+import { AiOperationsMonitorService } from './ai-operations-monitor.service';
 
 @Module({
   imports: [
@@ -33,6 +34,6 @@ import { QueuesModule } from 'src/queues/queues.module';
     ]),
   ],
   controllers: [AdminController],
-  providers: [AdminService],
+  providers: [AdminService, AiOperationsMonitorService],
 })
 export class AdminModule {}

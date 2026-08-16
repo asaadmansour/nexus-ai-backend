@@ -54,7 +54,14 @@ describe('Planning evaluation sandbox', () => {
       ai as unknown as AiService,
     );
 
-    await expect(service.evaluate(dto, 'job')).resolves.toBe(expected);
+    await expect(service.evaluate(dto, 'job')).resolves.toMatchObject({
+      result: expected,
+      auditBundle: {
+        schemaVersion: 1,
+        executionMode: 'http',
+        agentJobId: 'job',
+      },
+    });
     expect(ai.evaluatePlanningSubmission).toHaveBeenCalledWith(dto);
   });
 
@@ -120,6 +127,37 @@ describe('Planning evaluation sandbox', () => {
     ).toEqual({ score: 88 });
     expect(() => service.parseResult('{"score":100}')).toThrow(
       'without a structured result',
+    );
+  });
+
+  it('persists runner summary while redacting structured payloads and tokens', () => {
+    const service = createService() as unknown as {
+      parseAudit: (logs: string) => Record<string, unknown>;
+      sanitizeLogs: (logs: string) => {
+        value: string;
+        redacted: boolean;
+      };
+    };
+    const audit = Buffer.from(
+      JSON.stringify({ summaryMarkdown: '# Durable verdict' }),
+    ).toString('base64');
+    expect(
+      service.parseAudit(`NEXUS_EVALUATION_AUDIT:${audit}\n`),
+    ).toMatchObject({ summaryMarkdown: '# Durable verdict' });
+    const sanitized = service.sanitizeLogs(
+      `Bearer secret-token\nNEXUS_EVALUATION_AUDIT:${audit}\n`,
+    );
+    expect(sanitized.redacted).toBe(true);
+    expect(sanitized.value).not.toContain('secret-token');
+    expect(sanitized.value).not.toContain(audit);
+  });
+
+  it('canonicalizes audit JSON independently of object key order', () => {
+    const service = createService() as unknown as {
+      canonicalJson: (value: unknown) => string;
+    };
+    expect(service.canonicalJson({ b: 2, a: { d: 4, c: 3 } })).toBe(
+      service.canonicalJson({ a: { c: 3, d: 4 }, b: 2 }),
     );
   });
 

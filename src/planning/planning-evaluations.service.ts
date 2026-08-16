@@ -206,6 +206,9 @@ export class PlanningEvaluationsService {
     const requirements = buildPlanningEvaluationRequirements(type, brief);
     const existingSnapshot = this.asRecord(submission.evaluationRequirements);
     const preservedVerdict = this.asRecord(existingSnapshot.previousVerdict);
+    const preservedAuditBundle = this.asRecord(
+      existingSnapshot.previousAuditBundle,
+    );
     const previousVerdict =
       submission.evaluationResult ??
       (Object.keys(preservedVerdict).length > 0 ? preservedVerdict : null);
@@ -214,6 +217,11 @@ export class PlanningEvaluationsService {
       submissionType: type,
       requirements,
       previousVerdict,
+      previousAuditBundle:
+        submission.evaluationAuditBundle ??
+        (Object.keys(preservedAuditBundle).length > 0
+          ? preservedAuditBundle
+          : null),
     };
 
     if (
@@ -244,6 +252,7 @@ export class PlanningEvaluationsService {
     submission.evaluationScore = null;
     submission.evaluationRecommendation = null;
     submission.evaluationResult = null;
+    submission.evaluationAuditBundle = null;
     submission.evaluationError = null;
     submission.evaluatedAt = null;
     await this.submissionRepo.save(submission);
@@ -325,20 +334,27 @@ export class PlanningEvaluationsService {
 
     try {
       const payload = await this.buildPayload(submission);
-      const result = await this.evaluationSandbox.evaluate(
+      const execution = await this.evaluationSandbox.evaluate(
         payload,
         data.agentJobId,
       );
-      await this.saveResult(submission, result);
-      await this.markJobCompleted(data.agentJobId, result);
+      await this.saveResult(
+        submission,
+        execution.result,
+        execution.auditBundle,
+      );
+      await this.markJobCompleted(data.agentJobId, {
+        result: execution.result,
+        auditBundle: execution.auditBundle,
+      });
       try {
-        await this.notifyOwner(submission, result);
+        await this.notifyOwner(submission, execution.result);
       } catch (error) {
         this.logger.warn(
           `Planning evaluation ${submission.id} completed but notification failed: ${this.errorMessage(error)}`,
         );
       }
-      return result;
+      return execution.result;
     } catch (error) {
       const attempt = attemptsMade + 1;
       if (attempt >= maxAttempts) {
@@ -446,16 +462,15 @@ export class PlanningEvaluationsService {
   private async saveResult(
     submission: ProjectPlanningSubmission,
     result: PlanningEvaluationResult,
+    auditBundle: Record<string, unknown>,
   ) {
     submission.evaluationStatus = 'completed';
     submission.evaluationScore = result.score.toFixed(2);
     submission.evaluationRecommendation = result.recommendation;
     submission.evaluationResult = result;
+    submission.evaluationAuditBundle = auditBundle;
     submission.evaluationError = null;
     submission.evaluatedAt = new Date();
-    if (result.recommendation !== 'approve') {
-      submission.status = 'changes_requested';
-    }
     await this.submissionRepo.save(submission);
   }
 
@@ -471,11 +486,11 @@ export class PlanningEvaluationsService {
       title:
         result.recommendation === 'approve'
           ? 'Planning deliverable ready for admin review'
-          : 'Planning deliverable needs revision',
+          : 'AI planning review completed',
       body:
         result.recommendation === 'approve'
           ? `AI evaluation passed with score ${result.score}. An admin will make the final decision.`
-          : result.revisionItems.slice(0, 3).join(' ') || result.summary,
+          : `AI identified possible revisions. An admin will make the final decision. ${result.revisionItems.slice(0, 2).join(' ') || result.summary}`,
     });
   }
 
@@ -507,15 +522,16 @@ export class PlanningEvaluationsService {
 
   private async markJobCompleted(
     agentJobId: string,
-    output: PlanningEvaluationResult,
+    output: Record<string, unknown>,
   ) {
-    await this.agentJobRepo.update(agentJobId, {
-      status: 'completed',
-      output,
-      completedAt: new Date(),
-      lockedAt: null,
-      error: null,
-    });
+    const job = await this.agentJobRepo.findOne({ where: { id: agentJobId } });
+    if (!job) return;
+    job.status = 'completed';
+    job.output = output;
+    job.completedAt = new Date();
+    job.lockedAt = null;
+    job.error = null;
+    await this.agentJobRepo.save(job);
   }
 
   private async markJobFailed(

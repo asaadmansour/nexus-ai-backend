@@ -1,11 +1,18 @@
 import { OnWorkerEvent, Processor } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
-import { AI_JOB_RETRY, JOBS, QUEUES } from 'src/queues/queue.constants';
+import {
+  AI_JOB_RETRY,
+  AI_QUEUE_CONCURRENCY,
+  JOBS,
+  QUEUES,
+} from 'src/queues/queue.constants';
 import { SafeWorkerHost } from 'src/queues/safe-worker-host';
 import { ProjectPlanGenerationJobData } from 'src/queues/queue.types';
 import { ProjectPlansService } from '../project-plans.service';
 
-@Processor(QUEUES.PROJECT_PLAN_GENERATION, { concurrency: 1 })
+@Processor(QUEUES.PROJECT_PLAN_GENERATION, {
+  concurrency: AI_QUEUE_CONCURRENCY.PROJECT_PLAN_GENERATION,
+})
 export class ProjectPlanGenerationProcessor extends SafeWorkerHost {
   constructor(private readonly projectPlans: ProjectPlansService) {
     super();

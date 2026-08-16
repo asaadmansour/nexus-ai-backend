@@ -25,6 +25,7 @@ describe('PlanningEvaluationsService verdict history', () => {
       status: 'submitted',
       evaluationStatus: 'completed',
       evaluationResult: priorVerdict,
+      evaluationAuditBundle: { verdictSha256: 'old-verdict-hash' },
     } as unknown as ProjectPlanningSubmission;
     const submissionRepo = {
       findOne: jest.fn().mockResolvedValue(submission),
@@ -65,6 +66,7 @@ describe('PlanningEvaluationsService verdict history', () => {
     ).resolves.toMatchObject({ status: 'queued' });
     expect(submission.evaluationRequirements).toMatchObject({
       previousVerdict: priorVerdict,
+      previousAuditBundle: { verdictSha256: 'old-verdict-hash' },
     });
   });
 });

@@ -124,6 +124,9 @@ export class ProjectPlanningSubmission {
   @Column({ name: 'evaluation_result', type: 'jsonb', nullable: true })
   evaluationResult!: Record<string, unknown> | null;
 
+  @Column({ name: 'evaluation_audit_bundle', type: 'jsonb', nullable: true })
+  evaluationAuditBundle!: Record<string, unknown> | null;
+
   @Column({ name: 'evaluation_error', type: 'text', nullable: true })
   evaluationError!: string | null;
 
@@ -136,6 +139,22 @@ export class ProjectPlanningSubmission {
 
   @Column({ name: 'evaluated_at', type: 'timestamptz', nullable: true })
   evaluatedAt!: Date | null;
+
+  @Column({ name: 'ai_override', type: 'boolean', default: false })
+  aiOverride!: boolean;
+
+  @Column({ name: 'ai_override_reason', type: 'text', nullable: true })
+  aiOverrideReason!: string | null;
+
+  @Column({ name: 'ai_overridden_by', type: 'uuid', nullable: true })
+  aiOverriddenBy!: string | null;
+
+  @ManyToOne(() => User, { nullable: true, onDelete: 'RESTRICT' })
+  @JoinColumn({ name: 'ai_overridden_by' })
+  aiOverriddenByUser!: User | null;
+
+  @Column({ name: 'ai_overridden_at', type: 'timestamptz', nullable: true })
+  aiOverriddenAt!: Date | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

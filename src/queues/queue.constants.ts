@@ -49,4 +49,23 @@ export const AI_JOB_RECOVERY = {
   BATCH_SIZE: 20,
 } as const;
 
+function boundedConcurrency(name: string, fallback: number, maximum: number) {
+  const configured = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(configured)) return fallback;
+  return Math.max(1, Math.min(maximum, configured));
+}
+
+export const AI_QUEUE_CONCURRENCY = {
+  PLANNING_SUBMISSION_EVALUATION: boundedConcurrency(
+    'PLANNING_EVALUATION_CONCURRENCY',
+    2,
+    10,
+  ),
+  PROJECT_PLAN_GENERATION: boundedConcurrency(
+    'PROJECT_PLAN_GENERATION_CONCURRENCY',
+    2,
+    5,
+  ),
+} as const;
+
 export type QueueName = (typeof QUEUES)[keyof typeof QUEUES];

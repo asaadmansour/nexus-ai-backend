@@ -1,11 +1,18 @@
 import { OnWorkerEvent, Processor } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
-import { AI_JOB_RETRY, JOBS, QUEUES } from 'src/queues/queue.constants';
+import {
+  AI_JOB_RETRY,
+  AI_QUEUE_CONCURRENCY,
+  JOBS,
+  QUEUES,
+} from 'src/queues/queue.constants';
 import { SafeWorkerHost } from 'src/queues/safe-worker-host';
 import type { PlanningSubmissionEvaluationJobData } from 'src/queues/queue.types';
 import { PlanningEvaluationsService } from '../planning-evaluations.service';
 
-@Processor(QUEUES.PLANNING_SUBMISSION_EVALUATION, { concurrency: 1 })
+@Processor(QUEUES.PLANNING_SUBMISSION_EVALUATION, {
+  concurrency: AI_QUEUE_CONCURRENCY.PLANNING_SUBMISSION_EVALUATION,
+})
 export class PlanningSubmissionEvaluationProcessor extends SafeWorkerHost {
   constructor(private readonly evaluations: PlanningEvaluationsService) {
     super();
