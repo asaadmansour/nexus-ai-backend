@@ -939,10 +939,13 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     await this.notificationsService.createNotification({
       userId: profile.userId,
       projectId: submission.projectId,
+      taskId: submission.taskId,
       title: 'Submission evaluated',
       body: result.passed
         ? 'The AI evaluation of your submission passed. Admin review is next.'
-        : 'The AI evaluation of your submission requested changes. Check the feedback.',
+        : result.revisionNotes ||
+          result.findings[0] ||
+          'The AI evaluation requested changes. Check the submission feedback.',
     });
   }
 

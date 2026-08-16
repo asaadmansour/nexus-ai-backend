@@ -1,3 +1,4 @@
+import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { CreatePaymentReleaseRequestDto } from 'src/payments/dtos/create-payment-release-request.dto';
@@ -45,6 +46,34 @@ describe('Sprint 5 delivery DTOs', () => {
     expect(await validate(valid)).toHaveLength(0);
     expect((await validate(invalid)).map((error) => error.property)).toEqual(
       expect.arrayContaining(['decision', 'score']),
+    );
+  });
+
+  it('validates nested criterion ratings on the 1-to-5 scale', async () => {
+    const valid = plainToInstance(ReviewSubmissionDto, {
+      decision: 'approved',
+      feedback: 'The implementation meets the reviewed requirements.',
+      criteriaReviews: [
+        {
+          criterionKey: 'acceptance_1',
+          rating: 5,
+          comment: 'Verified against the acceptance example.',
+        },
+      ],
+    });
+    const invalid = plainToInstance(ReviewSubmissionDto, {
+      decision: 'rejected',
+      criteriaReviews: [
+        {
+          criterionKey: 'acceptance_1',
+          rating: 6,
+        },
+      ],
+    });
+
+    expect(await validate(valid)).toHaveLength(0);
+    expect((await validate(invalid))[0]?.children?.[0]?.children).toEqual(
+      expect.arrayContaining([expect.objectContaining({ property: 'rating' })]),
     );
   });
 

@@ -3,6 +3,8 @@ import {
   assertSubmissionApprovalEvaluation,
   assertSubmissionMatchesCurrentTask,
   assertTaskAcceptsDraft,
+  resolveSubmissionReviewCriteria,
+  validateSubmissionCriterionReviews,
 } from './delivery.service';
 
 describe('DeliveryService task/submission invariants', () => {
@@ -97,5 +99,84 @@ describe('DeliveryService task/submission invariants', () => {
         task: { assignedFreelancerProfileId: 'freelancer-a' },
       }),
     ).not.toThrow();
+  });
+
+  it('requires a 1-to-5 review for every applicable evaluation criterion', () => {
+    const evaluation = {
+      acceptanceCoverage: {
+        items: [
+          {
+            key: 'acceptance_1',
+            criterion: 'The endpoint works',
+            status: 'met',
+          },
+          {
+            key: 'operations',
+            criterion: 'Deployment notes are supplied',
+            status: 'not_applicable',
+          },
+          { key: 'quality', criterion: 'The code is clear', status: 'met' },
+        ],
+      },
+    };
+    expect(resolveSubmissionReviewCriteria(evaluation)).toHaveLength(2);
+    expect(
+      resolveSubmissionReviewCriteria({
+        acceptanceCoverage: {
+          items: [],
+          rubricSnapshot: {
+            criteria: [
+              {
+                key: 'queued_acceptance',
+                criterion: 'The queued rubric remains reviewable',
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual([
+      {
+        criterionKey: 'queued_acceptance',
+        criterion: 'The queued rubric remains reviewable',
+      },
+    ]);
+    expect(() =>
+      validateSubmissionCriterionReviews(evaluation, [
+        {
+          criterionKey: 'acceptance_1',
+          rating: 5,
+        },
+      ]),
+    ).toThrow('Rate every applicable review criterion');
+
+    expect(
+      validateSubmissionCriterionReviews(evaluation, [
+        {
+          criterionKey: 'acceptance_1',
+          rating: 5,
+        },
+        {
+          criterionKey: 'quality',
+          rating: 4,
+          comment: 'Small naming issue',
+        },
+      ]),
+    ).toEqual({
+      reviews: [
+        {
+          criterionKey: 'acceptance_1',
+          criterion: 'The endpoint works',
+          rating: 5,
+          comment: null,
+        },
+        {
+          criterionKey: 'quality',
+          criterion: 'The code is clear',
+          rating: 4,
+          comment: 'Small naming issue',
+        },
+      ],
+      score: 90,
+    });
   });
 });

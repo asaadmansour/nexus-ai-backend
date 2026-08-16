@@ -31,7 +31,10 @@ import { CreateRevisionRequestDto } from './dtos/create-revision-request.dto';
 import { CreateSubmissionDto } from './dtos/create-submission.dto';
 import { ListRevisionRequestsDto } from './dtos/list-revision-requests.dto';
 import { ListSubmissionsDto } from './dtos/list-submissions.dto';
-import { ReviewSubmissionDto } from './dtos/review-submission.dto';
+import {
+  ReviewSubmissionDto,
+  type SubmissionCriterionReviewDto,
+} from './dtos/review-submission.dto';
 import { SubmitSubmissionDto } from './dtos/submit-submission.dto';
 import { UpdateRevisionStatusDto } from './dtos/update-revision-status.dto';
 import { UpdateSubmissionDto } from './dtos/update-submission.dto';
@@ -122,6 +125,90 @@ export function assertSubmissionApprovalEvaluation(
       'Approval is blocked because the evaluation has no approving verdict',
     );
   }
+}
+
+export interface SubmissionReviewCriterion {
+  criterionKey: string;
+  criterion: string;
+}
+
+export function resolveSubmissionReviewCriteria(
+  evaluation: Pick<EvaluationRun, 'acceptanceCoverage'> | null,
+): SubmissionReviewCriterion[] {
+  const coverage = evaluation?.acceptanceCoverage;
+  if (!coverage || typeof coverage !== 'object') return [];
+  const completedItems = Array.isArray(coverage.items)
+    ? (coverage.items as unknown[])
+    : [];
+  const rubricSnapshot = coverage.rubricSnapshot;
+  const snapshotCriteria =
+    rubricSnapshot &&
+    typeof rubricSnapshot === 'object' &&
+    Array.isArray((rubricSnapshot as Record<string, unknown>).criteria)
+      ? ((rubricSnapshot as Record<string, unknown>).criteria as unknown[])
+      : [];
+  const source = completedItems.length ? completedItems : snapshotCriteria;
+  const seen = new Set<string>();
+
+  return source.flatMap((value, index) => {
+    if (!value || typeof value !== 'object') return [];
+    const item = value as Record<string, unknown>;
+    if (completedItems.length && item.status === 'not_applicable') return [];
+    const criterion =
+      typeof item.criterion === 'string' ? item.criterion.trim() : '';
+    if (!criterion) return [];
+    const criterionKey =
+      typeof item.key === 'string' && item.key.trim()
+        ? item.key.trim()
+        : `criterion_${index + 1}`;
+    if (seen.has(criterionKey)) return [];
+    seen.add(criterionKey);
+    return [{ criterionKey, criterion }];
+  });
+}
+
+export function validateSubmissionCriterionReviews(
+  evaluation: Pick<EvaluationRun, 'acceptanceCoverage'> | null,
+  input: SubmissionCriterionReviewDto[] | undefined,
+) {
+  const expected = resolveSubmissionReviewCriteria(evaluation);
+  if (!expected.length) {
+    if (input?.length) {
+      throw new BadRequestException(
+        'Criterion ratings do not match the evaluation rubric',
+      );
+    }
+    return { reviews: [], score: null };
+  }
+  if (!input || input.length !== expected.length) {
+    throw new BadRequestException(
+      `Rate every applicable review criterion from 1 to 5 (${expected.length} required)`,
+    );
+  }
+
+  const byKey = new Map(input.map((review) => [review.criterionKey, review]));
+  const reviews = expected.map((criterion) => {
+    const review = byKey.get(criterion.criterionKey);
+    if (
+      !review ||
+      !Number.isInteger(review.rating) ||
+      review.rating < 1 ||
+      review.rating > 5
+    ) {
+      throw new BadRequestException(
+        `Invalid or missing rating for criterion: ${criterion.criterion}`,
+      );
+    }
+    return {
+      ...criterion,
+      rating: review.rating,
+      comment: review.comment?.trim() || null,
+    };
+  });
+  const score =
+    (reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length) *
+    20;
+  return { reviews, score };
 }
 
 @Injectable()
@@ -432,6 +519,11 @@ export class DeliveryService {
     dto: ReviewSubmissionDto,
     requester: JwtPayload,
   ) {
+    if (dto.decision !== 'approved' && !dto.feedback?.trim()) {
+      throw new BadRequestException(
+        'General comments are required when requesting changes or rejecting a submission',
+      );
+    }
     const pullRequestAtReview =
       dto.decision === 'approved'
         ? await this.assertPullRequestHeadIsCurrent(submissionId, requester)
@@ -476,6 +568,11 @@ export class DeliveryService {
         }
       }
 
+      const criterionReview = validateSubmissionCriterionReviews(
+        latestEvaluation,
+        dto.criteriaReviews,
+      );
+
       const now = new Date();
       const review = await manager.getRepository(ProjectSubmissionReview).save({
         projectId: submission.projectId,
@@ -485,18 +582,28 @@ export class DeliveryService {
         reviewerUserId: requester.sub,
         reviewerRole: requester.role,
         decision: dto.decision,
-        feedback: dto.feedback ?? null,
+        feedback: dto.feedback?.trim() || null,
         requestedChanges: dto.requestedChanges ?? null,
-        score: dto.score !== undefined ? dto.score.toFixed(2) : null,
-        metadata: latestEvaluation
-          ? {
-              evaluationRunId: latestEvaluation.id,
-              evaluationStatus: latestEvaluation.status,
-              evaluationRecommendation: latestEvaluation.recommendation,
-              evaluatedCommitSha: latestEvaluation.evaluatedCommitSha,
-              manualReviewAcknowledged: dto.manualReviewAcknowledged === true,
-            }
-          : null,
+        score:
+          criterionReview.score !== null
+            ? criterionReview.score.toFixed(2)
+            : dto.score !== undefined
+              ? dto.score.toFixed(2)
+              : null,
+        metadata: {
+          criteriaReviews: criterionReview.reviews,
+          ratingScale: 5,
+          overallComment: dto.feedback?.trim() || null,
+          ...(latestEvaluation
+            ? {
+                evaluationRunId: latestEvaluation.id,
+                evaluationStatus: latestEvaluation.status,
+                evaluationRecommendation: latestEvaluation.recommendation,
+                evaluatedCommitSha: latestEvaluation.evaluatedCommitSha,
+                manualReviewAcknowledged: dto.manualReviewAcknowledged === true,
+              }
+            : {}),
+        },
       });
 
       submission.status = dto.decision;
@@ -566,10 +673,7 @@ export class DeliveryService {
       }
     }
 
-    await this.notifySubmissionReviewed(result.submission, dto.decision);
-    if (result.revisionRequest) {
-      await this.notifyRevisionCreated(result.revisionRequest);
-    }
+    await this.notifySubmissionReviewed(result.submission, result.review);
     return { ...result, releaseRequest, releaseError };
   }
 
@@ -1504,17 +1608,35 @@ export class DeliveryService {
 
   private async notifySubmissionReviewed(
     submission: ProjectSubmission,
-    decision: string,
+    review: ProjectSubmissionReview,
   ) {
     if (!submission.freelancerProfileId) return;
     const profile = await this.freelancerProfilesRepository.findOne({
       where: { id: submission.freelancerProfileId },
     });
     if (!profile) return;
+    const criteriaReviews = Array.isArray(review.metadata?.criteriaReviews)
+      ? (review.metadata.criteriaReviews as Array<Record<string, unknown>>)
+      : [];
+    const criterionComments = criteriaReviews
+      .filter((item) => typeof item.comment === 'string' && item.comment.trim())
+      .slice(0, 3)
+      .map(
+        (item) =>
+          `${String(item.criterion)} (${String(item.rating)}/5): ${String(item.comment)}`,
+      );
+    const body = [
+      review.feedback?.trim(),
+      review.score ? `Overall reviewer score: ${review.score}/100.` : null,
+      ...criterionComments,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join(' ');
     await this.notifyUsers(
       [profile.userId],
-      `Submission ${decision.replace('_', ' ')}`,
-      submission.title ?? 'Your submitted work has been reviewed.',
+      `Submission ${review.decision.replace(/_/g, ' ')}`,
+      body ||
+        `${submission.title ?? 'Your submitted work'} was ${review.decision.replace(/_/g, ' ')}.`,
       submission.projectId,
       submission.taskId,
     );
@@ -1529,7 +1651,7 @@ export class DeliveryService {
     await this.notifyUsers(
       [profile.userId],
       'Revision requested',
-      revision.title,
+      revision.description?.trim() || revision.title,
       revision.projectId,
       revision.taskId,
     );
