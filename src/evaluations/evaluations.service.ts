@@ -853,7 +853,10 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     run: EvaluationRun,
     result: EvaluateSubmissionResult,
   ) {
-    if (result.passed) return;
+    if (result.passed) {
+      await this.resolveAutomatedRevisionAfterPassing(evaluatedSubmission, run);
+      return;
+    }
     await this.dataSource.transaction(async (manager) => {
       const submissionRepo = manager.getRepository(ProjectSubmission);
       const submission = await submissionRepo
@@ -925,6 +928,70 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           resolvedAt: null,
         }),
       );
+    });
+  }
+
+  private async resolveAutomatedRevisionAfterPassing(
+    evaluatedSubmission: ProjectSubmission,
+    run: EvaluationRun,
+  ) {
+    await this.dataSource.transaction(async (manager) => {
+      const submissionRepo = manager.getRepository(ProjectSubmission);
+      const submission = await submissionRepo
+        .createQueryBuilder('submission')
+        .setLock('pessimistic_write')
+        .where('submission.id = :submissionId', {
+          submissionId: evaluatedSubmission.id,
+        })
+        .getOne();
+      if (
+        !submission ||
+        submission.status !== 'changes_requested' ||
+        !submission.commitSha ||
+        !run.evaluatedCommitSha ||
+        submission.commitSha.toLowerCase() !==
+          run.evaluatedCommitSha.toLowerCase()
+      ) {
+        return;
+      }
+
+      const revisionRepo = manager.getRepository(ProjectRevisionRequest);
+      const revisions = await revisionRepo.find({
+        where: {
+          submissionId: submission.id,
+          status: In(['open', 'in_progress']),
+        },
+      });
+      const evaluatedCommitSha = run.evaluatedCommitSha.toLowerCase();
+      const automated = revisions.filter((revision) => {
+        const metadata = revision.metadata ?? {};
+        return (
+          metadata.generatedBy === 'submission_evaluation_agent' &&
+          typeof metadata.evaluatedCommitSha === 'string' &&
+          metadata.evaluatedCommitSha.toLowerCase() === evaluatedCommitSha
+        );
+      });
+      if (!automated.length) return;
+
+      const resolvedAt = new Date();
+      for (const revision of automated) {
+        revision.status = 'resolved';
+        revision.resolvedAt = resolvedAt;
+        revision.metadata = {
+          ...(revision.metadata ?? {}),
+          resolvedByEvaluationRunId: run.id,
+          resolution: 'automated_re_evaluation_passed',
+          resolvedAt: resolvedAt.toISOString(),
+        };
+      }
+      await revisionRepo.save(automated);
+      submission.status = 'under_review';
+      await submissionRepo.save(submission);
+      if (submission.taskId) {
+        await manager.getRepository(ProjectTask).update(submission.taskId, {
+          status: 'review',
+        });
+      }
     });
   }
 

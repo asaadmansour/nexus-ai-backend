@@ -484,4 +484,89 @@ describe('EvaluationsService revision verdict', () => {
       }),
     );
   });
+
+  it('resolves a same-commit automated revision when reevaluation passes', async () => {
+    const commitSha = 'a'.repeat(40);
+    const submission = {
+      id: 'submission-id',
+      projectId: 'project-id',
+      taskId: 'task-id',
+      status: 'changes_requested',
+      commitSha,
+    } as ProjectSubmission;
+    const revision = {
+      id: 'revision-id',
+      status: 'open',
+      resolvedAt: null,
+      metadata: {
+        generatedBy: 'submission_evaluation_agent',
+        evaluatedCommitSha: commitSha,
+      },
+    } as ProjectRevisionRequest;
+    const submissionRepo = {
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(submission),
+      }),
+      save: jest.fn().mockResolvedValue(submission),
+    };
+    const revisionRepo = {
+      find: jest.fn().mockResolvedValue([revision]),
+      save: jest.fn().mockResolvedValue([revision]),
+    };
+    const taskRepo = { update: jest.fn().mockResolvedValue(undefined) };
+    const manager = {
+      getRepository: (entity: unknown) => {
+        if (entity === ProjectSubmission) return submissionRepo;
+        if (entity === ProjectRevisionRequest) return revisionRepo;
+        if (entity === ProjectTask) return taskRepo;
+        throw new Error('Unexpected repository');
+      },
+    };
+    const service = Object.create(
+      EvaluationsService.prototype,
+    ) as EvaluationsService;
+    Object.assign(service as unknown as Record<string, unknown>, {
+      dataSource: {
+        transaction: jest.fn((callback: (value: typeof manager) => unknown) =>
+          callback(manager),
+        ),
+      },
+    });
+
+    await (
+      service as unknown as {
+        applyRevisionVerdict(
+          value: ProjectSubmission,
+          run: EvaluationRun,
+          verdict: EvaluateSubmissionResult,
+        ): Promise<void>;
+      }
+    ).applyRevisionVerdict(
+      submission,
+      { id: 'passing-run-id', evaluatedCommitSha: commitSha } as EvaluationRun,
+      {
+        passed: true,
+        score: 100,
+        revisionRequested: false,
+        revisionNotes: '',
+        requiresHumanReview: false,
+        rubric: [],
+        findings: [],
+        risks: [],
+        source: 'fastapi',
+      },
+    );
+
+    expect(revision.status).toBe('resolved');
+    expect(revision.metadata).toMatchObject({
+      resolvedByEvaluationRunId: 'passing-run-id',
+      resolution: 'automated_re_evaluation_passed',
+    });
+    expect(submission.status).toBe('under_review');
+    expect(taskRepo.update).toHaveBeenCalledWith('task-id', {
+      status: 'review',
+    });
+  });
 });

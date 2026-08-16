@@ -34,6 +34,9 @@ interface GithubEvaluationTarget {
   commitSha: string;
   baseCommitSha: string | null;
   pullRequestNumber: number | null;
+  pullRequestUrl: string | null;
+  pullRequestState: string | null;
+  pullRequestDraft: boolean;
 }
 
 @Injectable()
@@ -61,18 +64,41 @@ export class ImplementationEvaluationSandboxService {
     if (target) await this.pinResolvedCommit(dto, target);
     const sandboxMode = this.config.get<string>('EVALUATION_SANDBOX_MODE');
 
-    if (!target || sandboxMode !== 'kubernetes') {
+    if (!target) {
       const result = await this.aiService.evaluateSubmission(resolvedDto);
       return {
         result,
-        evaluatedCommitSha:
-          target?.commitSha ?? dto.submission.commitSha ?? null,
-        auditBundle: this.buildHttpAudit(
-          resolvedDto,
-          result,
-          agentJobId,
-          target,
-        ),
+        evaluatedCommitSha: dto.submission.commitSha ?? null,
+        auditBundle: this.buildHttpAudit(resolvedDto, result, agentJobId, null),
+      };
+    }
+
+    if (sandboxMode !== 'kubernetes') {
+      const evidence = await this.github.inspectRepositorySnapshot({
+        owner: target.owner,
+        repoName: target.repoName,
+        commitSha: target.commitSha,
+        baseCommitSha: target.baseCommitSha,
+        pullRequestNumber: target.pullRequestNumber,
+        pullRequestUrl: target.pullRequestUrl,
+        pullRequestState: target.pullRequestState,
+        pullRequestDraft: target.pullRequestDraft,
+      });
+      const inspectedDto: EvaluateSubmissionDto = {
+        ...resolvedDto,
+        submission: {
+          ...resolvedDto.submission,
+          inspection: evidence.inspection,
+        },
+      };
+      const result = await this.aiService.evaluateSubmission(inspectedDto);
+      return {
+        result,
+        evaluatedCommitSha: target.commitSha,
+        auditBundle: {
+          ...this.buildHttpAudit(inspectedDto, result, agentJobId, target),
+          ...evidence.audit,
+        },
       };
     }
 
@@ -171,6 +197,9 @@ export class ImplementationEvaluationSandboxService {
         commitSha: pull.headSha,
         baseCommitSha: pull.baseSha,
         pullRequestNumber: pull.number,
+        pullRequestUrl: pull.url,
+        pullRequestState: pull.state,
+        pullRequestDraft: pull.draft,
       };
     }
 
@@ -190,6 +219,9 @@ export class ImplementationEvaluationSandboxService {
       commitSha: commit.sha,
       baseCommitSha: null,
       pullRequestNumber: null,
+      pullRequestUrl: null,
+      pullRequestState: null,
+      pullRequestDraft: false,
     };
   }
 
@@ -222,6 +254,7 @@ export class ImplementationEvaluationSandboxService {
         repositoryOwner: target.owner,
         repositoryName: target.repoName,
         pullRequestNumber: target.pullRequestNumber,
+        pullRequestUrl: target.pullRequestUrl,
         commitSha: target.commitSha,
         baseCommitSha: target.baseCommitSha,
       },

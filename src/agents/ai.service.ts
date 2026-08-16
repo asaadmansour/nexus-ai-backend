@@ -1074,6 +1074,7 @@ export class AiService {
         submission: dto.submission,
         brief: dto.brief ?? {},
         projectSpec: dto.projectSpec ?? {},
+        evaluationHistory: dto.evaluationHistory ?? [],
       },
       'evaluate-submission',
     );
