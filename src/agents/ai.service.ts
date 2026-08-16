@@ -245,7 +245,7 @@ type FastApiEvaluateSubmissionResponse = {
 export type PlanningEvaluationCheck = {
   key: string;
   title: string;
-  status: 'met' | 'partial' | 'missing' | 'conflict';
+  status: 'met' | 'not_applicable' | 'partial' | 'missing' | 'conflict';
   mandatory: boolean;
   severity: 'info' | 'minor' | 'major' | 'blocker';
   evidence: string;
@@ -687,24 +687,30 @@ export class AiService {
     const { min, max } = this.getQuoteBudgetRange(dto.project);
     const brief = this.asRecord(dto.brief);
     const project = this.asRecord(dto.project);
+    const requirementProfile = this.asRecord(brief.requirementProfile);
+    const planningComplexity = this.optionalString(
+      requirementProfile.complexity,
+    );
     const featureCount = this.countQuoteItems(brief.coreFeatures);
     const platformCount = Math.max(1, this.countQuoteItems(brief.platforms));
     const deliverableCount = this.countQuoteItems(brief.deliverables);
-    const teamSize = this.toNumber(brief.suggestedTeamSize) ?? 2;
+    const teamSize =
+      this.toNumber(brief.suggestedTeamSize) ??
+      (planningComplexity === 'trivial' ? 1 : 2);
     const deadlinePressure = this.quoteDeadlinePressure(project.deadline);
     const complexityScore = Math.min(
       1,
-      0.2 +
+      (planningComplexity === 'trivial' ? 0.05 : 0.2) +
         Math.min(featureCount, 8) * 0.06 +
         Math.min(platformCount, 3) * 0.08 +
         Math.min(deliverableCount, 5) * 0.04 +
         Math.min(teamSize, 8) * 0.025 +
         deadlinePressure,
     );
-    const factor = Math.min(
-      0.92,
-      Math.max(0.55, 0.52 + complexityScore * 0.35),
-    );
+    const factor =
+      planningComplexity === 'trivial'
+        ? Math.min(0.4, Math.max(0.15, 0.1 + complexityScore * 0.35))
+        : Math.min(0.92, Math.max(0.55, 0.52 + complexityScore * 0.35));
     const amount = this.roundMoney(min + (max - min) * factor);
     const complexity =
       complexityScore >= 0.72
@@ -725,7 +731,7 @@ export class AiService {
         'Final price estimated from the confirmed requirements, platform count, feature breadth, delivery scope, and the customer budget range.',
       assumptions: [
         'The first release follows the confirmed brief without major scope expansion.',
-        'Architecture and UI/UX planning are included as mandatory planning work before implementation.',
+        'Architecture and UI/UX planning are included at a depth proportional to the confirmed scope.',
         'Escrow funding starts the matching and planning workflow.',
       ],
       pricingSignals: [
@@ -817,6 +823,7 @@ export class AiService {
         roleKey: dto.roleKey,
         project: dto.project,
         brief: dto.brief ?? {},
+        requirementProfile: dto.requirementProfile ?? {},
         standardExpectations: dto.standardExpectations,
         freelancer: dto.freelancer ?? null,
       },
@@ -850,6 +857,7 @@ export class AiService {
   }
 
   getFallbackRoleBrief(dto: GenerateRoleBriefDto): RoleBriefResult {
+    const trivial = dto.requirementProfile?.complexity === 'trivial';
     return this.normalizeRoleBriefResult(
       dto,
       {
@@ -866,20 +874,32 @@ export class AiService {
           'Any constraints, preferences, or examples already captured',
         ],
         expectedDeliverables:
-          dto.roleKey === 'ui_ux'
+          trivial && dto.roleKey === 'ui_ux'
             ? [
-                'User flows for the core journeys',
-                'Screen map or wireframes for the first release',
-                'Design system notes: colors, typography, components, spacing, and responsive behavior',
-                'Implementation handoff notes for frontend developers',
+                'One inspectable screen specification or mockup',
+                'Responsive and accessibility notes',
+                'Exact content, style values, and frontend handoff checklist',
               ]
-            : [
-                'System architecture overview',
-                'Recommended stack and service boundaries',
-                'Database model and key API contracts',
-                'Security, scalability, and integration notes',
-                'Implementation risks and dependency order',
-              ],
+            : trivial
+              ? [
+                  'Minimal solution and hosting decision',
+                  'Scope boundaries and essential acceptance checks',
+                  'Repository, deployment, verification, and live-link handoff',
+                ]
+              : dto.roleKey === 'ui_ux'
+                ? [
+                    'User flows for the core journeys',
+                    'Screen map or wireframes for the first release',
+                    'Proportionate design notes: colors, typography, components, spacing, and responsive behavior',
+                    'Implementation handoff notes for frontend developers',
+                  ]
+                : [
+                    'System architecture overview',
+                    'Recommended stack and service boundaries',
+                    'Applicable data model and API contracts',
+                    'Relevant security, scalability, and integration notes',
+                    'Implementation risks and dependency order',
+                  ],
         acceptanceCriteria: [
           'Deliverable is specific to this project and not a generic template.',
           'The implementation team can create tasks from it without guessing major decisions.',
@@ -957,6 +977,7 @@ export class AiService {
     const projectTitle =
       this.optionalString(dto.project.title) ?? 'this project';
     const role = this.roleLabel(dto.roleKey);
+    const trivial = dto.requirementProfile?.complexity === 'trivial';
 
     return {
       summary: `${role} assignment for ${projectTitle}. Use the confirmed requirements to produce a project-specific planning deliverable for the Scrum Master and implementation team.`,
@@ -969,13 +990,24 @@ export class AiService {
         'Project description, budget, deadline, platforms, and customer preferences',
       ],
       expectedDeliverables:
-        dto.roleKey === 'ui_ux'
-          ? [
-              'User flows',
-              'Wireframes or screen structure',
-              'Design system notes',
-            ]
-          : ['Architecture overview', 'Technical stack', 'Data/API notes'],
+        trivial && dto.roleKey === 'ui_ux'
+          ? ['One screen specification', 'Responsive and accessibility notes']
+          : trivial
+            ? [
+                'Minimal architecture decision',
+                'Deployment and acceptance handoff',
+              ]
+            : dto.roleKey === 'ui_ux'
+              ? [
+                  'User flows',
+                  'Wireframes or screen structure',
+                  'Proportionate design rules',
+                ]
+              : [
+                  'Architecture overview',
+                  'Technical stack',
+                  'Applicable data/API notes',
+                ],
       acceptanceCriteria: [
         'Specific to the project',
         'Clear enough for admin review',
@@ -1102,7 +1134,13 @@ export class AiService {
       const evidenceItem = this.asRecord(evidence[requirement.key]);
       const summary = this.optionalString(evidenceItem.summary);
       const urls = this.toStringArray(evidenceItem.urls);
-      const hasEvidence = Boolean(summary || urls.length);
+      const notApplicableReason = this.optionalString(
+        evidenceItem.notApplicableReason,
+      );
+      const markedNotApplicable = evidenceItem.disposition === 'not_applicable';
+      const hasEvidence = Boolean(
+        summary || urls.length || notApplicableReason,
+      );
       const hasInspectedArtifact = [...inspectedArtifacts.values()].some(
         (artifact) =>
           this.toStringArray(artifact.requirementKeys).includes(
@@ -1110,20 +1148,45 @@ export class AiService {
           ),
       );
       const hasRequiredUrl =
+        markedNotApplicable ||
         !requirement.requiresUrl ||
         (source === 'local_mock' ? urls.length > 0 : hasInspectedArtifact);
       const requestedStatus = this.optionalString(item.status);
-      let status: PlanningEvaluationCheck['status'] =
-        !hasEvidence || !hasRequiredUrl
-          ? 'missing'
-          : requestedStatus &&
-              ['met', 'partial', 'missing', 'conflict'].includes(
-                requestedStatus,
-              )
-            ? (requestedStatus as PlanningEvaluationCheck['status'])
-            : source === 'local_mock'
-              ? 'met'
+      const validStatuses: PlanningEvaluationCheck['status'][] = [
+        'met',
+        'not_applicable',
+        'partial',
+        'missing',
+        'conflict',
+      ];
+      let status: PlanningEvaluationCheck['status'];
+      if (!requirement.mandatory && !hasEvidence) {
+        status = 'not_applicable';
+      } else if (markedNotApplicable) {
+        const validNotApplicableClaim =
+          requirement.allowNotApplicable &&
+          (notApplicableReason?.length ?? 0) >= 20;
+        status = !validNotApplicableClaim
+          ? 'conflict'
+          : requestedStatus === 'not_applicable' || source === 'local_mock'
+            ? 'not_applicable'
+            : requestedStatus &&
+                ['partial', 'missing', 'conflict'].includes(requestedStatus)
+              ? (requestedStatus as PlanningEvaluationCheck['status'])
               : 'missing';
+      } else {
+        status =
+          !hasEvidence || !hasRequiredUrl
+            ? 'missing'
+            : requestedStatus &&
+                validStatuses.includes(
+                  requestedStatus as PlanningEvaluationCheck['status'],
+                )
+              ? (requestedStatus as PlanningEvaluationCheck['status'])
+              : source === 'local_mock'
+                ? 'met'
+                : 'missing';
+      }
       const citations = this.toRecordArray(item.citations)
         .map((citation) => ({
           artifactId: this.optionalString(citation.artifactId) ?? '',
@@ -1147,13 +1210,14 @@ export class AiService {
         status = 'partial';
       }
       const severityValue = this.optionalString(item.severity);
+      const satisfied = ['met', 'not_applicable'].includes(status);
       const severity: PlanningEvaluationCheck['severity'] =
-        status !== 'met' && requirement.mandatory
+        !satisfied && requirement.mandatory
           ? 'blocker'
           : severityValue &&
               ['info', 'minor', 'major', 'blocker'].includes(severityValue)
             ? (severityValue as PlanningEvaluationCheck['severity'])
-            : status === 'met'
+            : satisfied
               ? 'info'
               : 'minor';
 
@@ -1165,26 +1229,35 @@ export class AiService {
         severity,
         evidence:
           this.optionalString(item.evidence) ??
-          (hasEvidence
-            ? (summary ?? urls.join(', '))
-            : 'No evidence submitted.'),
+          (markedNotApplicable
+            ? (notApplicableReason ?? 'No not-applicable reason submitted.')
+            : hasEvidence
+              ? (summary ?? urls.join(', '))
+              : 'No evidence submitted.'),
         feedback:
           this.optionalString(item.feedback) ??
-          (status === 'met'
-            ? 'Requirement is supported by submitted evidence.'
+          (satisfied
+            ? status === 'not_applicable'
+              ? 'The not-applicable justification is consistent with the approved scope.'
+              : 'Requirement is supported by submitted evidence.'
             : `Complete ${requirement.title} and provide specific evidence.`),
         citations,
       };
     });
     const blockers = checks.filter(
-      (check) => check.mandatory && check.status !== 'met',
+      (check) =>
+        check.mandatory && !['met', 'not_applicable'].includes(check.status),
     );
     const reportedScore = this.toNumber(result.score);
     const rawScore = this.clampScore(
       reportedScore ??
         (source === 'local_mock'
           ? (checks.filter((check) => check.status === 'met').length /
-              Math.max(1, checks.length)) *
+              Math.max(
+                1,
+                checks.filter((check) => check.status !== 'not_applicable')
+                  .length,
+              )) *
             100
           : 0),
     );
@@ -1215,7 +1288,11 @@ export class AiService {
         ),
     );
     const openIssues = checks
-      .filter((check) => check.status !== 'met')
+      .filter(
+        (check) =>
+          !['met', 'not_applicable'].includes(check.status) &&
+          (check.mandatory || check.status !== 'missing'),
+      )
       .map((check) => {
         const issue = returnedIssues.get(check.key) ?? {};
         const severity = this.optionalString(issue.severity);
@@ -1550,6 +1627,98 @@ export class AiService {
   ): ProjectPlanResult {
     const currency =
       typeof dto.project?.currency === 'string' ? dto.project.currency : 'EGP';
+    const architectureSnapshot = this.asRecord(
+      dto.architectureSubmission.evaluationRequirements,
+    );
+    const requirementProfile = this.asRecord(architectureSnapshot.profile);
+    if (requirementProfile.complexity === 'trivial') {
+      const projectTitle =
+        this.optionalString(dto.project.title) ?? 'the approved page';
+      return {
+        summary: `Implement and publish ${projectTitle} as one proportionate delivery milestone.`,
+        assumptions: [
+          'Scope follows the approved minimal architecture and single-screen UI/UX handoff.',
+        ],
+        timeline: { totalWeeks: 1, milestones: 1 },
+        milestones: [
+          {
+            key: 'm1',
+            title: 'Implement and publish the approved page',
+            description:
+              'Build the approved screen, verify its essential quality checks, and publish the live link.',
+            orderIndex: 1,
+            startDay: 0,
+            estimatedDays: 2,
+            budgetAmount: Number(dto.project.budgetMin ?? 0),
+            currency,
+            acceptanceCriteria: [
+              'Displayed content and layout match the approved planning artifacts',
+              'Responsive and accessibility checks pass',
+              'The live URL loads successfully',
+            ],
+          },
+        ],
+        tasks: [
+          {
+            key: 't1',
+            milestoneKey: 'm1',
+            title: 'Build, verify, and publish the approved page',
+            description:
+              'Implement only the approved static screen and its deployment handoff.',
+            priority: 'high',
+            roleKey: 'frontend',
+            requiredSkills: ['HTML', 'CSS', 'accessibility'],
+            estimatedHours: 4,
+            orderIndex: 1,
+            startDay: 0,
+            durationDays: 2,
+            acceptanceCriteria: [
+              'Exact approved content is visible',
+              'The page works at mobile and desktop widths',
+              'Build and live-link smoke checks pass',
+            ],
+            contractReferences: [
+              'architecture:technology_stack',
+              'ui_ux:screen_designs',
+            ],
+            ownedPaths: ['frontend'],
+            integrationChecks: [
+              'Run the frontend build',
+              'Open the deployed URL and verify the approved content',
+            ],
+            dependsOn: [],
+          },
+        ],
+        dependencies: [],
+        teamPlan: {
+          recommendedRoles: [
+            { roleKey: 'frontend', count: 1, skills: ['HTML', 'CSS'] },
+          ],
+          suggestedTeamSize: 1,
+        },
+        riskRegister: [
+          {
+            risk: 'Scope expands beyond the approved single-screen delivery',
+            impact: 'The small budget or timeline becomes invalid',
+            mitigation: 'Treat additions as a separately approved scope change',
+          },
+        ],
+        projectSpec: {
+          architecture: { style: 'minimal static delivery' },
+          designSystem: { scope: 'approved screen styles only' },
+          apiContract: {
+            applicable: false,
+            reason: 'The approved static solution has no runtime API.',
+          },
+          dataModel: {
+            applicable: false,
+            reason: 'The approved static solution stores no persistent data.',
+          },
+          conventions: { scope: 'approved repository and deployment handoff' },
+        },
+        source: 'local_mock',
+      };
+    }
 
     const milestones: ProjectPlanMilestone[] = [
       {

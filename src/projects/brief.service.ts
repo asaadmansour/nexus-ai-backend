@@ -13,6 +13,7 @@ import { Brief } from './entities/brief.entity';
 import { Project } from './entities/project.entity';
 import { AiService, type ProjectQuoteResult } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { assessPlanningRequirementProfile } from 'src/planning/planning-evaluation-requirements';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
@@ -23,17 +24,11 @@ const INITIAL_GREETING_MESSAGE =
   'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
 const PROJECT_DERIVED_FIELDS = new Set(['projectType', 'budget', 'deadline']);
 const USER_REQUIRED_BRIEF_FIELDS = [
-  'businessDomain',
   'mainGoal',
   'targetUsers',
   'coreFeatures',
   'platforms',
   'deliverables',
-  'constraintsPreferences',
-  'clientBackground',
-  'suggestedTeamSize',
-  'experienceLevel',
-  'experienceMinYears',
 ];
 const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_MATCHING,
@@ -369,7 +364,7 @@ export class BriefService {
 
     const projectQuote = await this.aiService.estimateProjectQuote({
       project: this.buildProjectQuoteContext(project),
-      brief: this.buildBriefQuoteContext(brief),
+      brief: this.buildBriefQuoteContext(brief, project),
     });
 
     brief.isComplete = true;
@@ -782,8 +777,9 @@ export class BriefService {
     };
   }
 
-  private buildBriefQuoteContext(brief: Brief) {
+  private buildBriefQuoteContext(brief: Brief, project: Project) {
     const knownFields = this.buildKnownFieldsFromBrief(brief) ?? {};
+    const requirementProfile = assessPlanningRequirementProfile(project, brief);
 
     return this.cleanJsonSection({
       ...knownFields,
@@ -793,7 +789,8 @@ export class BriefService {
       projectType: brief.projectType ?? knownFields.projectType,
       mainGoal: brief.mainGoal ?? knownFields.mainGoal,
       targetUsers: brief.targetUsers ?? knownFields.targetUsers,
-      coreFeatures: brief.coreFeatures ?? knownFields.coreFeatures,
+      coreFeatures: requirementProfile.features,
+      requirementProfile,
       platforms: brief.platforms ?? knownFields.platforms,
       deliverables: brief.deliverablesText ?? knownFields.deliverables,
       constraintsPreferences:

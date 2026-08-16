@@ -25,9 +25,11 @@ import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import { AI_JOB_RETRY } from 'src/queues/queue.constants';
 import type { PlanningSubmissionEvaluationJobData } from 'src/queues/queue.types';
 import {
+  assessPlanningRequirementProfile,
   buildPlanningEvaluationRequirements,
   type PlanningEvaluationRequirement,
   type PlanningSubmissionType,
+  validatePlanningRequirementEvidence,
 } from './planning-evaluation-requirements';
 import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
 
@@ -181,7 +183,42 @@ export class PlanningEvaluationsService {
       submissionType: type,
       architectureApproved: Boolean(architecture),
       architectureSubmissionId: architecture?.id ?? null,
-      requirements: buildPlanningEvaluationRequirements(type, brief),
+      profile: assessPlanningRequirementProfile(project, brief),
+      requirements: buildPlanningEvaluationRequirements(type, brief, project),
+    };
+  }
+
+  async prepareSubmissionRequirements(
+    projectId: string,
+    type: PlanningSubmissionType,
+    content: Record<string, unknown> | null | undefined,
+  ) {
+    const [project, brief] = await Promise.all([
+      this.projectRepo.findOne({ where: { id: projectId } }),
+      this.briefRepo.findOne({ where: { projectId } }),
+    ]);
+    if (!project) throw new NotFoundException('Project not found');
+
+    const profile = assessPlanningRequirementProfile(project, brief);
+    const requirements = buildPlanningEvaluationRequirements(
+      type,
+      brief,
+      project,
+    );
+    const errors = validatePlanningRequirementEvidence(requirements, content);
+    if (errors.length) {
+      throw new BadRequestException({
+        message: 'Planning checklist evidence is incomplete or invalid',
+        errors,
+      });
+    }
+
+    return {
+      version: 2,
+      submissionType: type,
+      profile,
+      requirements,
+      capturedAt: new Date().toISOString(),
     };
   }
 
@@ -200,11 +237,22 @@ export class PlanningEvaluationsService {
     }
 
     const type = this.submissionType(submission.submissionType);
-    const brief = await this.briefRepo.findOne({
-      where: { projectId: submission.projectId },
-    });
-    const requirements = buildPlanningEvaluationRequirements(type, brief);
+    const [project, brief] = await Promise.all([
+      this.projectRepo.findOne({ where: { id: submission.projectId } }),
+      this.briefRepo.findOne({ where: { projectId: submission.projectId } }),
+    ]);
+    if (!project) throw new NotFoundException('Project not found');
     const existingSnapshot = this.asRecord(submission.evaluationRequirements);
+    const snapshottedRequirements = Array.isArray(existingSnapshot.requirements)
+      ? (existingSnapshot.requirements as PlanningEvaluationRequirement[])
+      : [];
+    const requirements = snapshottedRequirements.length
+      ? snapshottedRequirements
+      : buildPlanningEvaluationRequirements(type, brief, project);
+    const snapshottedProfile = this.asRecord(existingSnapshot.profile);
+    const profile = Object.keys(snapshottedProfile).length
+      ? snapshottedProfile
+      : assessPlanningRequirementProfile(project, brief);
     const preservedVerdict = this.asRecord(existingSnapshot.previousVerdict);
     const preservedAuditBundle = this.asRecord(
       existingSnapshot.previousAuditBundle,
@@ -213,9 +261,15 @@ export class PlanningEvaluationsService {
       submission.evaluationResult ??
       (Object.keys(preservedVerdict).length > 0 ? preservedVerdict : null);
     submission.evaluationRequirements = {
-      version: 1,
+      version: 2,
       submissionType: type,
+      profile,
       requirements,
+      capturedAt:
+        (typeof existingSnapshot.capturedAt === 'string' &&
+        existingSnapshot.capturedAt.trim()
+          ? existingSnapshot.capturedAt
+          : null) ?? new Date().toISOString(),
       previousVerdict,
       previousAuditBundle:
         submission.evaluationAuditBundle ??
@@ -395,7 +449,11 @@ export class PlanningEvaluationsService {
     const snapshot = this.asRecord(submission.evaluationRequirements);
     const requirements = Array.isArray(snapshot.requirements)
       ? (snapshot.requirements as PlanningEvaluationRequirement[])
-      : buildPlanningEvaluationRequirements(type, brief);
+      : buildPlanningEvaluationRequirements(type, brief, project);
+    const snapshottedProfile = this.asRecord(snapshot.profile);
+    const requirementProfile = Object.keys(snapshottedProfile).length
+      ? snapshottedProfile
+      : assessPlanningRequirementProfile(project, brief);
     const previousSubmission = await this.submissionRepo
       .createQueryBuilder('submission')
       .where('submission.project_id = :projectId', {
@@ -435,6 +493,7 @@ export class PlanningEvaluationsService {
           }
         : {},
       requirements,
+      requirementProfile,
       submission: {
         submissionId: submission.id,
         submissionVersion: submission.version,

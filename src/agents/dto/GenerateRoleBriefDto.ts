@@ -25,5 +25,9 @@ export class GenerateRoleBriefDto {
 
   @IsOptional()
   @IsObject()
+  requirementProfile?: Record<string, unknown> | null;
+
+  @IsOptional()
+  @IsObject()
   freelancer?: Record<string, unknown> | null;
 }

@@ -20,6 +20,10 @@ import { ProjectStatusHistory } from 'src/projects/entities/project-status-histo
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from 'src/matching/entities/matching-candidate.entity';
+import {
+  assessPlanningRequirementProfile,
+  type PlanningComplexity,
+} from 'src/planning/planning-evaluation-requirements';
 import { CreateRoleAssignmentDto } from './dtos/create-role-assignment.dto';
 import { UpdateAssignmentStatusDto } from './dtos/update-assignment-status.dto';
 
@@ -468,7 +472,10 @@ export class RoleAssignmentsService {
 
     const brief = await this.briefRepo.findOne({ where: { projectId } });
     for (const assignment of assignments) {
-      if (!assignment.roleBrief) {
+      const roleBriefVersion = (
+        assignment.roleBrief as { generationVersion?: unknown } | null
+      )?.generationVersion;
+      if (!assignment.roleBrief || roleBriefVersion !== 2) {
         assignment.roleBrief = this.buildLocalRoleBrief(
           assignment.roleKey,
           assignment.project,
@@ -731,12 +738,23 @@ export class RoleAssignmentsService {
       const brief = await this.briefRepo.findOne({
         where: { projectId: assignment.projectId },
       });
+      const requirementProfile = assessPlanningRequirementProfile(
+        assignment.project,
+        brief,
+      );
       const result = await this.aiService.generateRoleBrief({
         assignmentId: assignment.id,
         roleKey: assignment.roleKey,
         project: this.projectRoleBriefInput(assignment.project),
-        brief: this.briefRoleBriefInput(brief),
-        standardExpectations: this.standardRoleExpectations(assignment.roleKey),
+        brief: {
+          ...(this.briefRoleBriefInput(brief) ?? {}),
+          coreFeatures: requirementProfile.features,
+        },
+        requirementProfile,
+        standardExpectations: this.standardRoleExpectations(
+          assignment.roleKey,
+          requirementProfile.complexity,
+        ),
         freelancer: assignment.freelancerProfile
           ? {
               id: assignment.freelancerProfile.id,
@@ -748,7 +766,11 @@ export class RoleAssignmentsService {
       });
 
       const update: QueryDeepPartialEntity<ProjectRoleAssignment> = {
-        roleBrief: result,
+        roleBrief: {
+          ...result,
+          generationVersion: 2,
+          requirementProfile,
+        },
         roleBriefStatus: result.source === 'fastapi' ? 'generated' : 'fallback',
         roleBriefGeneratedAt: new Date(),
         roleBriefError: null,
@@ -778,6 +800,8 @@ export class RoleAssignmentsService {
     const roleLabel = this.roleLabel(roleKey);
     const projectName = project.title || 'this project';
     const domain = brief?.domain ? ` in ${brief.domain}` : '';
+    const requirementProfile = assessPlanningRequirementProfile(project, brief);
+    const complexity = requirementProfile.complexity;
     const commonInputs = [
       'Confirmed requirements brief',
       'Project goal, users, core features, target platforms, budget, and deadline',
@@ -785,6 +809,8 @@ export class RoleAssignmentsService {
     ];
 
     return {
+      generationVersion: 2,
+      requirementProfile,
       title: `${roleLabel} planning brief for ${projectName}`,
       summary: [
         `${roleLabel} assignment for ${projectName}${domain}.`,
@@ -796,36 +822,10 @@ export class RoleAssignmentsService {
       ]
         .filter(Boolean)
         .join(' '),
-      objectives:
-        roleKey === 'ui_ux'
-          ? [
-              'Turn the requirements into clear user journeys and screens.',
-              'Define the first-version UX, responsive behavior, and visual direction.',
-              'Prepare a handoff that lets frontend developers build without guessing layout or interaction details.',
-            ]
-          : [
-              'Turn the requirements into a practical technical architecture.',
-              'Define system boundaries, data model, APIs, integrations, and major trade-offs.',
-              'Prepare a handoff that lets the Scrum Master split implementation into dependency-aware work.',
-            ],
-      responsibilities: this.standardRoleExpectations(roleKey),
+      objectives: this.roleObjectives(roleKey, complexity),
+      responsibilities: this.standardRoleExpectations(roleKey, complexity),
       requiredInputs: commonInputs,
-      expectedDeliverables:
-        roleKey === 'ui_ux'
-          ? [
-              'User flow map for the main journeys',
-              'Screen list and wireframe-level layout notes',
-              'Design system direction: colors, typography, spacing, components, forms, and states',
-              'Responsive behavior for desktop and mobile',
-              'UX risks, accessibility notes, and open questions',
-            ]
-          : [
-              'Architecture overview and recommended stack',
-              'Module/service boundaries',
-              'Database entities and relationships',
-              'API contract outline',
-              'Security, performance, integrations, deployment, and risk notes',
-            ],
+      expectedDeliverables: this.expectedRoleDeliverables(roleKey, complexity),
       acceptanceCriteria: [
         'The deliverable is specific to this project, not a generic template.',
         'Confirmed decisions and assumptions are clearly separated.',
@@ -885,24 +885,98 @@ export class RoleAssignmentsService {
     };
   }
 
-  private standardRoleExpectations(roleKey: string) {
+  private standardRoleExpectations(
+    roleKey: string,
+    complexity: PlanningComplexity = 'standard',
+  ) {
+    if (complexity === 'trivial') {
+      return roleKey === 'ui_ux'
+        ? [
+            'Define the one in-scope screen with exact content, hierarchy, spacing, typography, and colors.',
+            'Document only relevant responsive and accessibility behavior.',
+            'Provide a lightweight frontend handoff; Figma, a prototype, and a full design system are optional.',
+          ]
+        : [
+            'Choose the smallest suitable static, serverless, or monolithic solution and explain the cost trade-off.',
+            'Define exact acceptance, repository, deployment, and live-link handoff details.',
+            'Explicitly identify backend, API, database, authentication, or integration concerns that do not apply instead of designing them.',
+          ];
+    }
+
     if (roleKey === 'ui_ux') {
       return [
         'Map the primary user journeys and admin/staff journeys.',
-        'Define screens, states, edge cases, empty states, and validation behavior.',
+        'Define only applicable screens, states, edge cases, empty states, and validation behavior.',
         'Choose a clean design direction aligned with the customer preferences and project domain.',
-        'Document reusable components and responsive rules.',
+        'Document reusable components and responsive rules in proportion to the number of screens.',
         'Call out UX risks and unresolved product decisions.',
       ];
     }
 
     return [
       'Define the system architecture and major technical decisions.',
-      'Describe modules, data ownership, API boundaries, and third-party integrations.',
-      'Identify security, performance, reliability, deployment, and observability concerns.',
+      'Describe only applicable modules, data ownership, API boundaries, and third-party integrations.',
+      'Identify relevant security, performance, reliability, deployment, and observability concerns without inventing infrastructure.',
       'List implementation dependencies and risky unknowns.',
       'Provide a handoff that the Scrum Master can convert into milestones and tasks.',
     ];
+  }
+
+  private expectedRoleDeliverables(
+    roleKey: string,
+    complexity: PlanningComplexity,
+  ) {
+    if (complexity === 'trivial') {
+      return roleKey === 'ui_ux'
+        ? [
+            'One inspectable screen specification or mockup',
+            'Responsive and accessibility notes',
+            'Exact content, style values, assets, and frontend acceptance checklist',
+          ]
+        : [
+            'Minimal solution and hosting decision',
+            'Scope boundaries and essential quality checks',
+            'Repository, deployment, verification, rollback, and live-link handoff',
+          ];
+    }
+    return roleKey === 'ui_ux'
+      ? [
+          'In-scope user flows and screen inventory',
+          'Implementation-ready designs without duplicate artifact ceremony',
+          'Proportionate design rules, responsive behavior, accessibility, and states',
+          'Developer handoff notes and unresolved questions',
+        ]
+      : [
+          'Architecture overview and recommended stack',
+          'Applicable module or service boundaries',
+          'Applicable data, API, security, integration, and operational contracts',
+          'Implementation risks, dependency order, and handoff checkpoints',
+        ];
+  }
+
+  private roleObjectives(roleKey: string, complexity: PlanningComplexity) {
+    if (complexity === 'trivial') {
+      return roleKey === 'ui_ux'
+        ? [
+            'Define the single in-scope screen clearly enough to implement.',
+            'Keep responsive, accessibility, content, and visual decisions proportionate to the small scope.',
+          ]
+        : [
+            'Choose the smallest practical solution for the confirmed result and budget.',
+            'Give implementation, deployment, and acceptance details without inventing services or contracts.',
+          ];
+    }
+    return roleKey === 'ui_ux'
+      ? [
+          'Turn the requirements into clear in-scope user journeys and screens.',
+          'Define first-version UX, responsive behavior, accessibility, and visual direction.',
+          'Prepare a handoff that lets frontend developers build without guessing.',
+        ]
+      : [
+          'Turn the requirements into a practical technical architecture.',
+          'Define only applicable system, data, API, integration, and operational boundaries.',
+          'Prepare a handoff the Scrum Master can split into dependency-aware work.',
+        ];
   }
 
   private assignmentRoleBriefSummary(assignment: ProjectRoleAssignment) {

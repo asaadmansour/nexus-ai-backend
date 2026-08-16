@@ -132,6 +132,14 @@ export class PlanningSubmissionsService {
 
     const status = dto.status ?? 'submitted';
     if (status === 'submitted') this.assertSubmissionHasEvidence(dto);
+    const evaluationRequirements =
+      status === 'submitted'
+        ? await this.planningEvaluationsService.prepareSubmissionRequirements(
+            projectId,
+            dto.submissionType,
+            dto.content,
+          )
+        : null;
 
     const submission = await this.dataSource.transaction(async (manager) => {
       const lockedAssignment = await manager
@@ -187,6 +195,7 @@ export class PlanningSubmissionsService {
           summary: dto.summary ?? null,
           content: dto.content ?? null,
           fileUrls: dto.fileUrls ?? null,
+          evaluationRequirements,
           submittedAt: status === 'submitted' ? new Date() : null,
         }),
       );

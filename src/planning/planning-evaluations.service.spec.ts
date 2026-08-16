@@ -43,7 +43,13 @@ describe('PlanningEvaluationsService verdict history', () => {
     } as unknown as ConfigService;
     const service = new PlanningEvaluationsService(
       submissionRepo,
-      emptyRepo as Repository<Project>,
+      {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'project-id',
+          title: 'Test project',
+          description: 'Standard application',
+        }),
+      } as unknown as Repository<Project>,
       {
         findOne: jest.fn().mockResolvedValue(null),
       } as unknown as Repository<Brief>,

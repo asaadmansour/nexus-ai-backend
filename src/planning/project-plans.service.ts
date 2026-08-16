@@ -39,6 +39,7 @@ import { GeneratePlanDto } from './dtos/generate-plan.dto';
 import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
 import { UpdateTaskDto } from './dtos/update-task.dto';
+import { assessPlanningRequirementProfile } from './planning-evaluation-requirements';
 
 interface Requester {
   userId: string;
@@ -113,6 +114,7 @@ export class ProjectPlansService {
     );
     const brief = await this.briefRepo.findOne({ where: { projectId } });
     const planningTeam = await this.buildPlanningTeam(projectId);
+    const requirementProfile = assessPlanningRequirementProfile(project, brief);
 
     const generated = await this.aiService.generateProjectPlan({
       projectId,
@@ -132,18 +134,24 @@ export class ProjectPlansService {
         deadline: project.deadline?.toISOString() ?? null,
         isDeadlineFlexible: project.isDeadlineFlexible,
       },
-      brief: this.buildBriefForPlanning(brief),
+      brief: {
+        ...this.buildBriefForPlanning(brief),
+        coreFeatures: requirementProfile.features,
+        requirementProfile,
+      },
       architectureSubmission: {
         id: architecture.id,
         summary: architecture.summary,
         content: architecture.content ?? {},
         fileUrls: architecture.fileUrls ?? {},
+        evaluationRequirements: architecture.evaluationRequirements ?? {},
       },
       uiuxSubmission: {
         id: uiux.id,
         summary: uiux.summary,
         content: uiux.content ?? {},
         fileUrls: uiux.fileUrls ?? {},
+        evaluationRequirements: uiux.evaluationRequirements ?? {},
       },
       planningTeam,
       notes: dto.notes,
