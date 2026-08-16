@@ -6,6 +6,7 @@ import { ProjectsModule } from 'src/projects/projects.module';
 import { QueuesModule } from 'src/queues/queues.module';
 import {
   PlanningSubmissionDetailController,
+  FreelancerTasksController,
   ProjectPlanDetailController,
   ProjectPlanningController,
   ProjectTaskController,
@@ -38,6 +39,7 @@ const queueProcessors = areQueuesEnabled()
     PlanningSubmissionDetailController,
     ProjectPlanDetailController,
     ProjectTaskController,
+    FreelancerTasksController,
     AdminPlanningController,
   ],
   providers: [

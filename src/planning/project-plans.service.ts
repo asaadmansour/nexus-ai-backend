@@ -146,6 +146,8 @@ export class ProjectPlansService {
         content: architecture.content ?? {},
         fileUrls: architecture.fileUrls ?? {},
         evaluationRequirements: architecture.evaluationRequirements ?? {},
+        evaluationResult: architecture.evaluationResult ?? {},
+        adminNotes: architecture.adminNotes,
       },
       uiuxSubmission: {
         id: uiux.id,
@@ -153,6 +155,8 @@ export class ProjectPlansService {
         content: uiux.content ?? {},
         fileUrls: uiux.fileUrls ?? {},
         evaluationRequirements: uiux.evaluationRequirements ?? {},
+        evaluationResult: uiux.evaluationResult ?? {},
+        adminNotes: uiux.adminNotes,
       },
       planningTeam,
       notes: dto.notes,
@@ -225,12 +229,25 @@ export class ProjectPlansService {
     };
   }
 
-  async enqueueAutomaticGeneration(projectId: string, adminUserId: string) {
+  async enqueueAutomaticGeneration(
+    projectId: string,
+    adminUserId: string,
+    input: {
+      architectureSubmissionId?: string;
+      uiuxSubmissionId?: string;
+      notes?: string;
+    } = {},
+  ) {
     const architecture = await this.resolveApprovedSubmission(
       projectId,
       'architecture',
+      input.architectureSubmissionId,
     );
-    const uiux = await this.resolveApprovedSubmission(projectId, 'ui_ux');
+    const uiux = await this.resolveApprovedSubmission(
+      projectId,
+      'ui_ux',
+      input.uiuxSubmissionId,
+    );
 
     const existingPlan = await this.findCurrentPlanForInputs(
       projectId,
@@ -269,6 +286,7 @@ export class ProjectPlansService {
         uiuxSubmissionId: uiux.id,
         requestedBy: adminUserId,
         notes:
+          input.notes ??
           'Automatic scrum plan generation after architecture and UI/UX approval.',
       });
 
@@ -921,7 +939,36 @@ export class ProjectPlansService {
       relations: ['dependencies'],
     });
 
-    const data = tasks.map((task) => ({
+    const data = tasks.map((task) => this.taskResponse(task));
+    return { data, total };
+  }
+
+  async listAssignedFreelancerTasks(
+    userId: string,
+    query: { status?: string; page: number; limit: number },
+  ) {
+    const profile = await this.profileRepo.findOne({ where: { userId } });
+    if (!profile) return { data: [], total: 0 };
+
+    const where: Record<string, unknown> = {
+      assignedFreelancerProfileId: profile.id,
+    };
+    if (query.status) where.status = query.status;
+
+    const [tasks, total] = await this.taskRepo.findAndCount({
+      where,
+      order: { dueAt: 'ASC', orderIndex: 'ASC', createdAt: 'DESC' },
+      skip: (query.page - 1) * query.limit,
+      take: query.limit,
+      relations: ['dependencies', 'project', 'milestone'],
+    });
+
+    const data = tasks.map((task) => this.taskResponse(task, true));
+    return { data, total };
+  }
+
+  private taskResponse(task: ProjectTask, includeContext = false) {
+    return {
       id: task.id,
       projectId: task.projectId,
       projectPlanId: task.projectPlanId,
@@ -935,19 +982,41 @@ export class ProjectPlansService {
       roleKey: task.roleKey,
       requiredSkills: task.requiredSkills,
       estimatedHours: task.estimatedHours,
+      budgetAmount: task.budgetAmount,
+      currency: task.currency,
       orderIndex: task.orderIndex,
       startsAt: task.startsAt,
       dueAt: task.dueAt,
       acceptanceCriteria: task.acceptanceCriteria,
       metadata: task.metadata,
+      sourceMatchingRunId: task.sourceMatchingRunId,
+      sourceCandidateId: task.sourceCandidateId,
+      assignedBy: task.assignedBy,
+      assignedAt: task.assignedAt,
+      project:
+        includeContext && task.project
+          ? {
+              id: task.project.id,
+              title: task.project.title,
+              status: task.project.status,
+              currency: task.project.currency,
+            }
+          : null,
+      milestone:
+        includeContext && task.milestone
+          ? {
+              id: task.milestone.id,
+              title: task.milestone.title,
+              status: task.milestone.status,
+            }
+          : null,
       dependencies: (task.dependencies ?? []).map((dep) => ({
         taskId: dep.taskId,
         dependsOnTaskId: dep.dependsOnTaskId,
         dependencyType: dep.dependencyType,
         notes: dep.notes,
       })),
-    }));
-    return { data, total };
+    };
   }
 
   async updateTask(taskId: string, dto: UpdateTaskDto, requester: Requester) {

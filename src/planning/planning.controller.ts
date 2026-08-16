@@ -34,7 +34,7 @@ import { PlanningEvaluationsService } from './planning-evaluations.service';
 function parsePage(page: string, limit: string) {
   return {
     page: Math.max(1, parseInt(page, 10) || 1),
-    limit: Math.max(1, Math.min(parseInt(limit, 10) || 20, 100)),
+    limit: Math.max(1, Math.min(parseInt(limit, 10) || 20, 200)),
   };
 }
 
@@ -148,7 +148,20 @@ export class ProjectPlanningController {
   async generatePlan(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() dto: GeneratePlanDto,
+    @CurrentUser() user: JwtPayload,
   ) {
+    if (dto.mode === 'async') {
+      const data = await this.plans.enqueueAutomaticGeneration(
+        projectId,
+        user.sub,
+        {
+          architectureSubmissionId: dto.architectureSubmissionId,
+          uiuxSubmissionId: dto.uiuxSubmissionId,
+          notes: dto.notes,
+        },
+      );
+      return { status: 'success', data };
+    }
     const data = await this.plans.generate(projectId, dto);
     return { status: 'success', data };
   }
@@ -311,5 +324,27 @@ export class ProjectTaskController {
       role: user.role,
     });
     return { status: 'success', data };
+  }
+}
+
+@Controller('freelancer/tasks')
+@UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
+export class FreelancerTasksController {
+  constructor(private readonly plans: ProjectPlansService) {}
+
+  @Get()
+  @Roles(UserRole.FREELANCER)
+  async listMine(
+    @CurrentUser() user: JwtPayload,
+    @Query('status') status?: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '50',
+  ) {
+    const paged = parsePage(page, limit);
+    const { data, total } = await this.plans.listAssignedFreelancerTasks(
+      user.sub,
+      { status, ...paged },
+    );
+    return { status: 'success', data, total, ...paged };
   }
 }
