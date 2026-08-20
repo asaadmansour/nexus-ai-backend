@@ -2,6 +2,15 @@ import { ConfigService } from '@nestjs/config';
 import { GithubService } from './github.service';
 
 describe('GithubService read-only inspection', () => {
+  const service = () =>
+    new GithubService({
+      get: jest.fn((key: string) => {
+        if (key === 'GITHUB_TOKEN') return 'test-token';
+        if (key === 'GITHUB_API_URL') return 'https://api.github.test';
+        return undefined;
+      }),
+    } as unknown as ConfigService);
+
   it('builds complete source and static verification evidence for a tiny PR', async () => {
     const commitSha = 'a'.repeat(40);
     const fetchMock = jest
@@ -67,16 +76,10 @@ describe('GithubService read-only inspection', () => {
         }
         return Promise.resolve(new Response('not found', { status: 404 }));
       });
-    const service = new GithubService({
-      get: jest.fn((key: string) => {
-        if (key === 'GITHUB_TOKEN') return 'test-token';
-        if (key === 'GITHUB_API_URL') return 'https://api.github.test';
-        return undefined;
-      }),
-    } as unknown as ConfigService);
+    const github = service();
 
     try {
-      const result = await service.inspectRepositorySnapshot({
+      const result = await github.inspectRepositorySnapshot({
         owner: 'muhanadmedhat',
         repoName: 'project-hello-world',
         commitSha,
@@ -109,6 +112,62 @@ describe('GithubService read-only inspection', () => {
       expect(firstExcerpt.path).toBe('index.html');
       expect(String(firstExcerpt.content)).toContain('<h1>Hello, world!</h1>');
       expect(result.audit.executionMode).toBe('http-readonly');
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('treats a concurrently completed merge as successful', async () => {
+    const headSha = 'a'.repeat(40);
+    const baseSha = 'b'.repeat(40);
+    let pullReads = 0;
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation((input, init) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        if (url.endsWith('/pulls/4') && init?.method === 'GET') {
+          pullReads += 1;
+          return Promise.resolve(
+            Response.json({
+              number: 4,
+              state: pullReads === 1 ? 'open' : 'closed',
+              draft: false,
+              merged: pullReads > 1,
+              merge_commit_sha: pullReads > 1 ? 'c'.repeat(40) : null,
+              head: { sha: headSha, ref: 'feature' },
+              base: { sha: baseSha, ref: 'main' },
+            }),
+          );
+        }
+        if (url.endsWith('/pulls/4/merge') && init?.method === 'PUT') {
+          return Promise.resolve(
+            Response.json(
+              { merged: false, message: 'Base branch was modified' },
+              { status: 409 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response('not found', { status: 404 }));
+      });
+
+    try {
+      await expect(
+        service().mergePullRequest({
+          owner: 'nexus-ai',
+          repoName: 'project',
+          number: 4,
+          expectedHeadSha: headSha,
+        }),
+      ).resolves.toEqual({
+        merged: true,
+        sha: 'c'.repeat(40),
+        message: 'Pull request was merged by a concurrent integration run',
+      });
     } finally {
       fetchMock.mockRestore();
     }

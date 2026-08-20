@@ -81,14 +81,30 @@ export class UserService {
   }
 
   async updateMe(updated: UpdateUserDto, userId: string) {
-    const userUpdated = await this.userRepository.update(
-      { id: userId },
-      updated,
-    );
-    if (userUpdated.affected === 0)
-      throw new NotFoundException('No User Found');
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('No User Found');
+
+    if (
+      updated.phoneNumber !== undefined &&
+      updated.phoneNumber !== user.phoneNumber
+    ) {
+      const existing = await this.userRepository.findOne({
+        where: { phoneNumber: updated.phoneNumber },
+        select: { id: true },
+      });
+      if (existing && existing.id !== user.id) {
+        throw new ConflictException('This phone number is already registered.');
+      }
+      user.phoneNumber = updated.phoneNumber;
+      user.isPhoneVerified = false;
+      user.phoneVerifiedAt = null;
+    }
+    if (updated.firstName !== undefined) user.firstName = updated.firstName;
+    if (updated.lastName !== undefined) user.lastName = updated.lastName;
+    await this.userRepository.save(user);
     return {
       status: 'updated successfully',
+      requiresPhoneVerification: !user.isPhoneVerified,
     };
   }
 

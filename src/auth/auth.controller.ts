@@ -19,6 +19,7 @@ import { LogInUserDto } from './dtos/login-user.dto';
 import { AuthGuard } from 'src/common/guards/auth.guard';
 import { CompleteSignupDto } from './dtos/complete-signup.dto';
 import { VerifyEmailDto } from './dtos/verify-email.dto';
+import { VerifyPhoneDto } from './dtos/verify-phone.dto';
 import { RedisService } from 'src/redis/redis.service';
 import * as crypto from 'crypto';
 import type {
@@ -219,6 +220,24 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.authService.verifyEmail(req.user.sub, body.code);
+    this.setRefreshTokenCookie(res, result.refreshToken);
+    return { status: 'success', accessToken: result.accessToken };
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('phone/send-verification')
+  async sendPhoneVerification(@Req() req: AuthenticatedRequest) {
+    return this.authService.sendPhoneVerification(req.user.sub);
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('phone/verify')
+  async verifyPhone(
+    @Req() req: AuthenticatedRequest,
+    @Body() body: VerifyPhoneDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.authService.verifyPhone(req.user.sub, body.code);
     this.setRefreshTokenCookie(res, result.refreshToken);
     return { status: 'success', accessToken: result.accessToken };
   }

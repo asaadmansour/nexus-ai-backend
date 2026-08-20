@@ -25,6 +25,13 @@ export function validateEnv(config: Env): Env {
       'GITHUB_OWNER',
       'GITHUB_WEBHOOK_SECRET',
     );
+    if ((config.PHONE_VERIFICATION_REQUIRED ?? 'true') === 'true') {
+      requiredKeys.push(
+        'TWILIO_ACCOUNT_SID',
+        'TWILIO_AUTH_TOKEN',
+        'TWILIO_VERIFY_SERVICE_SID',
+      );
+    }
   }
   const missingKeys = requiredKeys.filter((key) => !config[key]);
 
@@ -55,6 +62,7 @@ export function validateEnv(config: Env): Env {
       'SMTP_PASSWORD',
       'GITHUB_TOKEN',
       'GITHUB_WEBHOOK_SECRET',
+      'TWILIO_AUTH_TOKEN',
     ].filter((key) => config[key] === 'change-me');
     if (placeholderKeys.length > 0) {
       throw new Error(

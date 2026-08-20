@@ -32,6 +32,19 @@ import { ProjectPayment } from './project-payment.entity';
       '"approved_submission_id" IS NOT NULL AND "entry_type" = \'release\' AND "status" = \'posted\'',
   },
 )
+@Index('escrow_ledger_entries_project_platform_fee_uidx', ['projectId'], {
+  unique: true,
+  where: '"entry_type" = \'platform_fee\' AND "status" = \'posted\'',
+})
+@Index('escrow_ledger_entries_payment_hold_uidx', ['paymentId'], {
+  unique: true,
+  where:
+    '"payment_id" IS NOT NULL AND "entry_type" = \'hold\' AND "status" = \'posted\'',
+})
+@Index('escrow_ledger_entries_project_governance_release_uidx', ['projectId'], {
+  unique: true,
+  where: '"entry_type" = \'governance_release\' AND "status" = \'posted\'',
+})
 export class EscrowLedgerEntry {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

@@ -21,6 +21,7 @@ import { PaymentsModule } from './payments/payments.module';
 import { RepositoriesModule } from './repositories/repositories.module';
 import { DeliveryModule } from './delivery/delivery.module';
 import { EvaluationsModule } from './evaluations/evaluations.module';
+import { ReviewerModule } from './reviewer/reviewer.module';
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { EvaluationsModule } from './evaluations/evaluations.module';
     RepositoriesModule,
     DeliveryModule,
     EvaluationsModule,
+    ReviewerModule,
   ],
   controllers: [AppController],
   providers: [AppService],

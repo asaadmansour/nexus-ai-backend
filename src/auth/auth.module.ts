@@ -10,11 +10,12 @@ import { RedisModule } from 'src/redis/redis.module';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { GoogleStrategy } from './strategies/google.strategy';
 import { EmailModule } from 'src/email/email.module';
+import { PhoneVerificationChallenge } from './entities/phone-verification-challenge.entity';
 
 @Module({
   imports: [
     PassportModule.register({ defaultStrategy: 'google' }),
-    TypeOrmModule.forFeature([User, RefreshToken]),
+    TypeOrmModule.forFeature([User, RefreshToken, PhoneVerificationChallenge]),
     JwtModule.registerAsync({
       global: true,
       useFactory: (configService: ConfigService) => ({

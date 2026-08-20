@@ -27,6 +27,7 @@ import { ProjectPlanningSubmission } from 'src/projects/entities/project-plannin
 import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { TaskCheckpoint } from 'src/projects/entities/task-checkpoint.entity';
 import { ProjectTaskDependency } from 'src/projects/entities/project-task-dependency.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
@@ -43,6 +44,7 @@ import { assessPlanningRequirementProfile } from './planning-evaluation-requirem
 import {
   createProjectBudgetAllocation,
   implementationBudgetAmount,
+  platformFeeAllocation,
 } from './project-budget-allocation';
 import { allocateProjectTaskBudgets } from './task-budget-allocation';
 
@@ -809,6 +811,52 @@ export class ProjectPlansService {
             }),
           );
           taskIdByKey.set(task.key, saved.id);
+
+          const checkpoints = task.checkpoints?.length
+            ? task.checkpoints
+            : [
+                {
+                  key: `${task.key}-progress`,
+                  title: 'Progress checkpoint',
+                  offsetDays: Math.max(
+                    0,
+                    Math.floor((task.durationDays ?? 1) / 2),
+                  ),
+                  weightPercent: 40,
+                  penaltyPercent: 3,
+                },
+                {
+                  key: `${task.key}-final`,
+                  title: 'Final delivery',
+                  offsetDays: Math.max(1, task.durationDays ?? 1),
+                  weightPercent: 60,
+                  penaltyPercent: 7,
+                },
+              ];
+          for (const [checkpointIndex, checkpoint] of checkpoints.entries()) {
+            await manager.save(
+              TaskCheckpoint,
+              manager.create(TaskCheckpoint, {
+                taskId: saved.id,
+                title: checkpoint.title,
+                orderIndex: checkpointIndex,
+                dueAt: this.dateAtPlanDay(
+                  plan.createdAt,
+                  (task.startDay ?? 0) +
+                    Math.min(
+                      Math.max(0, checkpoint.offsetDays),
+                      Math.max(1, task.durationDays ?? 1),
+                    ),
+                ),
+                weightPercent: Number(checkpoint.weightPercent).toFixed(2),
+                penaltyPercent: Number(checkpoint.penaltyPercent).toFixed(2),
+                graceMinutes: 60,
+                status: 'pending',
+                penaltyAmount: '0.00',
+                metadata: { key: checkpoint.key },
+              }),
+            );
+          }
         }
 
         let dependencyCount = 0;
@@ -864,6 +912,8 @@ export class ProjectPlansService {
               quote.amount,
               quote.currency,
             );
+            project.platformFeeAmount =
+              platformFeeAllocation(project.budgetAllocation)?.amount ?? '0.00';
           }
         }
         project.status = ProjectStatus.IMPLEMENTATION_READY;
@@ -1020,6 +1070,10 @@ export class ProjectPlansService {
       orderIndex: task.orderIndex,
       startsAt: task.startsAt,
       dueAt: task.dueAt,
+      penaltyAmount: task.penaltyAmount,
+      deadlineStrikes: task.deadlineStrikes,
+      maxDeadlineStrikes: task.maxDeadlineStrikes,
+      assignmentStatus: task.assignmentStatus,
       acceptanceCriteria: task.acceptanceCriteria,
       metadata: task.metadata,
       sourceMatchingRunId: task.sourceMatchingRunId,

@@ -8,7 +8,13 @@ import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { User } from 'src/users/entities/user.entity';
-import { Repository, DataSource, EntityManager, QueryRunner } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  MoreThan,
+  QueryRunner,
+  Repository,
+} from 'typeorm';
 import { SignUpUserDto } from './dtos/signup-user.dto';
 import { JwtService } from '@nestjs/jwt';
 import { LogInUserDto } from './dtos/login-user.dto';
@@ -18,6 +24,7 @@ import { UserRole } from 'src/common/enums/user-role.enum';
 import { EmailService } from 'src/email/email.service';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { sanitizeUser } from 'src/common/utils/sanitize-user.util';
+import { PhoneVerificationChallenge } from './entities/phone-verification-challenge.entity';
 import type {
   JwtPayload,
   RefreshJwtPayload,
@@ -29,6 +36,8 @@ export class AuthService {
     @InjectRepository(User) private readonly userRepository: Repository<User>,
     @InjectRepository(RefreshToken)
     private readonly refreshTokenRepository: Repository<RefreshToken>,
+    @InjectRepository(PhoneVerificationChallenge)
+    private readonly phoneChallengeRepository: Repository<PhoneVerificationChallenge>,
     private readonly jwtService: JwtService,
     private readonly redisService: RedisService,
     private readonly dataSource: DataSource,
@@ -62,12 +71,14 @@ export class AuthService {
     email?: string,
     role?: UserRole,
     isEmailVerified?: boolean,
+    isPhoneVerified?: boolean,
   ) {
     const accessToken = this.jwtService.sign({
       sub: userId,
       ...(email && { email }),
       ...(role && { role }),
       ...(isEmailVerified !== undefined && { isEmailVerified }),
+      ...(isPhoneVerified !== undefined && { isPhoneVerified }),
     });
     const refreshToken = this.jwtService.sign(
       { sub: userId },
@@ -123,6 +134,7 @@ export class AuthService {
         savedUser.email,
         savedUser.role,
         savedUser.isEmailVerified,
+        savedUser.isPhoneVerified,
       );
       await queryRunner.commitTransaction();
       return { user: userResponse, accessToken, refreshToken };
@@ -147,6 +159,7 @@ export class AuthService {
           email: true,
           role: true,
           isEmailVerified: true,
+          isPhoneVerified: true,
         },
       });
       if (!dbUser || !dbUser.hashedPassword)
@@ -165,6 +178,7 @@ export class AuthService {
         dbUser.email,
         dbUser.role,
         dbUser.isEmailVerified,
+        dbUser.isPhoneVerified,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };
@@ -233,7 +247,13 @@ export class AuthService {
 
       const user = await queryRunner.manager.findOne(User, {
         where: { id: userId },
-        select: { id: true, email: true, role: true, isEmailVerified: true },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          isEmailVerified: true,
+          isPhoneVerified: true,
+        },
       });
       if (!user) throw new UnauthorizedException('Login again');
 
@@ -243,6 +263,7 @@ export class AuthService {
         user.email,
         user.role,
         user.isEmailVerified,
+        user.isPhoneVerified,
       );
       await queryRunner.commitTransaction();
       return { status: 'success', accessToken, refreshToken };
@@ -272,6 +293,7 @@ export class AuthService {
           role: true,
           phoneNumber: true,
           isEmailVerified: true,
+          isPhoneVerified: true,
         },
       });
 
@@ -306,6 +328,7 @@ export class AuthService {
     role: UserRole;
     phoneNumber: string | null;
     isEmailVerified: boolean;
+    isPhoneVerified: boolean;
   }) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -317,6 +340,7 @@ export class AuthService {
         reqUser.email,
         reqUser.role,
         reqUser.isEmailVerified,
+        reqUser.isPhoneVerified,
       );
       await queryRunner.commitTransaction();
 
@@ -366,6 +390,8 @@ export class AuthService {
       }
 
       user.phoneNumber = payload.phoneNumber;
+      user.isPhoneVerified = false;
+      user.phoneVerifiedAt = null;
       user.role = payload.role;
       if (payload.firstName) user.firstName = payload.firstName;
       if (payload.lastName) user.lastName = payload.lastName;
@@ -386,6 +412,7 @@ export class AuthService {
         user.email,
         user.role,
         user.isEmailVerified,
+        user.isPhoneVerified,
       );
 
       await queryRunner.commitTransaction();
@@ -486,6 +513,7 @@ export class AuthService {
         user.email,
         user.role,
         user.isEmailVerified,
+        user.isPhoneVerified,
       );
 
       await queryRunner.commitTransaction();
@@ -514,5 +542,193 @@ export class AuthService {
     } finally {
       await queryRunner.release();
     }
+  }
+
+  async sendPhoneVerification(userId: string) {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user?.phoneNumber) {
+      throw new BadRequestException(
+        'Add a valid phone number before requesting verification',
+      );
+    }
+    if (user.isPhoneVerified) {
+      throw new BadRequestException('Phone number is already verified');
+    }
+
+    const acquired = await this.redisService.setNx(
+      `verifyPhoneCooldown:${userId}`,
+      'true',
+      60,
+    );
+    if (!acquired) {
+      throw new BadRequestException(
+        'A code was sent recently. Please wait before retrying.',
+      );
+    }
+
+    const recentCount = await this.phoneChallengeRepository.count({
+      where: {
+        userId,
+        createdAt: MoreThan(new Date(Date.now() - 10 * 60 * 1000)),
+      },
+    });
+    if (recentCount >= 3) {
+      await this.redisService.del(`verifyPhoneCooldown:${userId}`);
+      throw new BadRequestException(
+        'Too many verification requests. Try again in ten minutes.',
+      );
+    }
+
+    try {
+      let providerRequestId: string | null = null;
+      const testCode = this.phoneVerificationTestCode();
+      if (!testCode) {
+        const response = await this.twilioVerifyRequest('Verifications', {
+          To: user.phoneNumber,
+          Channel: 'sms',
+        });
+        providerRequestId =
+          typeof response.sid === 'string' ? response.sid : null;
+      }
+
+      await this.phoneChallengeRepository.save(
+        this.phoneChallengeRepository.create({
+          userId,
+          phoneNumber: user.phoneNumber,
+          provider: testCode ? 'test_mode' : 'twilio_verify',
+          providerRequestId,
+          status: 'pending',
+          attemptCount: 0,
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+          verifiedAt: null,
+        }),
+      );
+      return {
+        status: 'success',
+        message: 'Verification code sent',
+        expiresInSeconds: 600,
+        testMode: Boolean(testCode),
+      };
+    } catch (error) {
+      await this.redisService.del(`verifyPhoneCooldown:${userId}`);
+      throw error;
+    }
+  }
+
+  async verifyPhone(userId: string, code: string) {
+    const challenge = await this.phoneChallengeRepository.findOne({
+      where: {
+        userId,
+        status: 'pending',
+        expiresAt: MoreThan(new Date()),
+      },
+      order: { createdAt: 'DESC' },
+    });
+    if (!challenge) {
+      throw new BadRequestException('Verification code expired or invalid');
+    }
+    if (challenge.attemptCount >= 5) {
+      challenge.status = 'failed';
+      await this.phoneChallengeRepository.save(challenge);
+      throw new BadRequestException(
+        'Too many failed attempts. Request a new verification code.',
+      );
+    }
+
+    challenge.attemptCount += 1;
+    const testCode = this.phoneVerificationTestCode();
+    let approved = testCode ? code === testCode : false;
+    if (!testCode) {
+      const response = await this.twilioVerifyRequest('VerificationCheck', {
+        To: challenge.phoneNumber,
+        Code: code,
+      });
+      approved = response.status === 'approved';
+    }
+    if (!approved) {
+      if (challenge.attemptCount >= 5) challenge.status = 'failed';
+      await this.phoneChallengeRepository.save(challenge);
+      throw new BadRequestException('Invalid verification code');
+    }
+
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const user = await queryRunner.manager.findOne(User, {
+        where: { id: userId },
+      });
+      if (!user || user.phoneNumber !== challenge.phoneNumber) {
+        throw new BadRequestException(
+          'The account phone number changed; request a new code',
+        );
+      }
+
+      const verifiedAt = new Date();
+      user.isPhoneVerified = true;
+      user.phoneVerifiedAt = verifiedAt;
+      challenge.status = 'approved';
+      challenge.verifiedAt = verifiedAt;
+      await queryRunner.manager.save([user, challenge]);
+
+      const { accessToken, refreshToken } = await this.generateTokens(
+        user.id,
+        queryRunner,
+        user.email,
+        user.role,
+        user.isEmailVerified,
+        true,
+      );
+      await queryRunner.commitTransaction();
+      await this.redisService.del(`verifyPhoneCooldown:${userId}`);
+      return { status: 'success', accessToken, refreshToken };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private phoneVerificationTestCode() {
+    if (process.env.NODE_ENV === 'production') return null;
+    const code = process.env.PHONE_VERIFICATION_TEST_CODE?.trim();
+    return code && /^\d{4,10}$/.test(code) ? code : null;
+  }
+
+  private async twilioVerifyRequest(
+    resource: 'Verifications' | 'VerificationCheck',
+    input: Record<string, string>,
+  ): Promise<Record<string, unknown>> {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+    if (!accountSid || !authToken || !serviceSid) {
+      throw new BadRequestException(
+        'Phone verification service is not configured',
+      );
+    }
+
+    const response = await fetch(
+      `https://verify.twilio.com/v2/Services/${encodeURIComponent(serviceSid)}/${resource}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString('base64')}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(input),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+    if (!response.ok) {
+      const message =
+        typeof body.message === 'string'
+          ? body.message
+          : 'Phone verification provider rejected the request';
+      throw new BadRequestException(message);
+    }
+    return body;
   }
 }

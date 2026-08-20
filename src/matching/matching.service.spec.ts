@@ -8,7 +8,6 @@ describe('MatchingService task assignment invariants', () => {
     expect(() =>
       assertTaskMatchingRunInvariant(
         {
-          id: 'run-b',
           targetType: 'task',
           targetTaskId: 'task-b',
           projectId: 'project-a',
@@ -23,7 +22,6 @@ describe('MatchingService task assignment invariants', () => {
     expect(() =>
       assertTaskMatchingRunInvariant(
         {
-          id: 'run-a',
           targetType: 'task',
           targetTaskId: 'task-a',
           projectId: 'project-a',
@@ -38,7 +36,6 @@ describe('MatchingService task assignment invariants', () => {
     expect(() =>
       assertTaskMatchingRunInvariant(
         {
-          id: 'run-a',
           targetType: 'task',
           targetTaskId: 'task-a',
           projectId: 'project-a',

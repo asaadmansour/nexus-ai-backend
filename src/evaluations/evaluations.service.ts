@@ -29,8 +29,10 @@ import { Project } from 'src/projects/entities/project.entity';
 import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { User } from 'src/users/entities/user.entity';
 import { QueueEvaluationDto } from './dtos/queue-evaluation.dto';
 import { RetryEvaluationDto } from './dtos/retry-evaluation.dto';
 import type {
@@ -499,6 +501,12 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
             `Could not notify owner of submission ${submission.id}: ${this.getErrorMessage(error)}`,
           ),
       );
+      await this.notifyPrincipalReviewer(submission, result).catch(
+        (error: unknown) =>
+          this.logger.error(
+            `Could not notify principal reviewer for submission ${submission.id}: ${this.getErrorMessage(error)}`,
+          ),
+      );
 
       await this.markJobCompleted(data.agentJobId, {
         evaluationRunId: run.id,
@@ -520,6 +528,11 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           this.getErrorMessage(error),
         );
         await this.markJobFailed(data.agentJobId, error, maxAttempts);
+        await this.notifyEvaluationFailure(
+          data.projectId,
+          data.taskId ?? null,
+          this.getErrorMessage(error),
+        ).catch(() => undefined);
         await this.queuePendingRepositoryEvaluation(
           data.submissionId,
           data.evaluationRunId,
@@ -1159,11 +1172,79 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       taskId: submission.taskId,
       title: 'Submission evaluated',
       body: result.passed
-        ? 'The AI evaluation of your submission passed. Admin review is next.'
+        ? 'The AI evaluation of your submission passed. Principal reviewer decision is next.'
         : result.revisionNotes ||
           result.findings[0] ||
           'The AI evaluation requested changes. Check the submission feedback.',
     });
+  }
+
+  private async notifyPrincipalReviewer(
+    submission: ProjectSubmission,
+    result: EvaluateSubmissionResult,
+  ) {
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId: submission.projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+    if (!reviewer?.freelancerProfile?.userId) return;
+    await this.notificationsService.createNotification({
+      userId: reviewer.freelancerProfile.userId,
+      projectId: submission.projectId,
+      taskId: submission.taskId,
+      type: 'reviewer_attention',
+      title: 'Implementation evaluation ready',
+      body: result.passed
+        ? `AI passed ${submission.title ?? 'the submission'}; your acceptance decision is ready.`
+        : `AI recommends revisions for ${submission.title ?? 'the submission'}; review its findings before deciding.`,
+      actionUrl: `/reviewer/projects/${submission.projectId}`,
+    });
+  }
+
+  private async notifyEvaluationFailure(
+    projectId: string,
+    taskId: string | null,
+    error: string,
+  ) {
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+    const admins = await this.dataSource.getRepository(User).find({
+      where: { role: UserRole.ADMIN },
+      select: { id: true },
+    });
+    const recipientIds = new Set(admins.map((admin) => admin.id));
+    if (reviewer?.freelancerProfile?.userId) {
+      recipientIds.add(reviewer.freelancerProfile.userId);
+    }
+    await Promise.all(
+      [...recipientIds].map((userId) =>
+        this.notificationsService.createNotification({
+          userId,
+          projectId,
+          taskId,
+          type: 'technical_attention',
+          title: 'AI evaluation needs technical attention',
+          body: `Automated evaluation exhausted its retries. Nexus operations can retry it; no approval can bypass the missing verdict. ${error.slice(0, 300)}`,
+          actionUrl: '/messages',
+        }),
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------

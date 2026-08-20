@@ -29,6 +29,7 @@ import { GeneratePlanDto } from './dtos/generate-plan.dto';
 import { ReviewPlanDto } from './dtos/review-plan.dto';
 import { MaterializePlanDto } from './dtos/materialize-plan.dto';
 import { UpdateTaskDto } from './dtos/update-task.dto';
+import { TaskDeadlinesService } from './task-deadlines.service';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
 
 function parsePage(page: string, limit: string) {
@@ -310,7 +311,34 @@ export class ProjectPlanDetailController {
 @Controller('project-tasks')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
 export class ProjectTaskController {
-  constructor(private readonly plans: ProjectPlansService) {}
+  constructor(
+    private readonly plans: ProjectPlansService,
+    private readonly taskDeadlines: TaskDeadlinesService,
+  ) {}
+
+  @Get(':taskId/checkpoints')
+  @Roles(UserRole.ADMIN, UserRole.FREELANCER)
+  async checkpoints(
+    @Param('taskId', ParseUUIDPipe) taskId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const data = await this.taskDeadlines.list(
+      taskId,
+      user.sub,
+      user.role === UserRole.ADMIN,
+    );
+    return { status: 'success', data };
+  }
+
+  @Patch(':taskId/checkpoints/:checkpointId/complete')
+  @Roles(UserRole.FREELANCER)
+  async completeCheckpoint(
+    @Param('checkpointId', ParseUUIDPipe) checkpointId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const data = await this.taskDeadlines.complete(checkpointId, user.sub);
+    return { status: 'success', data };
+  }
 
   @Patch(':taskId')
   @Roles(UserRole.ADMIN, UserRole.FREELANCER)

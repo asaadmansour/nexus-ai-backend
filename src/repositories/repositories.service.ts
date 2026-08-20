@@ -7,7 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Not, Repository } from 'typeorm';
+import { In, LessThanOrEqual, Not, Repository } from 'typeorm';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { NotificationsService } from 'src/notifications/notifications.service';
@@ -16,6 +16,7 @@ import { ProjectRepository } from 'src/projects/entities/project-repository.enti
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { RepositoryCollaborator } from 'src/projects/entities/repository-collaborator.entity';
+import { User } from 'src/users/entities/user.entity';
 import { CreateRepositoryDto } from './dtos/create-repository.dto';
 import {
   ResendInviteDto,
@@ -60,7 +61,7 @@ export class RepositoriesService {
   async createRepository(
     projectId: string,
     dto: CreateRepositoryDto,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const project = await this.getProject(projectId);
     const existing = await this.findProjectRepository(projectId);
@@ -91,6 +92,11 @@ export class RepositoriesService {
     row.repoUrl = `https://github.com/${owner}/${repoName}`;
     row.defaultBranch = dto.defaultBranch ?? 'main';
 
+    let failure: string | null = null;
+    const previousFailure =
+      typeof existing?.metadata?.error === 'string'
+        ? existing.metadata.error
+        : null;
     try {
       const created = await this.github.createRepository({
         owner,
@@ -113,12 +119,22 @@ export class RepositoriesService {
       );
       row.status = 'failed';
       row.metadata = { visibility, error: message };
+      failure = message;
     }
-
-    return this.toRepositoryResponse(await this.repoRepo.save(row));
+    const saved = await this.repoRepo.save(row);
+    if (failure && failure !== previousFailure) {
+      await this.notifyTechnicalIssue(
+        projectId,
+        'GitHub repository provisioning failed',
+        failure,
+      );
+    }
+    return this.toRepositoryResponse(saved);
   }
 
   private async syncEvaluationWebhook(repository: ProjectRepository) {
+    const priorWebhook = repository.metadata?.evaluationWebhook as
+      Record<string, unknown> | undefined;
     try {
       const webhook = await this.github.ensureEvaluationWebhook({
         owner: repository.owner,
@@ -146,6 +162,16 @@ export class RepositoriesService {
           syncedAt: new Date().toISOString(),
         },
       };
+      if (
+        priorWebhook?.status !== 'failed' ||
+        priorWebhook?.error !== message
+      ) {
+        await this.notifyTechnicalIssue(
+          repository.projectId,
+          'GitHub evaluation webhook failed',
+          message,
+        );
+      }
     }
   }
 
@@ -222,7 +248,7 @@ export class RepositoriesService {
   async syncCollaborators(
     projectId: string,
     dto: SyncCollaboratorsDto,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const repository = await this.findProjectRepository(projectId);
     if (!repository) {
@@ -273,9 +299,20 @@ export class RepositoriesService {
       }
 
       if (!profile.githubUsername) {
+        const shouldNotify = row.inviteStatus !== 'missing_username';
         row.githubUsername = null;
         row.inviteStatus = 'missing_username';
         await this.collaboratorRepo.save(row);
+        if (shouldNotify) {
+          await this.notificationsService.createNotification({
+            userId: profile.userId,
+            projectId,
+            type: 'github_action_required',
+            title: 'Add your GitHub username',
+            body: 'Your project assignment is active, but repository access cannot be sent until you add your GitHub username to your profile.',
+            actionUrl: '/profile',
+          });
+        }
         missingUsername += 1;
         continue;
       }
@@ -291,7 +328,7 @@ export class RepositoriesService {
     repository.lastSyncedAt = new Date();
     await this.repoRepo.save(repository);
     this.logger.log(
-      `Repository ${repository.id} synced by ${adminUserId}: ${invited} invited, ${missingUsername} missing username`,
+      `Repository ${repository.id} synced by ${adminUserId ?? 'system'}: ${invited} invited, ${missingUsername} missing username`,
     );
 
     const collaborators = await this.collaboratorRepo.find({
@@ -334,12 +371,205 @@ export class RepositoriesService {
     return this.toCollaboratorResponse(row);
   }
 
+  async provisionForAssignedTeam(projectId: string) {
+    let repository = await this.findProjectRepository(projectId);
+    if (!repository || repository.status === 'failed') {
+      await this.createRepository(projectId, {}, null);
+      repository = await this.findProjectRepository(projectId);
+    }
+    if (!repository || repository.status !== 'active') {
+      throw new ServiceUnavailableException(
+        'Automatic GitHub repository provisioning is waiting for Nexus operations',
+      );
+    }
+    return this.syncCollaborators(
+      projectId,
+      {
+        includeTaskAssignees: true,
+        includePlanningAssignees: true,
+        permission: DEFAULT_PERMISSION,
+      },
+      null,
+    );
+  }
+
+  async revokeIfNoLongerAssigned(
+    projectId: string,
+    freelancerProfileId: string,
+  ) {
+    const [taskCount, assignmentCount] = await Promise.all([
+      this.taskRepo.count({
+        where: {
+          projectId,
+          assignedFreelancerProfileId: freelancerProfileId,
+          status: Not('cancelled'),
+        },
+      }),
+      this.assignmentRepo.count({
+        where: {
+          projectId,
+          freelancerProfileId,
+          status: In(ASSIGNMENT_ACTIVE_STATUSES),
+        },
+      }),
+    ]);
+    if (taskCount + assignmentCount > 0) return { revoked: false };
+    const row = await this.collaboratorRepo.findOne({
+      where: { projectId, freelancerProfileId },
+      relations: ['repository', 'freelancerProfile'],
+    });
+    if (!row || row.inviteStatus === 'removed') return { revoked: false };
+    const username =
+      row.freelancerProfile?.githubUsername ?? row.githubUsername;
+    if (!username) {
+      row.inviteStatus = 'removed';
+      row.removedAt = new Date();
+      await this.collaboratorRepo.save(row);
+      return { revoked: true };
+    }
+    try {
+      await this.github.removeCollaborator({
+        owner: row.repository.owner,
+        repoName: row.repository.repoName,
+        username,
+      });
+      row.inviteStatus = 'removed';
+      row.removedAt = new Date();
+      row.metadata = {
+        operation: 'revoke',
+        completedAt: new Date().toISOString(),
+      };
+      await this.collaboratorRepo.save(row);
+      if (row.freelancerProfile?.userId) {
+        await this.notificationsService.createNotification({
+          userId: row.freelancerProfile.userId,
+          projectId,
+          type: 'repository_access_removed',
+          title: 'Repository access removed',
+          body: 'Your repository access was removed because you are no longer assigned to this project.',
+          actionUrl: '/freelancer/projects',
+        });
+      }
+      return { revoked: true };
+    } catch (error) {
+      row.inviteStatus = 'failed';
+      row.metadata = {
+        operation: 'revoke',
+        error: error instanceof Error ? error.message : String(error),
+      };
+      await this.collaboratorRepo.save(row);
+      throw error;
+    }
+  }
+
+  async reconcileAutomation() {
+    const cutoff = new Date(Date.now() - 5 * 60_000);
+    const projectIds = new Set<string>();
+    const failedRepositories = await this.repoRepo.find({
+      where: { status: 'failed', updatedAt: LessThanOrEqual(cutoff) },
+      take: 20,
+      order: { updatedAt: 'ASC' },
+    });
+    for (const repository of failedRepositories) {
+      projectIds.add(repository.projectId);
+    }
+
+    const missingTaskProjects = await this.taskRepo
+      .createQueryBuilder('task')
+      .select('DISTINCT task.projectId', 'projectId')
+      .leftJoin(
+        RepositoryCollaborator,
+        'collaborator',
+        'collaborator.projectId = task.projectId AND collaborator.freelancerProfileId = task.assignedFreelancerProfileId',
+      )
+      .where('task.assignedFreelancerProfileId IS NOT NULL')
+      .andWhere('task.status != :cancelled', { cancelled: 'cancelled' })
+      .andWhere(
+        '(collaborator.id IS NULL OR collaborator.inviteStatus = :removed)',
+        { removed: 'removed' },
+      )
+      .limit(100)
+      .getRawMany<{ projectId: string }>();
+    const missingPlanningProjects = await this.assignmentRepo
+      .createQueryBuilder('assignment')
+      .select('DISTINCT assignment.projectId', 'projectId')
+      .leftJoin(
+        RepositoryCollaborator,
+        'collaborator',
+        'collaborator.projectId = assignment.projectId AND collaborator.freelancerProfileId = assignment.freelancerProfileId',
+      )
+      .where('assignment.status IN (:...statuses)', {
+        statuses: ASSIGNMENT_ACTIVE_STATUSES,
+      })
+      .andWhere('assignment.freelancerProfileId IS NOT NULL')
+      .andWhere(
+        '(collaborator.id IS NULL OR collaborator.inviteStatus = :removed)',
+        { removed: 'removed' },
+      )
+      .limit(100)
+      .getRawMany<{ projectId: string }>();
+    for (const row of [...missingTaskProjects, ...missingPlanningProjects]) {
+      projectIds.add(row.projectId);
+    }
+
+    let provisioned = 0;
+    for (const projectId of projectIds) {
+      try {
+        await this.provisionForAssignedTeam(projectId);
+        provisioned += 1;
+      } catch (error) {
+        this.logger.error(
+          `Automatic repository provisioning failed for ${projectId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    const retryRows = await this.collaboratorRepo.find({
+      where: {
+        inviteStatus: In(['missing_username', 'failed']),
+        updatedAt: LessThanOrEqual(cutoff),
+      },
+      relations: ['freelancerProfile'],
+      take: 50,
+      order: { updatedAt: 'ASC' },
+    });
+    let retried = 0;
+    for (const row of retryRows) {
+      if (row.metadata?.operation === 'revoke') {
+        if (!row.freelancerProfileId) continue;
+        try {
+          await this.revokeIfNoLongerAssigned(
+            row.projectId,
+            row.freelancerProfileId,
+          );
+          retried += 1;
+        } catch {
+          // The row keeps its retryable failed state.
+        }
+        continue;
+      }
+      if (!row.freelancerProfile?.githubUsername) continue;
+      try {
+        await this.resendInvite(row.id, {});
+        retried += 1;
+      } catch {
+        // The row keeps its retryable failed state.
+      }
+    }
+    return { provisioned, retried };
+  }
+
   // Sends the GitHub invite and records the outcome on the row. Failures are
   // stored as `failed` so the admin can retry them from the UI.
   private async sendInvite(
     repository: ProjectRepository,
     row: RepositoryCollaborator,
   ) {
+    const previousFailure =
+      row.inviteStatus === 'failed' && typeof row.metadata?.error === 'string'
+        ? row.metadata.error
+        : null;
+    let failure: string | null = null;
     try {
       const result = await this.github.inviteCollaborator({
         owner: repository.owner,
@@ -364,9 +594,64 @@ export class RepositoriesService {
       );
       row.inviteStatus = 'failed';
       row.metadata = { error: message };
+      failure = message;
     }
     await this.collaboratorRepo.save(row);
+    if (failure && failure !== previousFailure) {
+      await this.notifyTechnicalIssue(
+        row.projectId,
+        'GitHub collaborator invitation failed',
+        `${row.githubUsername ?? 'Unknown GitHub user'}: ${failure}`,
+      );
+    }
     return row;
+  }
+
+  private async notifyTechnicalIssue(
+    projectId: string,
+    title: string,
+    body: string,
+  ) {
+    try {
+      const [admins, reviewer] = await Promise.all([
+        this.projectRepo.manager.getRepository(User).find({
+          where: { role: UserRole.ADMIN },
+          select: { id: true },
+        }),
+        this.assignmentRepo.findOne({
+          where: {
+            projectId,
+            phase: 'governance',
+            roleKey: 'principal_reviewer',
+            status: In(ASSIGNMENT_ACTIVE_STATUSES),
+          },
+          relations: ['freelancerProfile'],
+        }),
+      ]);
+      const recipients = new Set(admins.map((admin) => admin.id));
+      if (reviewer?.freelancerProfile?.userId) {
+        recipients.add(reviewer.freelancerProfile.userId);
+      }
+      await Promise.all(
+        [...recipients].map((userId) =>
+          this.notificationsService.createNotification({
+            userId,
+            projectId,
+            type: 'technical_issue',
+            title,
+            body,
+            actionUrl:
+              userId === reviewer?.freelancerProfile?.userId
+                ? `/reviewer/projects/${projectId}`
+                : `/dashboard/admin/repositories?projectId=${projectId}`,
+          }),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(
+        `Could not notify operations about repository failure for ${projectId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private async notifyInvite(
@@ -377,8 +662,10 @@ export class RepositoriesService {
     await this.notificationsService.createNotification({
       userId: profile.userId,
       projectId: repository.projectId,
+      type: 'repository_access',
       title: 'Repository access',
       body: `You were invited to the project repository ${repository.owner}/${repository.repoName}.`,
+      actionUrl: `/freelancer/projects/${repository.projectId}`,
     });
   }
 

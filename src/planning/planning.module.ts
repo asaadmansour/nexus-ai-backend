@@ -21,6 +21,7 @@ import { PlanningEvaluationsService } from './planning-evaluations.service';
 import { MatchingModule } from 'src/matching/matching.module';
 import { PlanningEvaluationSandboxService } from './planning-evaluation-sandbox.service';
 import { PaymentsModule } from 'src/payments/payments.module';
+import { TaskDeadlinesService } from './task-deadlines.service';
 
 const queueProcessors = areQueuesEnabled()
   ? [ProjectPlanGenerationProcessor, PlanningSubmissionEvaluationProcessor]
@@ -49,6 +50,7 @@ const queueProcessors = areQueuesEnabled()
     PlanningEvaluationsService,
     PlanningEvaluationSandboxService,
     ProjectPlansService,
+    TaskDeadlinesService,
     ...queueProcessors,
   ],
   exports: [

@@ -6,6 +6,7 @@ export interface JwtPayload {
   email?: string;
   role: UserRole;
   isEmailVerified?: boolean;
+  isPhoneVerified?: boolean;
   exp?: number;
   iat?: number;
 }
@@ -22,6 +23,7 @@ export interface GoogleAuthUser {
   role: UserRole;
   phoneNumber: string | null;
   isEmailVerified: boolean;
+  isPhoneVerified: boolean;
 }
 
 export interface OptionalAuthenticatedRequest extends Request {

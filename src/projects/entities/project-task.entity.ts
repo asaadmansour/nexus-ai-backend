@@ -155,6 +155,29 @@ export class ProjectTask {
   })
   budgetAmount!: string | null;
 
+  @Column({
+    name: 'penalty_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    default: 0,
+  })
+  penaltyAmount!: string;
+
+  @Column({ name: 'deadline_strikes', type: 'int', default: 0 })
+  deadlineStrikes!: number;
+
+  @Column({ name: 'max_deadline_strikes', type: 'int', default: 2 })
+  maxDeadlineStrikes!: number;
+
+  @Column({
+    name: 'assignment_status',
+    type: 'varchar',
+    length: 40,
+    default: 'unassigned',
+  })
+  assignmentStatus!: string;
+
   @Column({ type: 'char', length: 3, nullable: true })
   currency!: string | null;
 

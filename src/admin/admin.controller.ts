@@ -76,11 +76,18 @@ export class AdminController {
   async getProjects(
     @Query('page') page: string = '1',
     @Query('limit') limit: string = '50',
+    @Query('status') status?: string,
+    @Query('automationStatus') automationStatus?: string,
+    @Query('search') search?: string,
+    @Query('customerId') customerId?: string,
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
   ) {
     const { pageNum, limitNum } = this.parsePagination(page, limit);
     const { projects, total } = await this.adminService.getProjects(
       pageNum,
       limitNum,
+      { status, automationStatus, search, customerId, dateFrom, dateTo },
     );
     return {
       status: 'success',

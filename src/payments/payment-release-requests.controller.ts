@@ -29,7 +29,7 @@ export class ProjectPaymentReleaseRequestsController {
   ) {}
 
   @Post()
-  @Roles(UserRole.ADMIN, UserRole.CUSTOMER, UserRole.FREELANCER)
+  @Roles(UserRole.ADMIN, UserRole.FREELANCER)
   async create(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() dto: CreatePaymentReleaseRequestDto,

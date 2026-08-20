@@ -1,39 +1,97 @@
-export const PROJECT_BUDGET_ALLOCATION_VERSION = 1;
-
-export const PROJECT_BUDGET_PERCENTAGES = {
-  architect: 25,
-  ui_ux: 25,
-  implementation: 50,
-} as const;
+export const PROJECT_BUDGET_ALLOCATION_VERSION = 2;
 
 export type PlanningBudgetRole = 'architect' | 'ui_ux';
 export type ProjectBudgetComplexity = 'trivial' | 'standard' | 'complex';
+export type CostedProjectRole =
+  'principal_reviewer' | PlanningBudgetRole | 'implementation' | 'platform_fee';
 
 export interface ProjectBudgetRoleAllocation {
   percentage: number;
   amount: string;
   estimatedHours: number;
+  people: number;
   maxHourlyRate: string;
+}
+
+export interface ProjectBudgetRoleEstimate {
+  roleKey: Exclude<CostedProjectRole, 'platform_fee'>;
+  people: number;
+  hoursEach: number;
+  hourlyRate: number;
+  subtotal?: number;
 }
 
 export interface ProjectBudgetAllocation extends Record<string, unknown> {
   version: number;
+  strategy: 'automation_first_market_cost';
+  totalAmount: string;
+  currency: string;
+  complexity: ProjectBudgetComplexity;
+  platformFee: {
+    percentage: number;
+    amount: string;
+  };
+  governance: {
+    principalReviewer: ProjectBudgetRoleAllocation;
+  };
+  planning: Record<PlanningBudgetRole, ProjectBudgetRoleAllocation>;
+  implementation: {
+    percentage: number;
+    amount: string;
+    estimatedHours?: number;
+    people?: number;
+    maxHourlyRate?: string;
+  };
+  minimumRecommendedAmount: string;
+  budgetGap: string;
+  generatedAt: string;
+}
+
+type LegacyProjectBudgetAllocation = {
+  version: 1;
   strategy: 'planning_25_25_implementation_50';
   totalAmount: string;
   currency: string;
   complexity: ProjectBudgetComplexity;
   planning: Record<PlanningBudgetRole, ProjectBudgetRoleAllocation>;
-  implementation: {
-    percentage: number;
-    amount: string;
-  };
+  implementation: { percentage: number; amount: string };
   generatedAt: string;
-}
+};
 
-const PLANNING_HOURS: Record<ProjectBudgetComplexity, number> = {
-  trivial: 4,
-  standard: 16,
-  complex: 32,
+const ROLE_PERCENTAGES: Record<
+  ProjectBudgetComplexity,
+  Record<CostedProjectRole, number>
+> = {
+  trivial: {
+    platform_fee: 10,
+    principal_reviewer: 8,
+    architect: 8,
+    ui_ux: 8,
+    implementation: 66,
+  },
+  standard: {
+    platform_fee: 10,
+    principal_reviewer: 10,
+    architect: 15,
+    ui_ux: 15,
+    implementation: 50,
+  },
+  complex: {
+    platform_fee: 10,
+    principal_reviewer: 12,
+    architect: 18,
+    ui_ux: 16,
+    implementation: 44,
+  },
+};
+
+const ROLE_HOURS: Record<
+  ProjectBudgetComplexity,
+  Record<'principal_reviewer' | PlanningBudgetRole, number>
+> = {
+  trivial: { principal_reviewer: 4, architect: 3, ui_ux: 3 },
+  standard: { principal_reviewer: 12, architect: 12, ui_ux: 12 },
+  complex: { principal_reviewer: 24, architect: 24, ui_ux: 22 },
 };
 
 export function createProjectBudgetAllocation(
@@ -41,68 +99,140 @@ export function createProjectBudgetAllocation(
   currencyValue: string,
   complexity: ProjectBudgetComplexity = 'standard',
   generatedAt = new Date(),
+  marketRates: Partial<
+    Record<'principal_reviewer' | PlanningBudgetRole | 'implementation', number>
+  > = {},
+  marketEstimates: ProjectBudgetRoleEstimate[] = [],
 ): ProjectBudgetAllocation {
   const totalCents = toCents(totalAmount);
   if (totalCents <= 0) {
     throw new Error('Project budget allocation requires a positive total');
   }
   const currency = normalizeCurrency(currencyValue);
-  const architectCents = Math.round(
-    (totalCents * PROJECT_BUDGET_PERCENTAGES.architect) / 100,
-  );
-  const uiuxCents = Math.round(
-    (totalCents * PROJECT_BUDGET_PERCENTAGES.ui_ux) / 100,
-  );
-  // The final bucket receives rounding residue, so the three buckets always
-  // equal the quoted project price down to the cent.
-  const implementationCents = totalCents - architectCents - uiuxCents;
-  const estimatedHours = PLANNING_HOURS[complexity];
+  const percentages = ROLE_PERCENTAGES[complexity];
+  const hours = ROLE_HOURS[complexity];
+  const feeCents = percentCents(totalCents, percentages.platform_fee);
+  const normalizedEstimates = normalizeMarketEstimates(marketEstimates);
+  const dynamicCents = normalizedEstimates
+    ? proportionalRoleCents(totalCents - feeCents, normalizedEstimates)
+    : null;
+  const reviewerCents =
+    dynamicCents?.principal_reviewer ??
+    percentCents(totalCents, percentages.principal_reviewer);
+  const architectCents =
+    dynamicCents?.architect ?? percentCents(totalCents, percentages.architect);
+  const uiuxCents =
+    dynamicCents?.ui_ux ?? percentCents(totalCents, percentages.ui_ux);
+  const implementationCents = dynamicCents
+    ? dynamicCents.implementation
+    : totalCents - feeCents - reviewerCents - architectCents - uiuxCents;
+  const estimateByRole = normalizedEstimates
+    ? Object.fromEntries(
+        normalizedEstimates.map((estimate) => [estimate.roleKey, estimate]),
+      )
+    : null;
+
+  const minimumRecommendedCents = normalizedEstimates
+    ? Math.ceil(
+        (normalizedEstimates.reduce(
+          (sum, estimate) => sum + estimate.costCents,
+          0,
+        ) *
+          100) /
+          (100 - percentages.platform_fee),
+      )
+    : Math.max(
+        totalCents,
+        minimumTotalForRole(
+          marketRates.principal_reviewer,
+          hours.principal_reviewer,
+          percentages.principal_reviewer,
+        ),
+        minimumTotalForRole(
+          marketRates.architect,
+          hours.architect,
+          percentages.architect,
+        ),
+        minimumTotalForRole(marketRates.ui_ux, hours.ui_ux, percentages.ui_ux),
+      );
 
   return {
     version: PROJECT_BUDGET_ALLOCATION_VERSION,
-    strategy: 'planning_25_25_implementation_50',
+    strategy: 'automation_first_market_cost',
     totalAmount: fromCents(totalCents),
     currency,
     complexity,
+    platformFee: {
+      percentage: percentages.platform_fee,
+      amount: fromCents(feeCents),
+    },
+    governance: {
+      principalReviewer: roleAllocation(
+        reviewerCents,
+        percentageOf(reviewerCents, totalCents),
+        estimateByRole?.principal_reviewer?.totalHours ??
+          hours.principal_reviewer,
+        estimateByRole?.principal_reviewer?.people ?? 1,
+      ),
+    },
     planning: {
       architect: roleAllocation(
         architectCents,
-        PROJECT_BUDGET_PERCENTAGES.architect,
-        estimatedHours,
+        percentageOf(architectCents, totalCents),
+        estimateByRole?.architect?.totalHours ?? hours.architect,
+        estimateByRole?.architect?.people ?? 1,
       ),
       ui_ux: roleAllocation(
         uiuxCents,
-        PROJECT_BUDGET_PERCENTAGES.ui_ux,
-        estimatedHours,
+        percentageOf(uiuxCents, totalCents),
+        estimateByRole?.ui_ux?.totalHours ?? hours.ui_ux,
+        estimateByRole?.ui_ux?.people ?? 1,
       ),
     },
     implementation: {
-      percentage: PROJECT_BUDGET_PERCENTAGES.implementation,
+      percentage: percentageOf(implementationCents, totalCents),
       amount: fromCents(implementationCents),
+      ...(estimateByRole?.implementation
+        ? {
+            estimatedHours: estimateByRole.implementation.totalHours,
+            people: estimateByRole.implementation.people,
+            maxHourlyRate: fromCents(
+              Math.floor(
+                implementationCents / estimateByRole.implementation.totalHours,
+              ),
+            ),
+          }
+        : {}),
     },
+    minimumRecommendedAmount: fromCents(minimumRecommendedCents),
+    budgetGap: fromCents(Math.max(minimumRecommendedCents - totalCents, 0)),
     generatedAt: generatedAt.toISOString(),
   };
 }
 
 export function projectBudgetAllocation(
   value: Record<string, unknown> | null | undefined,
-): ProjectBudgetAllocation | null {
-  if (!value || value.version !== PROJECT_BUDGET_ALLOCATION_VERSION) {
-    return null;
+): ProjectBudgetAllocation | LegacyProjectBudgetAllocation | null {
+  if (!value) return null;
+  if (value.version === 1) {
+    const legacy = value as LegacyProjectBudgetAllocation;
+    return legacy.strategy === 'planning_25_25_implementation_50' &&
+      legacy.planning?.architect &&
+      legacy.planning?.ui_ux &&
+      legacy.implementation
+      ? legacy
+      : null;
   }
+  if (value.version !== PROJECT_BUDGET_ALLOCATION_VERSION) return null;
   const candidate = value as ProjectBudgetAllocation;
-  const planning = candidate.planning;
-  if (
-    candidate.strategy !== 'planning_25_25_implementation_50' ||
-    !planning?.architect ||
-    !planning.ui_ux ||
-    !candidate.implementation ||
-    toCents(candidate.totalAmount) <= 0 ||
-    !candidate.currency
-  ) {
-    return null;
-  }
-  return candidate;
+  return candidate.strategy === 'automation_first_market_cost' &&
+    candidate.governance?.principalReviewer &&
+    candidate.planning?.architect &&
+    candidate.planning?.ui_ux &&
+    candidate.platformFee &&
+    candidate.implementation
+    ? candidate
+    : null;
 }
 
 export function planningRoleAllocation(
@@ -116,6 +246,22 @@ export function planningRoleAllocation(
   return allocation.planning[roleKey];
 }
 
+export function principalReviewerRoleAllocation(
+  value: Record<string, unknown> | null | undefined,
+) {
+  const allocation = projectBudgetAllocation(value);
+  return allocation && allocation.version === 2
+    ? allocation.governance.principalReviewer
+    : null;
+}
+
+export function platformFeeAllocation(
+  value: Record<string, unknown> | null | undefined,
+) {
+  const allocation = projectBudgetAllocation(value);
+  return allocation && allocation.version === 2 ? allocation.platformFee : null;
+}
+
 export function implementationBudgetAmount(
   value: Record<string, unknown> | null | undefined,
 ) {
@@ -127,24 +273,124 @@ export function requiredProjectTotalForRate(
   hourlyRate: number | string,
   roleKey: PlanningBudgetRole,
   estimatedHours: number,
+  complexity: ProjectBudgetComplexity = 'standard',
 ) {
-  const rateCents = toCents(hourlyRate);
-  const roleCostCents = rateCents * estimatedHours;
-  const percentage = PROJECT_BUDGET_PERCENTAGES[roleKey];
+  const roleCostCents = toCents(hourlyRate) * estimatedHours;
+  const percentage = ROLE_PERCENTAGES[complexity][roleKey];
   return fromCents(Math.ceil((roleCostCents * 100) / percentage));
+}
+
+function minimumTotalForRole(
+  rate: number | undefined,
+  hours: number,
+  percentage: number,
+) {
+  if (!Number.isFinite(rate) || !rate || rate <= 0) return 0;
+  return Math.ceil((toCents(rate) * hours * 100) / percentage);
+}
+
+function percentCents(totalCents: number, percentage: number) {
+  return Math.round((totalCents * percentage) / 100);
 }
 
 function roleAllocation(
   cents: number,
   percentage: number,
   estimatedHours: number,
+  people = 1,
 ): ProjectBudgetRoleAllocation {
   return {
     percentage,
     amount: fromCents(cents),
     estimatedHours,
+    people,
     maxHourlyRate: fromCents(Math.floor(cents / estimatedHours)),
   };
+}
+
+type NormalizedRoleEstimate = ProjectBudgetRoleEstimate & {
+  totalHours: number;
+  costCents: number;
+};
+
+function normalizeMarketEstimates(
+  estimates: ProjectBudgetRoleEstimate[],
+): NormalizedRoleEstimate[] | null {
+  const required: ProjectBudgetRoleEstimate['roleKey'][] = [
+    'principal_reviewer',
+    'architect',
+    'ui_ux',
+    'implementation',
+  ];
+  const byRole = new Map<
+    ProjectBudgetRoleEstimate['roleKey'],
+    NormalizedRoleEstimate
+  >();
+  for (const estimate of estimates) {
+    if (!required.includes(estimate.roleKey) || byRole.has(estimate.roleKey)) {
+      continue;
+    }
+    const people = Math.round(Number(estimate.people));
+    const hoursEach = Math.round(Number(estimate.hoursEach));
+    const hourlyRate = Number(estimate.hourlyRate);
+    if (
+      !Number.isFinite(people) ||
+      people <= 0 ||
+      !Number.isFinite(hoursEach) ||
+      hoursEach <= 0 ||
+      !Number.isFinite(hourlyRate) ||
+      hourlyRate <= 0
+    ) {
+      continue;
+    }
+    const totalHours = people * hoursEach;
+    byRole.set(estimate.roleKey, {
+      ...estimate,
+      people,
+      hoursEach,
+      hourlyRate,
+      totalHours,
+      costCents: Math.round(totalHours * hourlyRate * 100),
+    });
+  }
+  return required.every((role) => byRole.has(role))
+    ? required.map((role) => byRole.get(role)!)
+    : null;
+}
+
+function proportionalRoleCents(
+  laborPoolCents: number,
+  estimates: NormalizedRoleEstimate[],
+) {
+  const totalCost = estimates.reduce(
+    (sum, estimate) => sum + estimate.costCents,
+    0,
+  );
+  const shares = estimates.map((estimate, index) => {
+    const raw = (laborPoolCents * estimate.costCents) / totalCost;
+    return {
+      roleKey: estimate.roleKey,
+      cents: Math.floor(raw),
+      fraction: raw - Math.floor(raw),
+      index,
+    };
+  });
+  let remaining =
+    laborPoolCents - shares.reduce((sum, role) => sum + role.cents, 0);
+  for (const share of [...shares].sort(
+    (left, right) => right.fraction - left.fraction || left.index - right.index,
+  )) {
+    if (remaining <= 0) break;
+    share.cents += 1;
+    remaining -= 1;
+  }
+  return Object.fromEntries(
+    shares.map((share) => [share.roleKey, share.cents]),
+  ) as Record<ProjectBudgetRoleEstimate['roleKey'], number>;
+}
+
+function percentageOf(cents: number, totalCents: number) {
+  return Number(((cents * 100) / totalCents).toFixed(2));
 }
 
 function normalizeCurrency(value: string) {

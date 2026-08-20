@@ -17,6 +17,9 @@ const validConfig = {
   GITHUB_TOKEN: 'github-token',
   GITHUB_OWNER: 'nexus-owner',
   GITHUB_WEBHOOK_SECRET: 'github-webhook-secret',
+  TWILIO_ACCOUNT_SID: 'AC123',
+  TWILIO_AUTH_TOKEN: 'twilio-token',
+  TWILIO_VERIFY_SERVICE_SID: 'VA123',
 };
 
 describe('environment validation', () => {

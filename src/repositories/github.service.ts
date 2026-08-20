@@ -42,8 +42,16 @@ type GithubPullRequestResponse = {
   html_url?: string;
   state?: string;
   draft?: boolean;
+  merged?: boolean;
+  merge_commit_sha?: string | null;
   head?: { sha?: string; ref?: string };
   base?: { sha?: string; ref?: string };
+};
+
+type GithubMergePullRequestResponse = {
+  sha?: string | null;
+  merged?: boolean;
+  message?: string;
 };
 
 type GithubPullFileResponse = {
@@ -110,10 +118,18 @@ export type GithubPullRequestTarget = {
   url: string | null;
   state: string | null;
   draft: boolean;
+  merged: boolean;
+  mergeCommitSha: string | null;
   headSha: string;
   headRef: string | null;
   baseSha: string;
   baseRef: string | null;
+};
+
+export type GithubMergePullRequestResult = {
+  merged: boolean;
+  sha: string | null;
+  message: string | null;
 };
 
 export type GithubWebhookResult = {
@@ -223,6 +239,22 @@ export class GithubService {
     };
   }
 
+  async removeCollaborator(input: {
+    owner: string;
+    repoName: string;
+    username: string;
+  }): Promise<void> {
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}/collaborators/${encodeURIComponent(input.username)}`,
+      { method: 'DELETE' },
+    );
+    if (response.status === 204 || response.status === 404) return;
+    await this.parse<unknown>(
+      response,
+      `remove collaborator ${input.username}`,
+    );
+  }
+
   async resolveCommit(input: {
     owner: string;
     repoName: string;
@@ -275,10 +307,95 @@ export class GithubService {
       url: payload.html_url ?? null,
       state: payload.state ?? null,
       draft: payload.draft === true,
+      merged: payload.merged === true,
+      mergeCommitSha:
+        typeof payload.merge_commit_sha === 'string' &&
+        /^[a-f0-9]{40}$/i.test(payload.merge_commit_sha)
+          ? payload.merge_commit_sha.toLowerCase()
+          : null,
       headSha,
       headRef: payload.head?.ref ?? null,
       baseSha,
       baseRef: payload.base?.ref ?? null,
+    };
+  }
+
+  async mergePullRequest(input: {
+    owner: string;
+    repoName: string;
+    number: number;
+    expectedHeadSha: string;
+    commitTitle?: string;
+  }): Promise<GithubMergePullRequestResult> {
+    const current = await this.getPullRequest(input);
+    if (current.merged) {
+      return {
+        merged: true,
+        sha: current.mergeCommitSha,
+        message: 'Pull request was already merged',
+      };
+    }
+    if (current.state !== 'open' || current.draft) {
+      return {
+        merged: false,
+        sha: null,
+        message: 'Pull request is not open and ready for integration',
+      };
+    }
+    if (current.headSha !== input.expectedHeadSha.toLowerCase()) {
+      return {
+        merged: false,
+        sha: null,
+        message: 'Pull request head changed after approval',
+      };
+    }
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}/pulls/${input.number}/merge`,
+      {
+        method: 'PUT',
+        body: {
+          sha: current.headSha,
+          merge_method: 'squash',
+          commit_title:
+            input.commitTitle ?? `Integrate approved work (#${input.number})`,
+        },
+      },
+    );
+    if (response.status === 405 || response.status === 409) {
+      const payload = (await response
+        .json()
+        .catch(() => ({}))) as GithubMergePullRequestResponse;
+      const latest = await this.getPullRequest(input);
+      if (
+        latest.merged &&
+        latest.headSha === input.expectedHeadSha.toLowerCase()
+      ) {
+        return {
+          merged: true,
+          sha: latest.mergeCommitSha,
+          message: 'Pull request was merged by a concurrent integration run',
+        };
+      }
+      return {
+        merged: false,
+        sha: null,
+        message:
+          payload.message ??
+          'GitHub reported that the pull request is not mergeable',
+      };
+    }
+    const payload = await this.parse<GithubMergePullRequestResponse>(
+      response,
+      `merge pull request ${input.owner}/${input.repoName}#${input.number}`,
+    );
+    const sha =
+      typeof payload.sha === 'string' && /^[a-f0-9]{40}$/i.test(payload.sha)
+        ? payload.sha.toLowerCase()
+        : null;
+    return {
+      merged: payload.merged === true,
+      sha,
+      message: payload.message ?? null,
     };
   }
 

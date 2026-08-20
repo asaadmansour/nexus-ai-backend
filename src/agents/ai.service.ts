@@ -73,6 +73,9 @@ type FastApiGenerateEmbeddingResponse = {
 
 type FastApiProjectQuoteResponse = {
   amount?: unknown;
+  recommendedMinimum?: unknown;
+  budgetGap?: unknown;
+  roleEstimates?: unknown;
   currency?: unknown;
   quoteStatus?: unknown;
   confidence?: unknown;
@@ -129,6 +132,13 @@ export type ProjectPlanTask = {
   contractReferences?: string[];
   ownedPaths?: string[];
   integrationChecks?: string[];
+  checkpoints?: Array<{
+    key: string;
+    title: string;
+    offsetDays: number;
+    weightPercent: number;
+    penaltyPercent: number;
+  }>;
   dependsOn?: string[];
   status?: string;
 };
@@ -204,6 +214,15 @@ export type RoleBriefResult = {
 
 export type ProjectQuoteResult = {
   amount: number;
+  recommendedMinimum: number;
+  budgetGap: number;
+  roleEstimates: Array<{
+    roleKey: string;
+    people: number;
+    hoursEach: number;
+    hourlyRate: number;
+    subtotal: number;
+  }>;
   currency: string;
   quoteStatus: 'pending_customer' | 'out_of_budget';
   confidence: number;
@@ -656,17 +675,73 @@ export class AiService {
   ): ProjectQuoteResult {
     const fallback = this.getFallbackProjectQuoteResult(dto, source);
     const { min, max } = this.getQuoteBudgetRange(dto.project);
-    const requestedAmount = this.toNumber(result.amount);
-    const amount = this.roundMoney(
-      this.clampQuoteAmount(requestedAmount ?? fallback.amount, min, max),
+    const requiredRoles = [
+      'principal_reviewer',
+      'architect',
+      'ui_ux',
+      'implementation',
+    ];
+    const roleEstimateMap = new Map(
+      fallback.roleEstimates.map((role) => [role.roleKey, role]),
     );
+    if (Array.isArray(result.roleEstimates)) {
+      for (const value of result.roleEstimates) {
+        const role = this.asRecord(value);
+        const roleKey = this.optionalString(role.roleKey);
+        const peopleValue = this.toNumber(role.people);
+        const hoursEachValue = this.toNumber(role.hoursEach);
+        const hourlyRate = this.toNumber(role.hourlyRate);
+        if (
+          !roleKey ||
+          !requiredRoles.includes(roleKey) ||
+          !peopleValue ||
+          peopleValue <= 0 ||
+          !hoursEachValue ||
+          hoursEachValue <= 0 ||
+          !hourlyRate ||
+          hourlyRate <= 0
+        ) {
+          continue;
+        }
+        const people = Math.max(1, Math.round(peopleValue));
+        const hoursEach = Math.max(1, Math.round(hoursEachValue));
+        roleEstimateMap.set(roleKey, {
+          roleKey,
+          people,
+          hoursEach,
+          hourlyRate: this.roundMoney(hourlyRate),
+          subtotal: this.roundMoney(people * hoursEach * hourlyRate),
+        });
+      }
+    }
+    const roleEstimates = requiredRoles.map((roleKey) =>
+      roleEstimateMap.get(roleKey)!,
+    );
+    const laborMinimum = this.roundMoney(
+      roleEstimates.reduce((sum, role) => sum + role.subtotal, 0) / 0.9,
+    );
+    const requestedAmount = this.toNumber(result.amount);
+    const recommendedMinimum = this.roundMoney(
+      Math.max(
+        laborMinimum,
+        this.toNumber(result.recommendedMinimum) ?? 0,
+        fallback.recommendedMinimum,
+      ),
+    );
+    const amount = this.roundMoney(
+      Math.max(min, requestedAmount ?? 0, recommendedMinimum),
+    );
+    const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
 
     return {
       amount,
+      recommendedMinimum,
+      budgetGap,
+      roleEstimates,
       currency:
         this.optionalString(result.currency)?.toUpperCase().slice(0, 3) ??
         fallback.currency,
-      quoteStatus: 'pending_customer',
+      quoteStatus: budgetGap > 0 ? 'out_of_budget' : 'pending_customer',
       confidence: this.clampQuoteConfidence(
         this.toNumber(result.confidence) ?? fallback.confidence,
       ),
@@ -712,28 +787,67 @@ export class AiService {
         Math.min(teamSize, 8) * 0.025 +
         deadlinePressure,
     );
-    const factor =
-      planningComplexity === 'trivial'
-        ? Math.min(0.4, Math.max(0.15, 0.1 + complexityScore * 0.35))
-        : Math.min(0.92, Math.max(0.55, 0.52 + complexityScore * 0.35));
-    const amount = this.roundMoney(min + (max - min) * factor);
     const complexity =
       complexityScore >= 0.72
         ? 'high'
         : complexityScore >= 0.45
           ? 'medium'
           : 'low';
+    const complexityKey =
+      planningComplexity === 'trivial'
+        ? 'trivial'
+        : complexity === 'high'
+          ? 'complex'
+          : 'standard';
+    const workers = Math.max(1, Math.min(8, Math.round(teamSize)));
+    const hours = {
+      trivial: { reviewer: 2, architect: 2, uiux: 2, implementation: 8 },
+      standard: { reviewer: 12, architect: 16, uiux: 18, implementation: 160 },
+      complex: { reviewer: 28, architect: 36, uiux: 40, implementation: 480 },
+    }[complexityKey];
+    const rates = {
+      reviewer: this.marketRate('MARKET_RATE_PRINCIPAL_REVIEWER', 650),
+      architect: this.marketRate('MARKET_RATE_ARCHITECT', 550),
+      uiux: this.marketRate('MARKET_RATE_UI_UX', 450),
+      implementation: this.marketRate('MARKET_RATE_DEVELOPER', 400),
+    };
+    const roleEstimates = [
+      this.quoteRoleEstimate(
+        'principal_reviewer',
+        1,
+        hours.reviewer,
+        rates.reviewer,
+      ),
+      this.quoteRoleEstimate('architect', 1, hours.architect, rates.architect),
+      this.quoteRoleEstimate('ui_ux', 1, hours.uiux, rates.uiux),
+      this.quoteRoleEstimate(
+        'implementation',
+        workers,
+        Math.ceil(hours.implementation / workers),
+        rates.implementation,
+      ),
+    ];
+    const laborTotal = roleEstimates.reduce(
+      (sum, role) => sum + role.subtotal,
+      0,
+    );
+    const recommendedMinimum = this.roundMoney(laborTotal / 0.9);
+    const amount = this.roundMoney(Math.max(min, recommendedMinimum));
+    const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
 
     return {
       amount,
+      recommendedMinimum,
+      budgetGap,
+      roleEstimates,
       currency:
         this.optionalString(project.currency)?.toUpperCase().slice(0, 3) ??
         'EGP',
-      quoteStatus: 'pending_customer',
+      quoteStatus: budgetGap > 0 ? 'out_of_budget' : 'pending_customer',
       confidence: source === 'fastapi' ? 0.75 : 0.58,
       complexity,
       rationale:
-        'Final price estimated from the confirmed requirements, platform count, feature breadth, delivery scope, and the customer budget range.',
+        'Final price estimated from role hours and assessed market-rate assumptions before comparing it with the customer budget.',
       assumptions: [
         'The first release follows the confirmed brief without major scope expansion.',
         'Architecture and UI/UX planning are included at a depth proportional to the confirmed scope.',
@@ -756,9 +870,26 @@ export class AiService {
     return { min, max };
   }
 
-  private clampQuoteAmount(amount: number, min: number, max: number) {
-    if (max <= min) return min;
-    return Math.min(max, Math.max(min, amount));
+  private marketRate(name: string, fallback: number) {
+    const configured = Number(process.env[name]);
+    return Number.isFinite(configured) && configured > 0
+      ? configured
+      : fallback;
+  }
+
+  private quoteRoleEstimate(
+    roleKey: string,
+    people: number,
+    hoursEach: number,
+    hourlyRate: number,
+  ) {
+    return {
+      roleKey,
+      people,
+      hoursEach,
+      hourlyRate,
+      subtotal: this.roundMoney(people * hoursEach * hourlyRate),
+    };
   }
 
   private roundMoney(value: number) {
@@ -1015,7 +1146,7 @@ export class AiService {
                 ],
       acceptanceCriteria: [
         'Specific to the project',
-        'Clear enough for admin review',
+        'Clear enough for principal-reviewer decision',
         'Ready for Scrum Master planning',
       ],
       handoffChecklist: ['Confirmed decisions', 'Open questions', 'Risks'],
@@ -1544,6 +1675,33 @@ export class AiService {
         .filter((dependency) => dependency.taskKey === key)
         .map((dependency) => dependency.dependsOnKey);
       const dependsOn = Array.from(new Set([...taskDeps, ...externalDeps]));
+      const checkpoints = Array.isArray(item.checkpoints)
+        ? item.checkpoints
+            .filter(
+              (checkpoint): checkpoint is Record<string, unknown> =>
+                typeof checkpoint === 'object' && checkpoint !== null,
+            )
+            .map((checkpoint, checkpointIndex) => ({
+              key:
+                this.optionalString(checkpoint.key) ??
+                `${key}-checkpoint-${checkpointIndex + 1}`,
+              title:
+                this.optionalString(checkpoint.title) ??
+                `Checkpoint ${checkpointIndex + 1}`,
+              offsetDays: Math.max(
+                0,
+                this.toNumber(checkpoint.offsetDays) ?? checkpointIndex + 1,
+              ),
+              weightPercent: Math.max(
+                1,
+                this.toNumber(checkpoint.weightPercent) ?? 50,
+              ),
+              penaltyPercent: Math.max(
+                0,
+                this.toNumber(checkpoint.penaltyPercent) ?? 5,
+              ),
+            }))
+        : [];
 
       return {
         key,
@@ -1564,6 +1722,7 @@ export class AiService {
         contractReferences: this.toStringArray(item.contractReferences),
         ownedPaths: this.toStringArray(item.ownedPaths),
         integrationChecks: this.toStringArray(item.integrationChecks),
+        checkpoints,
         dependsOn,
         status: this.optionalString(item.status) ?? 'todo',
       };

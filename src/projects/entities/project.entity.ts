@@ -142,6 +142,30 @@ export class Project {
   @Column({ name: 'budget_allocation', type: 'jsonb', nullable: true })
   budgetAllocation: Record<string, unknown> | null;
 
+  @Column({
+    name: 'automation_status',
+    type: 'varchar',
+    length: 60,
+    default: 'awaiting_funding',
+  })
+  automationStatus: string;
+
+  @Column({
+    name: 'platform_fee_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    default: 0,
+  })
+  platformFeeAmount: string;
+
+  @Column({
+    name: 'principal_reviewer_assignment_id',
+    type: 'uuid',
+    nullable: true,
+  })
+  principalReviewerAssignmentId: string | null;
+
   @OneToMany(() => ProjectRoleAssignment, (assignment) => assignment.project)
   roleAssignments?: ProjectRoleAssignment[];
 

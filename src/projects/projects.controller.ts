@@ -43,12 +43,16 @@ export class ProjectsController {
   }
 
   @Get(':id')
-  @Roles(UserRole.CUSTOMER)
+  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
   async getProject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    const data = await this.projectsService.findOne(id, user.sub, false);
+    const data = await this.projectsService.findOne(
+      id,
+      user.sub,
+      user.role === UserRole.ADMIN,
+    );
     return { status: 'success', data };
   }
 

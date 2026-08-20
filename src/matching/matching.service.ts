@@ -12,6 +12,8 @@ import {
   EntityManager,
   In,
   IsNull,
+  LessThanOrEqual,
+  MoreThan,
   Not,
   Repository,
 } from 'typeorm';
@@ -25,9 +27,10 @@ import { Project } from 'src/projects/entities/project.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
+import { TaskCheckpoint } from 'src/projects/entities/task-checkpoint.entity';
 import {
   planningRoleAllocation,
-  requiredProjectTotalForRate,
+  principalReviewerRoleAllocation,
 } from 'src/planning/project-budget-allocation';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from './entities/matching-candidate.entity';
@@ -40,16 +43,29 @@ import {
 } from './dtos/start-planning-matching.dto';
 import { UpdateCandidateStatusDto } from './dtos/update-candidate-status.dto';
 import { ReviewRunDto } from './dtos/review-run.dto';
+import { ProjectInvitation } from './entities/project-invitation.entity';
+import { FreelancerPerformanceEvent } from 'src/freelancers/entities/freelancer-performance-event.entity';
+import { RepositoriesService } from 'src/repositories/repositories.service';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
+const PRINCIPAL_REVIEWER_ROLE = 'principal_reviewer';
+const INVITATION_TTL_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_LIMIT = 10;
-
-const MIN_AFFORDABLE_POOL = 3;
 
 // Sensible default required-skills per planning role, used when the admin does
 // not pass explicit `filters.skills`. Lets the architect and ui_ux runs rank
 // against role-relevant skills instead of one shared list.
 const PLANNING_ROLE_SKILLS: Record<string, string[]> = {
+  principal_reviewer: [
+    'Solution Architecture',
+    'System Design',
+    'Technical Leadership',
+    'Code Review',
+    'Risk Management',
+    'Project Planning',
+    'API Design',
+    'Security',
+  ],
   architect: [
     'System Design',
     'API Design',
@@ -108,6 +124,7 @@ const ASSIGNABLE_CANDIDATE_STATUSES = new Set([
   'recommended',
   'shortlisted',
   'selected',
+  'invited',
 ]);
 
 export function assertTaskMatchingRunInvariant(
@@ -150,8 +167,11 @@ export class MatchingService {
     private readonly profileRepo: Repository<FreelancerProfile>,
     @InjectRepository(ProjectTask)
     private readonly taskRepo: Repository<ProjectTask>,
+    @InjectRepository(ProjectInvitation)
+    private readonly invitationRepo: Repository<ProjectInvitation>,
     private readonly aiService: AiService,
     private readonly notificationsService: NotificationsService,
+    private readonly repositoriesService: RepositoriesService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -164,7 +184,24 @@ export class MatchingService {
   // must not disrupt the brief-completion flow that calls it.
   async autoStartPlanningRoles(projectId: string): Promise<void> {
     try {
-      const existingRuns = await this.runRepo.count({ where: { projectId } });
+      const reviewer = await this.dataSource
+        .getRepository(ProjectRoleAssignment)
+        .findOne({
+          where: {
+            projectId,
+            phase: 'governance',
+            roleKey: PRINCIPAL_REVIEWER_ROLE,
+            status: In(['accepted', 'in_progress']),
+          },
+        });
+      if (!reviewer) return;
+      const existingRuns = await this.runRepo.count({
+        where: {
+          projectId,
+          targetType: 'planning_role',
+          targetRoleKey: In(PLANNING_ROLES),
+        },
+      });
       if (existingRuns > 0) return;
 
       const project = await this.projectRepo.findOne({
@@ -178,6 +215,45 @@ export class MatchingService {
       this.logger.error(
         `Auto-start matching failed for project ${projectId}: ${message}`,
       );
+      await this.markStaffingBlocked(projectId, message);
+    }
+  }
+
+  async autoStartPrincipalReviewer(projectId: string): Promise<void> {
+    try {
+      const existingAssignment = await this.dataSource
+        .getRepository(ProjectRoleAssignment)
+        .findOne({
+          where: {
+            projectId,
+            phase: 'governance',
+            roleKey: PRINCIPAL_REVIEWER_ROLE,
+            status: In(['assigned', 'accepted', 'in_progress']),
+          },
+        });
+      if (existingAssignment) return;
+      const pendingInvitation = await this.invitationRepo.findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['pending', 'accepting']),
+        },
+      });
+      if (pendingInvitation) return;
+      const project = await this.getProject(projectId);
+      if (project.status !== ProjectStatus.BRIEF_COMPLETE) return;
+      await this.startPlanningRoles(
+        projectId,
+        { roles: [PRINCIPAL_REVIEWER_ROLE] },
+        null,
+      );
+    } catch (error) {
+      const message = this.errorMessage(error);
+      this.logger.error(
+        `Principal-reviewer automation failed for ${projectId}: ${message}`,
+      );
+      await this.markStaffingBlocked(projectId, message);
     }
   }
 
@@ -199,7 +275,18 @@ export class MatchingService {
       : [...PLANNING_ROLES];
 
     const brief = await this.briefRepo.findOne({ where: { projectId } });
-    const { candidates } = await this.buildCandidatePool(dto, brief, project);
+    const candidatePools = new Map(
+      await Promise.all(
+        roles.map(
+          async (role) =>
+            [
+              role,
+              (await this.buildCandidatePool(dto, brief, project, role))
+                .candidates,
+            ] as const,
+        ),
+      ),
+    );
     const limit = dto.filters?.limit ?? DEFAULT_LIMIT;
 
     // Create the runs and flip the project up front, in a short transaction, so
@@ -218,7 +305,7 @@ export class MatchingService {
               requestedBy: adminUserId,
               filters: dto.filters ? { ...dto.filters } : null,
               inputSnapshot: {
-                candidatePoolSize: candidates.length,
+                candidatePoolSize: candidatePools.get(role)?.length ?? 0,
                 filters: dto.filters ?? null,
               },
               startedAt: new Date(),
@@ -240,6 +327,7 @@ export class MatchingService {
 
     for (const run of runs) {
       try {
+        const candidates = candidatePools.get(run.targetRoleKey!) ?? [];
         // Rank against role-specific skills (admin override, else per-role default).
         const roleSkills = dto.filters?.skills?.length
           ? dto.filters.skills
@@ -255,6 +343,7 @@ export class MatchingService {
         });
 
         const candidateCount = await this.completeRun(run, ai);
+        const invitation = await this.inviteNextCandidate(run.id);
         runResults.push({
           id: run.id,
           targetType: 'planning_role',
@@ -262,6 +351,7 @@ export class MatchingService {
           status: 'completed',
           candidateCount,
           summary: ai.summary,
+          invitationId: invitation?.id ?? null,
         });
       } catch (error) {
         runResults.push({
@@ -273,6 +363,17 @@ export class MatchingService {
           error: await this.failRun(run, error),
         });
       }
+    }
+
+    if (
+      runResults.some(
+        (result) => result.status === 'failed' || result.invitationId == null,
+      )
+    ) {
+      await this.markStaffingBlocked(
+        projectId,
+        'One or more planning roles could not be invited automatically.',
+      );
     }
 
     return {
@@ -323,7 +424,10 @@ export class MatchingService {
   // Start implementation-task matching
   // ---------------------------------------------------------------------------
 
-  async autoStartImplementationTasks(projectId: string, adminUserId: string) {
+  async autoStartImplementationTasks(
+    projectId: string,
+    adminUserId: string | null,
+  ) {
     try {
       const result = await this.startImplementationTasks(
         projectId,
@@ -366,6 +470,7 @@ export class MatchingService {
       this.logger.error(
         `Automatic implementation matching failed for project ${projectId}: ${message}`,
       );
+      await this.markStaffingBlocked(projectId, message);
       return {
         triggered: false,
         projectId,
@@ -380,7 +485,7 @@ export class MatchingService {
   async startImplementationTasks(
     projectId: string,
     dto: StartImplementationMatchingDto,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const project = await this.getProject(projectId);
     if (!IMPLEMENTATION_MATCH_ALLOWED_STATUSES.has(project.status)) {
@@ -526,6 +631,7 @@ export class MatchingService {
         });
 
         const candidateCount = await this.completeRun(run, ai);
+        const invitation = await this.inviteNextCandidate(run.id);
         runResults.push({
           id: run.id,
           targetType: 'task',
@@ -535,6 +641,7 @@ export class MatchingService {
           status: 'completed',
           candidateCount,
           summary: ai.summary,
+          invitationId: invitation?.id ?? null,
         });
       } catch (error) {
         runResults.push({
@@ -549,6 +656,16 @@ export class MatchingService {
         });
       }
     }
+    if (
+      runResults.some(
+        (result) => result.status === 'failed' || result.invitationId == null,
+      )
+    ) {
+      await this.markStaffingBlocked(
+        input.project.id,
+        'One or more implementation tasks could not be invited automatically.',
+      );
+    }
     return runResults;
   }
 
@@ -556,7 +673,11 @@ export class MatchingService {
   // Assign an implementation task
   // ---------------------------------------------------------------------------
 
-  async assignTask(taskId: string, dto: AssignTaskDto, adminUserId: string) {
+  async assignTask(
+    taskId: string,
+    dto: AssignTaskDto,
+    adminUserId: string | null,
+  ) {
     if (!dto.candidateId && !dto.freelancerProfileId) {
       throw new BadRequestException(
         'candidateId or freelancerProfileId is required',
@@ -665,11 +786,19 @@ export class MatchingService {
         }
       }
 
+      const assignedAt = new Date();
+      const scheduleOverrun = await this.rebaseTaskSchedule(
+        manager,
+        task,
+        project,
+        assignedAt,
+      );
       task.assignedFreelancerProfileId = freelancerProfileId;
       task.sourceMatchingRunId = sourceRun?.id ?? null;
       task.sourceCandidateId = candidate?.id ?? null;
       task.assignedBy = adminUserId;
-      task.assignedAt = new Date();
+      task.assignedAt = assignedAt;
+      task.assignmentStatus = 'accepted';
       if (task.status !== 'in_progress') task.status = 'todo';
       if (dto.notes) {
         task.metadata = {
@@ -702,17 +831,51 @@ export class MatchingService {
         adminUserId,
       );
 
-      return { task, notifyUserId: profile.userId ?? null };
+      return { task, notifyUserId: profile.userId ?? null, scheduleOverrun };
     });
 
     if (result.notifyUserId) {
       await this.notificationsService.createNotification({
         userId: result.notifyUserId,
         projectId: result.task.projectId,
+        taskId: result.task.id,
+        type: 'task_assignment',
         title: 'New task assignment',
-        body: `You were assigned the task "${result.task.title}".`,
+        body: `You were assigned the task "${result.task.title}". Its countdown starts from the accepted schedule.`,
+        actionUrl: `/freelancer/projects/${result.task.projectId}/tasks/${result.task.id}`,
       });
     }
+    if (result.scheduleOverrun) {
+      const reviewer = await this.dataSource
+        .getRepository(ProjectRoleAssignment)
+        .findOne({
+          where: {
+            projectId: result.task.projectId,
+            phase: 'governance',
+            roleKey: PRINCIPAL_REVIEWER_ROLE,
+            status: In(['accepted', 'in_progress']),
+          },
+          relations: ['freelancerProfile'],
+        });
+      if (reviewer?.freelancerProfile?.userId) {
+        await this.notificationsService.createNotification({
+          userId: reviewer.freelancerProfile.userId,
+          projectId: result.task.projectId,
+          taskId: result.task.id,
+          type: 'schedule_risk',
+          title: 'Task schedule exceeds project deadline',
+          body: `The rematched schedule for "${result.task.title}" now ends after the project deadline. Review dependencies and customer expectations.`,
+          actionUrl: `/reviewer/projects/${result.task.projectId}`,
+        });
+      }
+    }
+    await this.repositoriesService
+      .provisionForAssignedTeam(result.task.projectId)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Automatic repository access failed for task ${result.task.id}: ${this.errorMessage(error)}`,
+        ),
+      );
 
     const { task } = result;
     return {
@@ -733,7 +896,7 @@ export class MatchingService {
   private async advanceImplementationStatus(
     manager: EntityManager,
     projectId: string,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const project = await manager.findOne(Project, {
       where: { id: projectId },
@@ -749,7 +912,11 @@ export class MatchingService {
     });
 
     if (unassigned === 0) {
-      if (project.status === ProjectStatus.ASSIGNED) return;
+      project.automationStatus = 'implementation_active';
+      if (project.status === ProjectStatus.ASSIGNED) {
+        await manager.save(Project, project);
+        return;
+      }
       await this.transitionProject(manager, project, adminUserId, {
         status: ProjectStatus.ASSIGNED,
         reason: 'All implementation tasks have assigned freelancers.',
@@ -1056,6 +1223,1013 @@ export class MatchingService {
     };
   }
 
+  async listInvitations(userId: string, status?: string) {
+    const profile = await this.getProfileByUserId(userId);
+    const where: Record<string, unknown> = {
+      freelancerProfileId: profile.id,
+    };
+    if (status) where.status = status;
+    return this.invitationRepo.find({
+      where,
+      relations: ['project', 'task'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  async respondToInvitation(
+    invitationId: string,
+    userId: string,
+    decision: 'accepted' | 'declined',
+    reason?: string,
+  ) {
+    const profile = await this.getProfileByUserId(userId);
+    const invitation = await this.invitationRepo.findOne({
+      where: { id: invitationId, freelancerProfileId: profile.id },
+      relations: [
+        'project',
+        'task',
+        'candidate',
+        'candidate.freelancerProfile',
+        'matchingRun',
+      ],
+    });
+    if (!invitation) throw new NotFoundException('Invitation not found');
+    if (invitation.status !== 'pending') {
+      throw new ConflictException('This invitation has already been resolved');
+    }
+    if (invitation.expiresAt <= new Date()) {
+      await this.expireInvitation(invitation);
+      throw new ConflictException(
+        'This invitation expired and the next candidate is being invited',
+      );
+    }
+
+    if (decision === 'declined') {
+      const declined = await this.invitationRepo
+        .createQueryBuilder()
+        .update(ProjectInvitation)
+        .set({
+          status: 'declined',
+          respondedAt: new Date(),
+          responseReason: reason?.trim() || null,
+        })
+        .where('id = :id', { id: invitation.id })
+        .andWhere("status = 'pending'")
+        .andWhere('expires_at > NOW()')
+        .execute();
+      if (!declined.affected) {
+        await this.expireInvitation(invitation);
+        throw new ConflictException(
+          'This invitation is no longer pending and matching has continued',
+        );
+      }
+      invitation.status = 'declined';
+      invitation.respondedAt = new Date();
+      invitation.responseReason = reason?.trim() || null;
+      if (invitation.candidate) {
+        invitation.candidate.status = 'rejected';
+        invitation.candidate.rejectionReason =
+          reason?.trim() || 'Freelancer declined the invitation';
+        await this.candidateRepo.save(invitation.candidate);
+      }
+      if (invitation.taskId) {
+        await this.taskRepo.update(invitation.taskId, {
+          assignmentStatus: 'unassigned',
+        });
+      }
+      await this.notifyProjectOwner(
+        invitation.project,
+        'Invitation declined',
+        `${profile.user?.firstName ?? 'A freelancer'} declined the ${invitation.roleKey} invitation. The next match is being invited automatically.`,
+        userId,
+      );
+      await this.inviteNextCandidate(invitation.matchingRunId!);
+      return { id: invitation.id, status: invitation.status };
+    }
+
+    if (!invitation.matchingRun || !invitation.candidate) {
+      throw new ConflictException(
+        'The invitation is missing its matching evidence and needs manual review',
+      );
+    }
+
+    let assignment: ProjectRoleAssignment | null = null;
+    if (invitation.phase === 'implementation') {
+      if (!invitation.taskId) {
+        throw new ConflictException('Task invitation has no task');
+      }
+      const claimed = await this.invitationRepo
+        .createQueryBuilder()
+        .update(ProjectInvitation)
+        .set({ status: 'accepting' })
+        .where('id = :id', { id: invitation.id })
+        .andWhere("status = 'pending'")
+        .andWhere('expires_at > NOW()')
+        .execute();
+      if (!claimed.affected) {
+        await this.expireInvitation(invitation);
+        throw new ConflictException(
+          'This invitation is no longer pending and matching has continued',
+        );
+      }
+      try {
+        await this.assignTask(
+          invitation.taskId,
+          {
+            candidateId: invitation.candidate.id,
+            sourceMatchingRunId: invitation.matchingRun.id,
+          },
+          null,
+        );
+      } catch (error) {
+        await this.invitationRepo
+          .createQueryBuilder()
+          .update(ProjectInvitation)
+          .set({ status: 'pending' })
+          .where('id = :id AND status = :status', {
+            id: invitation.id,
+            status: 'accepting',
+          })
+          .execute();
+        throw error;
+      }
+      invitation.status = 'accepted';
+      invitation.respondedAt = new Date();
+      invitation.responseReason = reason?.trim() || null;
+      await this.invitationRepo.update(
+        { id: invitation.id, status: 'accepting' },
+        {
+          status: 'accepted',
+          respondedAt: invitation.respondedAt,
+          responseReason: invitation.responseReason,
+        },
+      );
+    } else {
+      assignment = await this.dataSource.transaction(async (manager) => {
+        const locked = await manager
+          .getRepository(ProjectInvitation)
+          .createQueryBuilder('invitation')
+          .setLock('pessimistic_write')
+          .where('invitation.id = :id', { id: invitation.id })
+          .getOne();
+        if (!locked || locked.status !== 'pending') {
+          throw new ConflictException('Invitation is no longer pending');
+        }
+        if (locked.expiresAt <= new Date()) {
+          throw new ConflictException(
+            'This invitation expired and matching has continued',
+          );
+        }
+        const created = await this.createPlanningAssignment(manager, {
+          run: invitation.matchingRun!,
+          candidate: invitation.candidate!,
+          adminUserId: null,
+          notes: reason?.trim() || 'Automatically matched and accepted.',
+          phase: invitation.phase === 'governance' ? 'governance' : 'planning',
+          accepted: true,
+        });
+        locked.status = 'accepted';
+        locked.respondedAt = new Date();
+        locked.responseReason = reason?.trim() || null;
+        await manager.save(ProjectInvitation, locked);
+
+        invitation.candidate!.status = 'assigned';
+        invitation.candidate!.selectedAt = new Date();
+        await manager.save(MatchingCandidate, invitation.candidate!);
+        invitation.matchingRun!.status = 'reviewed';
+        invitation.matchingRun!.reviewedAt = new Date();
+        await manager.save(MatchingRun, invitation.matchingRun!);
+
+        if (invitation.phase === 'governance') {
+          invitation.project.principalReviewerAssignmentId = created.id;
+          invitation.project.automationStatus = 'matching_planning_team';
+          await manager.save(Project, invitation.project);
+        } else {
+          await this.maybeAdvanceToPlanningAssigned(
+            manager,
+            invitation.projectId,
+            null,
+          );
+        }
+        return created;
+      });
+    }
+
+    await this.notifyProjectOwner(
+      invitation.project,
+      'Invitation accepted',
+      `${profile.user?.firstName ?? 'The freelancer'} accepted the ${invitation.roleKey} assignment.`,
+      userId,
+    );
+    if (invitation.phase === 'governance') {
+      await this.autoStartPlanningRoles(invitation.projectId);
+    }
+    if (invitation.phase !== 'implementation') {
+      await this.repositoriesService
+        .provisionForAssignedTeam(invitation.projectId)
+        .catch((error: unknown) =>
+          this.logger.error(
+            `Automatic repository access failed for ${invitation.phase} assignment ${assignment?.id ?? invitation.id}: ${this.errorMessage(error)}`,
+          ),
+        );
+    }
+    return {
+      id: invitation.id,
+      status: 'accepted',
+      assignmentId: assignment?.id ?? null,
+      taskId: invitation.taskId,
+    };
+  }
+
+  async expirePendingInvitations() {
+    const expired = await this.invitationRepo.find({
+      where: { status: 'pending', expiresAt: LessThanOrEqual(new Date()) },
+      relations: ['project', 'task', 'candidate'],
+      take: 100,
+      order: { expiresAt: 'ASC' },
+    });
+    for (const invitation of expired) {
+      try {
+        await this.expireInvitation(invitation);
+      } catch (error) {
+        this.logger.error(
+          `Could not expire invitation ${invitation.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return { expired: expired.length };
+  }
+
+  async recoverAcceptingInvitations() {
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000);
+    const accepting = await this.invitationRepo.find({
+      where: {
+        status: 'accepting',
+        updatedAt: LessThanOrEqual(staleBefore),
+      },
+      relations: ['project', 'task', 'candidate'],
+      take: 100,
+      order: { updatedAt: 'ASC' },
+    });
+    let accepted = 0;
+    let reset = 0;
+    let expired = 0;
+    for (const invitation of accepting) {
+      const state = await this.dataSource.transaction(async (manager) => {
+        const locked = await manager
+          .getRepository(ProjectInvitation)
+          .createQueryBuilder('invitation')
+          .setLock('pessimistic_write')
+          .where('invitation.id = :id', { id: invitation.id })
+          .getOne();
+        if (!locked || locked.status !== 'accepting') return 'unchanged';
+        const task = locked.taskId
+          ? await manager.findOne(ProjectTask, {
+              where: { id: locked.taskId },
+            })
+          : null;
+        if (task?.assignedFreelancerProfileId === locked.freelancerProfileId) {
+          locked.status = 'accepted';
+          locked.respondedAt = locked.respondedAt ?? new Date();
+          await manager.save(ProjectInvitation, locked);
+          return 'accepted';
+        }
+        locked.status = 'pending';
+        await manager.save(ProjectInvitation, locked);
+        return locked.expiresAt <= new Date() ? 'expired' : 'reset';
+      });
+      if (state === 'accepted') {
+        accepted += 1;
+        await this.notifyProjectOwner(
+          invitation.project,
+          'Invitation accepted',
+          `The ${invitation.roleKey} assignment was recovered after an interrupted acceptance request.`,
+          invitation.freelancerProfile?.userId,
+        );
+        await this.repositoriesService
+          .provisionForAssignedTeam(invitation.projectId)
+          .catch((error: unknown) =>
+            this.logger.error(
+              `Repository recovery failed for invitation ${invitation.id}: ${this.errorMessage(error)}`,
+            ),
+          );
+      } else if (state === 'expired') {
+        expired += 1;
+        await this.expireInvitation(invitation);
+      } else if (state === 'reset') {
+        reset += 1;
+      }
+    }
+    return { inspected: accepting.length, accepted, reset, expired };
+  }
+
+  async recoverBlockedStaffing() {
+    const projects = await this.projectRepo.find({
+      where: { automationStatus: 'staffing_blocked' },
+      order: { updatedAt: 'ASC' },
+      take: 10,
+    });
+    let restarted = 0;
+    for (const project of projects) {
+      const recentRun = await this.runRepo.findOne({
+        where: {
+          projectId: project.id,
+          createdAt: MoreThan(new Date(Date.now() - 15 * 60_000)),
+        },
+        order: { createdAt: 'DESC' },
+      });
+      if (recentRun) continue;
+      try {
+        const reviewer = await this.dataSource
+          .getRepository(ProjectRoleAssignment)
+          .findOne({
+            where: {
+              projectId: project.id,
+              phase: 'governance',
+              roleKey: PRINCIPAL_REVIEWER_ROLE,
+              status: In(['accepted', 'in_progress']),
+            },
+          });
+        if (!reviewer) {
+          await this.autoStartPrincipalReviewer(project.id);
+          restarted += 1;
+          continue;
+        }
+
+        if (MATCH_START_ALLOWED_STATUSES.has(project.status)) {
+          const planningAssignments = await this.dataSource
+            .getRepository(ProjectRoleAssignment)
+            .find({
+              where: {
+                projectId: project.id,
+                phase: 'planning',
+                status: In(ASSIGNMENT_ACTIVE_STATUSES),
+              },
+            });
+          const assignedRoles = new Set(
+            planningAssignments.map((assignment) => assignment.roleKey),
+          );
+          const missingRoles = PLANNING_ROLES.filter(
+            (role) => !assignedRoles.has(role),
+          );
+          if (missingRoles.length) {
+            await this.startPlanningRoles(
+              project.id,
+              { roles: missingRoles },
+              null,
+            );
+            restarted += missingRoles.length;
+            continue;
+          }
+        }
+
+        if (IMPLEMENTATION_MATCH_ALLOWED_STATUSES.has(project.status)) {
+          const tasks = await this.taskRepo.find({
+            where: {
+              projectId: project.id,
+              assignedFreelancerProfileId: IsNull(),
+              status: In(MATCHABLE_TASK_STATUSES),
+            },
+            select: { id: true },
+            take: 25,
+          });
+          if (tasks.length) {
+            await this.startImplementationTasks(
+              project.id,
+              { taskIds: tasks.map((task) => task.id), mode: 'sync' },
+              null,
+            );
+            restarted += tasks.length;
+          }
+        }
+      } catch (error) {
+        this.logger.error(
+          `Blocked staffing recovery failed for ${project.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: projects.length, restarted };
+  }
+
+  async removeTaskAssignee(
+    taskId: string,
+    reason: string,
+    actorUserId: string | null,
+  ) {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const task = await manager
+        .getRepository(ProjectTask)
+        .createQueryBuilder('task')
+        .setLock('pessimistic_write')
+        .where('task.id = :taskId', { taskId })
+        .getOne();
+      if (!task) throw new NotFoundException('Task not found');
+      if (!task.assignedFreelancerProfileId) {
+        throw new ConflictException('Task has no assignee to remove');
+      }
+      const removedProfileId = task.assignedFreelancerProfileId;
+      const removedAt = new Date();
+      const priorAssignedAt = task.assignedAt;
+      const profile = await manager.findOne(FreelancerProfile, {
+        where: { id: removedProfileId },
+      });
+      if (profile) {
+        profile.projectRemovals += 1;
+        profile.performanceScore = Math.max(
+          0,
+          Number(profile.performanceScore) - 10,
+        ).toFixed(2);
+        profile.riskFlags = [
+          ...(profile.riskFlags ?? []),
+          {
+            type: 'task_removal',
+            projectId: task.projectId,
+            taskId: task.id,
+            reason,
+            at: new Date().toISOString(),
+          },
+        ].slice(-20);
+        await manager.save(FreelancerProfile, profile);
+        await manager.save(
+          FreelancerPerformanceEvent,
+          manager.create(FreelancerPerformanceEvent, {
+            freelancerProfileId: profile.id,
+            projectId: task.projectId,
+            taskId: task.id,
+            eventType: 'task_removed',
+            scoreDelta: '-10.00',
+            moneyDelta: '0.00',
+            currency: task.currency,
+            reason,
+            metadata: { actorUserId },
+          }),
+        );
+      }
+      task.assignedFreelancerProfileId = null;
+      task.assignedAt = null;
+      task.assignedBy = null;
+      task.assignmentStatus = 'unassigned';
+      task.status = 'todo';
+      const currentPenalty = Math.max(0, Number(task.penaltyAmount ?? 0));
+      const currentBudget = Math.max(0, Number(task.budgetAmount ?? 0));
+      task.metadata = {
+        ...(task.metadata ?? {}),
+        assignmentHistory: [
+          ...this.metadataArray(task.metadata?.assignmentHistory),
+          {
+            freelancerProfileId: removedProfileId,
+            assignedAt: priorAssignedAt?.toISOString() ?? null,
+            endedAt: removedAt.toISOString(),
+            reason,
+            penaltyAmount: currentPenalty.toFixed(2),
+            budgetBeforePenalty: currentBudget.toFixed(2),
+          },
+        ].slice(-20),
+      };
+      if (currentPenalty > 0) {
+        task.budgetAmount = Math.max(0, currentBudget - currentPenalty).toFixed(
+          2,
+        );
+      }
+      task.penaltyAmount = '0.00';
+      task.deadlineStrikes = 0;
+      const checkpoints = await manager.getRepository(TaskCheckpoint).find({
+        where: { taskId: task.id },
+      });
+      for (const checkpoint of checkpoints) {
+        checkpoint.metadata = {
+          ...(checkpoint.metadata ?? {}),
+          assignmentHistory: [
+            ...this.metadataArray(checkpoint.metadata?.assignmentHistory),
+            {
+              freelancerProfileId: removedProfileId,
+              status: checkpoint.status,
+              completedAt: checkpoint.completedAt?.toISOString() ?? null,
+              assessedAt: checkpoint.assessedAt?.toISOString() ?? null,
+              penaltyAmount: checkpoint.penaltyAmount,
+              endedAt: removedAt.toISOString(),
+            },
+          ].slice(-20),
+        };
+        checkpoint.status = 'pending';
+        checkpoint.completedAt = null;
+        checkpoint.assessedAt = null;
+        checkpoint.penaltyAmount = '0.00';
+      }
+      if (checkpoints.length) {
+        await manager.getRepository(TaskCheckpoint).save(checkpoints);
+      }
+      await manager.save(ProjectTask, task);
+      return { task, removedProfileId };
+    });
+
+    const existingRun = result.task.sourceMatchingRunId
+      ? await this.runRepo.findOne({
+          where: { id: result.task.sourceMatchingRunId },
+        })
+      : null;
+    await this.repositoriesService
+      .revokeIfNoLongerAssigned(result.task.projectId, result.removedProfileId)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Automatic repository revocation failed for removed assignee ${result.removedProfileId}: ${this.errorMessage(error)}`,
+        ),
+      );
+    const invitation = existingRun
+      ? await this.inviteNextCandidate(existingRun.id)
+      : null;
+    if (!invitation) {
+      await this.startImplementationTasks(
+        result.task.projectId,
+        { taskIds: [result.task.id], mode: 'sync' },
+        actorUserId,
+      );
+    }
+    return {
+      taskId: result.task.id,
+      removedFreelancerProfileId: result.removedProfileId,
+      rematching: true,
+    };
+  }
+
+  async removePlanningAssignee(
+    projectId: string,
+    roleKey: string,
+    reason: string,
+    actorUserId: string | null,
+  ) {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const assignment = await manager
+        .getRepository(ProjectRoleAssignment)
+        .createQueryBuilder('assignment')
+        .setLock('pessimistic_write')
+        .where('assignment.projectId = :projectId', { projectId })
+        .andWhere('assignment.phase = :phase', { phase: 'planning' })
+        .andWhere('assignment.roleKey = :roleKey', { roleKey })
+        .andWhere('assignment.endedAt IS NULL')
+        .getOne();
+      if (!assignment?.freelancerProfileId) {
+        throw new ConflictException('Planning role has no active assignee');
+      }
+      const removedProfileId = assignment.freelancerProfileId;
+      assignment.status = 'removed';
+      assignment.endedAt = new Date();
+      assignment.decisionReason = reason;
+      await manager.save(ProjectRoleAssignment, assignment);
+
+      const profile = await manager.findOne(FreelancerProfile, {
+        where: { id: removedProfileId },
+      });
+      if (profile) {
+        profile.projectRemovals += 1;
+        profile.riskFlags = [
+          ...(profile.riskFlags ?? []),
+          {
+            type: 'planning_role_rejection',
+            projectId,
+            roleKey,
+            reason,
+            at: new Date().toISOString(),
+          },
+        ].slice(-20);
+        await manager.save(FreelancerProfile, profile);
+      }
+      const project = await manager.findOne(Project, {
+        where: { id: projectId },
+      });
+      if (project) {
+        project.status = ProjectStatus.PLANNING_MATCHING;
+        project.planningStatus = 'matching';
+        project.automationStatus = 'awaiting_planning_team';
+        await manager.save(Project, project);
+      }
+      return {
+        removedProfileId,
+        sourceMatchingRunId: assignment.sourceMatchingRunId,
+      };
+    });
+
+    await this.repositoriesService
+      .revokeIfNoLongerAssigned(projectId, result.removedProfileId)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Automatic repository revocation failed for rejected ${roleKey} assignee ${result.removedProfileId}: ${this.errorMessage(error)}`,
+        ),
+      );
+    const existingRun = result.sourceMatchingRunId
+      ? await this.runRepo.findOne({
+          where: { id: result.sourceMatchingRunId },
+        })
+      : null;
+    const invitation = existingRun
+      ? await this.inviteNextCandidate(existingRun.id)
+      : null;
+    if (!invitation) {
+      await this.startPlanningRoles(
+        projectId,
+        { roles: [roleKey], filters: undefined },
+        actorUserId,
+      );
+    }
+    return {
+      projectId,
+      roleKey,
+      removedFreelancerProfileId: result.removedProfileId,
+      rematching: true,
+    };
+  }
+
+  async isPrincipalReviewer(userId: string, projectId: string) {
+    const profile = await this.profileRepo.findOne({ where: { userId } });
+    if (!profile) return false;
+    return Boolean(
+      await this.dataSource.getRepository(ProjectRoleAssignment).findOne({
+        where: {
+          projectId,
+          freelancerProfileId: profile.id,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress', 'completed']),
+        },
+      }),
+    );
+  }
+
+  private async rebaseTaskSchedule(
+    manager: EntityManager,
+    task: ProjectTask,
+    project: Project,
+    assignedAt: Date,
+  ) {
+    const priorStart = task.startsAt ?? assignedAt;
+    const priorDue =
+      task.dueAt ?? new Date(priorStart.getTime() + 24 * 60 * 60 * 1000);
+    const durationMs = Math.max(
+      60 * 60 * 1000,
+      priorDue.getTime() - priorStart.getTime(),
+    );
+    const nextStart =
+      priorStart.getTime() > assignedAt.getTime() ? priorStart : assignedAt;
+    const shiftMs = Math.max(0, nextStart.getTime() - priorStart.getTime());
+    const nextDue = new Date(nextStart.getTime() + durationMs);
+    task.metadata = {
+      ...(task.metadata ?? {}),
+      plannedStartsAt:
+        task.metadata?.plannedStartsAt ?? priorStart.toISOString(),
+      plannedDueAt: task.metadata?.plannedDueAt ?? priorDue.toISOString(),
+      scheduleRebasedAt: assignedAt.toISOString(),
+      scheduleRebaseCount:
+        Number(task.metadata?.scheduleRebaseCount ?? 0) + (shiftMs > 0 ? 1 : 0),
+    };
+    task.startsAt = nextStart;
+    task.dueAt = nextDue;
+
+    if (shiftMs > 0) {
+      const checkpoints = await manager.getRepository(TaskCheckpoint).find({
+        where: { taskId: task.id, status: In(['pending', 'deferred']) },
+      });
+      for (const checkpoint of checkpoints) {
+        checkpoint.dueAt = new Date(checkpoint.dueAt.getTime() + shiftMs);
+        checkpoint.status = 'pending';
+        checkpoint.assessedAt = null;
+      }
+      if (checkpoints.length) {
+        await manager.getRepository(TaskCheckpoint).save(checkpoints);
+      }
+    }
+    return Boolean(project.deadline && nextDue > project.deadline);
+  }
+
+  private metadataArray(value: unknown): Record<string, unknown>[] {
+    return Array.isArray(value)
+      ? value.filter(
+          (entry): entry is Record<string, unknown> =>
+            Boolean(entry) &&
+            typeof entry === 'object' &&
+            !Array.isArray(entry),
+        )
+      : [];
+  }
+
+  private async inviteNextCandidate(runId: string) {
+    const run = await this.runRepo.findOne({
+      where: { id: runId },
+      relations: ['project', 'targetTask'],
+    });
+    if (!run || !['completed', 'reviewed'].includes(run.status)) return null;
+    const existing = await this.invitationRepo.findOne({
+      where: {
+        projectId: run.projectId,
+        taskId: run.targetTaskId ?? IsNull(),
+        roleKey: run.targetRoleKey!,
+        status: In(['pending', 'accepting']),
+      },
+    });
+    if (existing) return existing;
+
+    const candidates = await this.candidateRepo.find({
+      where: {
+        matchingRunId: run.id,
+        status: In(['recommended', 'shortlisted']),
+      },
+      relations: ['freelancerProfile', 'freelancerProfile.user'],
+      order: { rank: 'ASC' },
+    });
+    const candidateIds = candidates
+      .map((entry) => entry.freelancerProfileId)
+      .filter((id): id is string => Boolean(id));
+    const pendingInvitationsPromise: Promise<ProjectInvitation[]> =
+      candidateIds.length > 0
+        ? this.invitationRepo.find({
+            select: { freelancerProfileId: true },
+            where: {
+              freelancerProfileId: In(candidateIds),
+              status: In(['pending', 'accepting']),
+            },
+          })
+        : Promise.resolve([]);
+    const activeAssignmentsPromise: Promise<ProjectRoleAssignment[]> =
+      candidateIds.length > 0
+        ? this.dataSource.getRepository(ProjectRoleAssignment).find({
+            select: { freelancerProfileId: true },
+            where: {
+              projectId: run.projectId,
+              freelancerProfileId: In(candidateIds),
+              status: In(ASSIGNMENT_ACTIVE_STATUSES),
+            },
+          })
+        : Promise.resolve([]);
+    const activeTasksPromise: Promise<ProjectTask[]> =
+      candidateIds.length > 0
+        ? this.taskRepo.find({
+            select: { assignedFreelancerProfileId: true },
+            where: {
+              projectId: run.projectId,
+              assignedFreelancerProfileId: In(candidateIds),
+              status: In(ACTIVE_TASK_STATUSES),
+            },
+          })
+        : Promise.resolve([]);
+    const reviewerLoadsPromise: Promise<
+      Array<{ profileId: string; projects: string }>
+    > =
+      run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE && candidateIds.length > 0
+        ? this.dataSource
+            .getRepository(ProjectRoleAssignment)
+            .createQueryBuilder('assignment')
+            .select('assignment.freelancerProfileId', 'profileId')
+            .addSelect('COUNT(DISTINCT assignment.projectId)', 'projects')
+            .where('assignment.freelancerProfileId IN (:...candidateIds)', {
+              candidateIds,
+            })
+            .andWhere('assignment.phase = :phase', { phase: 'governance' })
+            .andWhere('assignment.roleKey = :roleKey', {
+              roleKey: PRINCIPAL_REVIEWER_ROLE,
+            })
+            .andWhere('assignment.status IN (:...statuses)', {
+              statuses: ['accepted', 'in_progress'],
+            })
+            .groupBy('assignment.freelancerProfileId')
+            .getRawMany<{ profileId: string; projects: string }>()
+        : Promise.resolve([]);
+    const [
+      pendingInvitations,
+      activeProjectAssignments,
+      activeProjectTasks,
+      reviewerLoads,
+    ] = await Promise.all([
+      pendingInvitationsPromise,
+      activeAssignmentsPromise,
+      activeTasksPromise,
+      reviewerLoadsPromise,
+    ]);
+    const unavailableProfileIds = new Set([
+      ...pendingInvitations.map((entry) => entry.freelancerProfileId),
+      ...activeProjectAssignments.map((entry) => entry.freelancerProfileId),
+      ...activeProjectTasks
+        .map((entry) => entry.assignedFreelancerProfileId)
+        .filter((id): id is string => Boolean(id)),
+    ]);
+    const reviewerLoadByProfile = new Map<string, number>(
+      reviewerLoads.map(
+        (entry) => [entry.profileId, Number(entry.projects)] as const,
+      ),
+    );
+    let candidate: MatchingCandidate | null = null;
+    for (const option of candidates) {
+      if (!option.freelancerProfile?.isAvailable) continue;
+      if (
+        !option.freelancerProfileId ||
+        unavailableProfileIds.has(option.freelancerProfileId)
+      ) {
+        continue;
+      }
+      if (run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE) {
+        const experience = option.freelancerProfile.yearsExperience ?? 0;
+        const performance = Number(
+          option.freelancerProfile.performanceScore ?? 100,
+        );
+        const activeProjects =
+          reviewerLoadByProfile.get(option.freelancerProfileId) ?? 0;
+        if (experience < 5 || performance < 80 || activeProjects >= 3) continue;
+      }
+      candidate = option;
+      break;
+    }
+    if (!candidate?.freelancerProfile) {
+      await this.markStaffingBlocked(
+        run.projectId,
+        `No eligible candidate remains for ${run.targetRoleKey ?? 'this assignment'}.`,
+      );
+      return null;
+    }
+
+    const phase = run.targetTaskId
+      ? 'implementation'
+      : run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE
+        ? 'governance'
+        : 'planning';
+    const invitation = await this.invitationRepo.save(
+      this.invitationRepo.create({
+        projectId: run.projectId,
+        taskId: run.targetTaskId,
+        freelancerProfileId: candidate.freelancerProfileId!,
+        matchingRunId: run.id,
+        candidateId: candidate.id,
+        phase,
+        roleKey: run.targetRoleKey ?? 'implementation',
+        status: 'pending',
+        rankSnapshot: candidate.rank,
+        scoreSnapshot: {
+          score: Number(candidate.score),
+          scoreBreakdown: candidate.scoreBreakdown,
+          rationale: candidate.rationale,
+        },
+        expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
+        respondedAt: null,
+        responseReason: null,
+      }),
+    );
+    candidate.status = 'invited';
+    await this.candidateRepo.save(candidate);
+    if (run.targetTaskId) {
+      await this.taskRepo.update(run.targetTaskId, {
+        assignmentStatus: 'invitation_pending',
+      });
+    }
+    await this.projectRepo.update(run.projectId, {
+      automationStatus:
+        phase === 'governance'
+          ? 'awaiting_principal_reviewer'
+          : phase === 'planning'
+            ? 'awaiting_planning_team'
+            : 'awaiting_implementation_team',
+    });
+    await this.notificationsService.createNotification({
+      userId: candidate.freelancerProfile.userId,
+      projectId: run.projectId,
+      taskId: run.targetTaskId,
+      type: 'project_invitation',
+      title: 'Project invitation',
+      body: `You are invited as ${invitation.roleKey}. Respond within two hours before the invitation moves to the next match.`,
+      actionUrl: '/invitations',
+      metadata: {
+        invitationId: invitation.id,
+        expiresAt: invitation.expiresAt.toISOString(),
+        phase,
+      },
+    });
+    return invitation;
+  }
+
+  private async expireInvitation(invitation: ProjectInvitation) {
+    const expired = await this.dataSource.transaction(async (manager) => {
+      const locked = await manager
+        .getRepository(ProjectInvitation)
+        .createQueryBuilder('invitation')
+        .setLock('pessimistic_write')
+        .where('invitation.id = :id', { id: invitation.id })
+        .getOne();
+      if (
+        !locked ||
+        locked.status !== 'pending' ||
+        locked.expiresAt > new Date()
+      ) {
+        return false;
+      }
+      locked.status = 'expired';
+      locked.respondedAt = new Date();
+      locked.responseReason = 'No response within the two-hour window';
+      await manager.save(ProjectInvitation, locked);
+      if (locked.candidateId) {
+        await manager
+          .getRepository(MatchingCandidate)
+          .update({ id: locked.candidateId }, { status: 'expired' });
+      }
+      if (locked.taskId) {
+        await manager.getRepository(ProjectTask).update(locked.taskId, {
+          assignmentStatus: 'unassigned',
+        });
+      }
+      invitation.status = 'expired';
+      invitation.respondedAt = locked.respondedAt;
+      invitation.responseReason = locked.responseReason;
+      return true;
+    });
+    if (!expired) return;
+    const profile = await this.profileRepo.findOne({
+      where: { id: invitation.freelancerProfileId },
+    });
+    if (profile)
+      await this.notificationsService
+        .createNotification({
+          userId: profile.userId,
+          projectId: invitation.projectId,
+          taskId: invitation.taskId,
+          type: 'invitation_expired',
+          title: 'Invitation expired',
+          body: 'The two-hour response window ended and the project moved to the next match.',
+          actionUrl: '/invitations',
+        })
+        .catch(() => undefined);
+    await this.notifyProjectOwner(
+      invitation.project,
+      'Invitation expired',
+      `The ${invitation.roleKey} invitation expired after two hours. The next eligible freelancer is being invited automatically.`,
+      profile?.userId,
+    );
+    if (invitation.matchingRunId) {
+      await this.inviteNextCandidate(invitation.matchingRunId);
+    }
+  }
+
+  private async getProfileByUserId(userId: string) {
+    const profile = await this.profileRepo.findOne({
+      where: { userId },
+      relations: ['user'],
+    });
+    if (!profile) throw new NotFoundException('Freelancer profile not found');
+    return profile;
+  }
+
+  private async notifyProjectOwner(
+    project: Project,
+    title: string,
+    body: string,
+    actorUserId?: string,
+  ) {
+    await this.notificationsService.createNotification({
+      userId: project.customerId,
+      projectId: project.id,
+      type: 'staffing_update',
+      title,
+      body,
+      actionUrl: `/projects/${project.id}/team`,
+    });
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId: project.id,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+    const reviewerUserId = reviewer?.freelancerProfile?.userId;
+    if (reviewerUserId && reviewerUserId !== actorUserId) {
+      await this.notificationsService.createNotification({
+        userId: reviewerUserId,
+        projectId: project.id,
+        type: 'reviewer_attention',
+        title,
+        body,
+        actionUrl: `/reviewer/projects/${project.id}`,
+      });
+    }
+  }
+
+  private async markStaffingBlocked(projectId: string, reason: string) {
+    try {
+      const project = await this.projectRepo.findOne({
+        where: { id: projectId },
+      });
+      if (!project || project.automationStatus === 'staffing_blocked') return;
+      project.automationStatus = 'staffing_blocked';
+      await this.projectRepo.save(project);
+      await this.notifyProjectOwner(
+        project,
+        'Automatic staffing needs attention',
+        `Automatic matching is retrying this project. Current blocker: ${reason}`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Could not persist staffing blocker for ${projectId}: ${this.errorMessage(error)}`,
+      );
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1065,11 +2239,14 @@ export class MatchingService {
     input: {
       run: MatchingRun;
       candidate: MatchingCandidate;
-      adminUserId: string;
+      adminUserId: string | null;
       notes: string | null;
+      phase?: 'governance' | 'planning';
+      accepted?: boolean;
     },
   ): Promise<ProjectRoleAssignment> {
     const { run, candidate, adminUserId, notes } = input;
+    const phase = input.phase ?? 'planning';
     const roleKey = run.targetRoleKey!;
     const profile = candidate.freelancerProfile;
     if (
@@ -1086,16 +2263,15 @@ export class MatchingService {
       where: { id: run.projectId },
     });
     if (!project) throw new NotFoundException('Project not found');
-    const compensation = this.assertPlanningCompensationCoverage(
-      project,
-      roleKey,
-      profile,
-    );
+    const compensation =
+      phase === 'governance'
+        ? this.principalReviewerCompensation(project, profile)
+        : this.assertPlanningCompensationCoverage(project, roleKey, profile);
 
     const existing = await manager.findOne(ProjectRoleAssignment, {
       where: {
         projectId: run.projectId,
-        phase: 'planning',
+        phase,
         roleKey,
       },
     });
@@ -1110,9 +2286,9 @@ export class MatchingService {
       manager.create(ProjectRoleAssignment, {
         projectId: run.projectId,
         freelancerProfileId: candidate.freelancerProfileId,
-        phase: 'planning',
+        phase,
         roleKey,
-        status: 'assigned',
+        status: input.accepted ? 'accepted' : 'assigned',
         sourceMatchingRunId: run.id,
         sourceCandidateId: candidate.id,
         assignedBy: adminUserId,
@@ -1127,6 +2303,7 @@ export class MatchingService {
         },
         notes,
         assignedAt: new Date(),
+        acceptedAt: input.accepted ? new Date() : null,
       }),
     );
   }
@@ -1134,7 +2311,7 @@ export class MatchingService {
   private async maybeAdvanceToPlanningAssigned(
     manager: EntityManager,
     projectId: string,
-    adminUserId: string,
+    adminUserId: string | null,
   ) {
     const activeRoles = await manager
       .createQueryBuilder(ProjectRoleAssignment, 'a')
@@ -1200,10 +2377,31 @@ export class MatchingService {
     }
   }
 
-  private affordablePlanningRate(project: Project): number | null {
-    const role = planningRoleAllocation(project.budgetAllocation, 'architect');
-    const rate = Number(role?.maxHourlyRate);
+  private affordablePlanningRate(
+    project: Project,
+    roleKey: string,
+  ): number | null {
+    const allocation =
+      roleKey === PRINCIPAL_REVIEWER_ROLE
+        ? principalReviewerRoleAllocation(project.budgetAllocation)
+        : planningRoleAllocation(project.budgetAllocation, roleKey);
+    const rate = Number(allocation?.maxHourlyRate);
     return Number.isFinite(rate) && rate > 0 ? rate : null;
+  }
+
+  private minimumPlanningAvailability(project: Project, roleKey: string) {
+    const allocation =
+      roleKey === PRINCIPAL_REVIEWER_ROLE
+        ? principalReviewerRoleAllocation(project.budgetAllocation)
+        : planningRoleAllocation(project.budgetAllocation, roleKey);
+    if (!allocation?.estimatedHours) return 1;
+    const remainingWeeks = project.deadline
+      ? Math.max(
+          1,
+          (project.deadline.getTime() - Date.now()) / (7 * 24 * 60 * 60 * 1000),
+        )
+      : 4;
+    return Math.max(1, Math.ceil(allocation.estimatedHours / remainingWeeks));
   }
 
   private assertProjectFullyFunded(project: Project) {
@@ -1245,21 +2443,52 @@ export class MatchingService {
     const amount = Number(allocation.amount);
     const expectedCost = hourlyRate * allocation.estimatedHours;
     if (expectedCost > amount + 0.005) {
-      const role = roleKey as 'architect' | 'ui_ux';
-      const requiredTotal = requiredProjectTotalForRate(
-        hourlyRate,
-        role,
-        allocation.estimatedHours,
-      );
       const currentTotal = Number(project.quotedAmount) || 0;
+      const requiredTotal =
+        amount > 0
+          ? Math.ceil(((expectedCost * currentTotal) / amount) * 100) / 100
+          : expectedCost;
       throw new ConflictException(
-        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the role allocation of ${allocation.amount}. Increase the project total to at least ${requiredTotal} (an increase of ${(Number(requiredTotal) - currentTotal).toFixed(2)}) or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
+        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the role allocation of ${allocation.amount}. Increase the project total to at least ${requiredTotal.toFixed(2)} (an increase of ${(requiredTotal - currentTotal).toFixed(2)}) or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
       );
     }
     return {
       amount: allocation.amount,
       currency: project.quotedCurrency ?? project.currency,
       estimatedHours: allocation.estimatedHours,
+    };
+  }
+
+  private principalReviewerCompensation(
+    project: Project,
+    profile: FreelancerProfile,
+  ) {
+    const allocation = principalReviewerRoleAllocation(
+      project.budgetAllocation,
+    );
+    const total = Number(project.quotedAmount);
+    const estimatedHours = allocation?.estimatedHours ?? 12;
+    const amount = Number(allocation?.amount ?? total * 0.1);
+    const rate = Number(profile.hourlyRate);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new ConflictException(
+        'No principal-reviewer compensation is allocated for this project',
+      );
+    }
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new ConflictException(
+        'The principal reviewer must have a platform-assessed hourly rate',
+      );
+    }
+    if (rate * estimatedHours > amount + 0.005) {
+      throw new ConflictException(
+        `The principal reviewer exceeds the allocated governance budget of ${amount.toFixed(2)} ${project.quotedCurrency ?? project.currency}`,
+      );
+    }
+    return {
+      amount: amount.toFixed(2),
+      currency: project.quotedCurrency ?? project.currency,
+      estimatedHours,
     };
   }
 
@@ -1330,6 +2559,7 @@ export class MatchingService {
     dto: StartPlanningMatchingDto,
     brief: Brief | null,
     project: Project,
+    roleKey: string,
   ) {
     const filters = dto.filters;
     const qb = this.buildProfileQuery(filters);
@@ -1338,32 +2568,58 @@ export class MatchingService {
     // explicit admin maxHourlyRate wins; otherwise derive one from the budget.
     const maxRate = this.effectiveRateCap(
       filters?.maxHourlyRate ?? null,
-      this.affordablePlanningRate(project),
+      this.affordablePlanningRate(project, roleKey),
     );
     const cappedQb = qb.clone();
+    const minimumAvailability = Math.max(
+      filters?.minAvailabilityHours ?? 0,
+      this.minimumPlanningAvailability(project, roleKey),
+    );
+    cappedQb.andWhere(
+      'COALESCE(p.availabilityHoursPerWeek, 0) >= :roleMinAvailability',
+      { roleMinAvailability: minimumAvailability },
+    );
     if (maxRate != null) {
       cappedQb.andWhere('p.hourlyRate IS NOT NULL');
       cappedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
     }
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
-    const profiles = await cappedQb.take(poolCap).getMany();
+    const fetchedProfiles = await cappedQb.take(poolCap).getMany();
+    const requiredRoleSkills = PLANNING_ROLE_SKILLS[roleKey] ?? [];
+    const profiles = requiredRoleSkills.length
+      ? fetchedProfiles.filter((profile) => {
+          const skills = (profile.skills ?? []).map((skill) =>
+            skill.toLowerCase(),
+          );
+          return requiredRoleSkills.some((required) => {
+            const normalized = required.toLowerCase();
+            return skills.some(
+              (skill) =>
+                skill.includes(normalized) || normalized.includes(skill),
+            );
+          });
+        })
+      : fetchedProfiles;
 
-    if (!profiles.length && maxRate != null) {
+    if (!profiles.length) {
       throw new ConflictException(
-        `No planning freelancer fits the allocated maximum rate of ${maxRate.toFixed(2)} ${project.quotedCurrency ?? project.currency}/hour. Increase the project budget or add an affordable approved freelancer before matching.`,
+        `No ${roleKey} freelancer fits the required role skills${maxRate != null ? `, allocated maximum rate of ${maxRate.toFixed(2)} ${project.quotedCurrency ?? project.currency}/hour,` : ','} and ${minimumAvailability} availability hours/week. Increase the budget or add an eligible approved freelancer before matching.`,
       );
     }
 
     // Dense retrieval signal: cosine of the brief embedding vs. each freelancer
     // profile embedding (pgvector). Best-effort — if it fails, matching still
     // works on lexical + structured signals.
-    const similarity = await this.computeTextSimilarity(
-      this.briefText(brief),
-      profiles.map((profile) => profile.id),
-    );
+    const profileIds = profiles.map((profile) => profile.id);
+    const [similarity, workload] = await Promise.all([
+      this.computeTextSimilarity(this.briefText(brief), profileIds),
+      this.getActiveWorkload(profileIds),
+    ]);
 
-    return { candidates: this.toCandidateInputs(profiles, similarity) };
+    return {
+      candidates: this.toCandidateInputs(profiles, similarity, workload),
+    };
   }
 
   // Same idea as the planning pool, but narrowed to one implementation task:
@@ -1392,24 +2648,10 @@ export class MatchingService {
     }
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
-    let profiles = await narrowedQb.take(poolCap).getMany();
-
-    // Relax skill matching when necessary, but never discard the compensation
-    // ceiling: an unaffordable recommendation cannot become an assignment.
-    if (profiles.length < MIN_AFFORDABLE_POOL) {
-      this.logger.warn(
-        `Task ${task.id} prefilter matched only ${profiles.length} freelancers; relaxing.`,
-      );
-      const affordableQb = qb.clone();
-      if (maxRate != null) {
-        affordableQb.andWhere('p.hourlyRate IS NOT NULL');
-        affordableQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
-      }
-      profiles = await affordableQb.take(poolCap).getMany();
-    }
-    if (!profiles.length && maxRate != null) {
+    const profiles = await narrowedQb.take(poolCap).getMany();
+    if (!profiles.length) {
       throw new ConflictException(
-        `No approved freelancer fits task "${task.title}" at the allocated maximum rate of ${maxRate.toFixed(2)} ${task.currency ?? 'project currency'}/hour. Increase the project budget or add an affordable freelancer.`,
+        'No eligible approved freelancer fits this task required skills, allocated rate, and availability. Increase the budget or add a role-fit freelancer.',
       );
     }
 
@@ -1441,6 +2683,9 @@ export class MatchingService {
           )
         : null;
       const active = workload?.get(profile.id);
+      const reviewedSubmissions =
+        profile.approvedSubmissions + profile.rejectedSubmissions;
+      const timedDeliveries = profile.onTimeDeliveries + profile.lateDeliveries;
 
       return {
         freelancerProfileId: profile.id,
@@ -1455,6 +2700,16 @@ export class MatchingService {
         yearsExperience: profile.yearsExperience ?? null,
         averageSkillScore,
         embeddingSimilarity: similarity.get(profile.id) ?? null,
+        performanceScore: Number(profile.performanceScore ?? 100),
+        approvalRate: reviewedSubmissions
+          ? profile.approvedSubmissions / reviewedSubmissions
+          : null,
+        onTimeRate: timedDeliveries
+          ? profile.onTimeDeliveries / timedDeliveries
+          : null,
+        missedDeadlines: profile.missedDeadlines ?? 0,
+        projectRemovals: profile.projectRemovals ?? 0,
+        riskFlags: profile.riskFlags ?? [],
         ...(workload
           ? {
               activeTaskCount: active?.tasks ?? 0,

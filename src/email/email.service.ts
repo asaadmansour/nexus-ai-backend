@@ -64,4 +64,35 @@ export class EmailService {
       );
     }
   }
+
+  async sendTransactionalEmail(
+    email: string,
+    subject: string,
+    input: { body: string; actionUrl?: string | null; actionLabel?: string },
+  ) {
+    const maskedEmail = this.maskEmail(email);
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
+      if (process.env.NODE_ENV !== 'production') {
+        this.logger.log(`[DEV MODE] ${subject} -> ${maskedEmail}`);
+        return;
+      }
+      throw new InternalServerErrorException(
+        'Email service configuration missing',
+      );
+    }
+
+    const escapedBody = input.body
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>');
+    const action = input.actionUrl
+      ? `<p><a href="${input.actionUrl}" style="display:inline-block;padding:10px 16px;background:#324933;color:#fff;text-decoration:none;border-radius:6px">${input.actionLabel ?? 'Open Nexus AI'}</a></p>`
+      : '';
+    await this.mailerService.sendMail({
+      to: email,
+      subject,
+      html: `<div style="font-family:Arial,sans-serif;padding:20px;color:#222"><h2>${subject}</h2><p>${escapedBody}</p>${action}</div>`,
+    });
+  }
 }

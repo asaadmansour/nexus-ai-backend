@@ -6,7 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
@@ -15,11 +15,13 @@ import { ProjectPlanningSubmission } from 'src/projects/entities/project-plannin
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { FreelancerPerformanceEvent } from 'src/freelancers/entities/freelancer-performance-event.entity';
 import { CreatePlanningSubmissionDto } from './dtos/create-planning-submission.dto';
 import { ReviewPlanningSubmissionDto } from './dtos/review-planning-submission.dto';
 import { ProjectPlansService } from './project-plans.service';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
 import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requests.service';
+import { MatchingService } from 'src/matching/matching.service';
 
 interface Requester {
   userId: string;
@@ -88,6 +90,7 @@ export class PlanningSubmissionsService {
     private readonly projectPlansService: ProjectPlansService,
     private readonly planningEvaluationsService: PlanningEvaluationsService,
     private readonly paymentReleaseRequestsService: PaymentReleaseRequestsService,
+    private readonly matchingService: MatchingService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -223,6 +226,28 @@ export class PlanningSubmissionsService {
             requester.userId,
           )
         : null;
+
+    if (status === 'submitted') {
+      const reviewer = await this.assignmentRepo.findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+      if (reviewer?.freelancerProfile?.userId) {
+        await this.notificationsService.createNotification({
+          userId: reviewer.freelancerProfile.userId,
+          projectId,
+          type: 'reviewer_attention',
+          title: `${dto.submissionType.replace('_', '/')} submitted`,
+          body: `${dto.title ?? 'A planning deliverable'} is being evaluated and will be ready for your decision.`,
+          actionUrl: `/reviewer/projects/${projectId}`,
+        });
+      }
+    }
 
     return {
       ...this.toDetail(submission, assignment.freelancerProfile),
@@ -387,6 +412,42 @@ export class PlanningSubmissionsService {
       submission.aiOverriddenAt = isAiOverride ? new Date() : null;
       await manager.save(ProjectPlanningSubmission, submission);
 
+      if (submission.freelancerProfileId) {
+        const profile = await manager.findOne(FreelancerProfile, {
+          where: { id: submission.freelancerProfileId },
+        });
+        if (profile) {
+          const scoreDelta =
+            dto.status === 'approved' ? 2 : dto.status === 'rejected' ? -8 : -2;
+          if (dto.status === 'approved') profile.approvedSubmissions += 1;
+          else if (dto.status === 'rejected') profile.rejectedSubmissions += 1;
+          profile.performanceScore = Math.max(
+            0,
+            Math.min(100, Number(profile.performanceScore) + scoreDelta),
+          ).toFixed(2);
+          await manager.save(FreelancerProfile, profile);
+          await manager.save(
+            FreelancerPerformanceEvent,
+            manager.create(FreelancerPerformanceEvent, {
+              freelancerProfileId: profile.id,
+              projectId: submission.projectId,
+              taskId: null,
+              eventType: `planning_submission_${dto.status}`,
+              scoreDelta: scoreDelta.toFixed(2),
+              moneyDelta: '0.00',
+              currency: null,
+              reason:
+                dto.adminNotes?.trim() ||
+                `${submission.submissionType} submission ${dto.status.replace('_', ' ')}`,
+              metadata: {
+                submissionId: submission.id,
+                submissionType: submission.submissionType,
+              },
+            }),
+          );
+        }
+      }
+
       let planUnlocked = false;
       let paymentReleaseRequestId: string | null = null;
       if (dto.status === 'approved') {
@@ -397,6 +458,12 @@ export class PlanningSubmissionsService {
             manager,
           );
         paymentReleaseRequestId = paymentReleaseRequest.id;
+        await manager
+          .getRepository(ProjectRoleAssignment)
+          .update(submission.assignmentId!, {
+            status: 'completed',
+            completedAt: new Date(),
+          });
         planUnlocked = await this.maybeUnlockPlanGeneration(
           manager,
           submission.projectId,
@@ -420,10 +487,29 @@ export class PlanningSubmissionsService {
         body: `Your ${result.submission.submissionType} submission was ${dto.status.replace('_', ' ')}.`,
       });
     }
+    let paymentRelease: unknown = null;
+    let paymentReleaseError: string | null = null;
     if (result.paymentReleaseRequestId) {
-      await this.paymentReleaseRequestsService.notifyPlanningReleaseRequested(
-        result.paymentReleaseRequestId,
-      );
+      try {
+        paymentRelease = await this.paymentReleaseRequestsService.review(
+          result.paymentReleaseRequestId,
+          {
+            decision: 'approved',
+            releaseNow: true,
+            reviewNotes:
+              'Automatically released after principal/admin acceptance of the planning deliverable.',
+          },
+          { sub: adminUserId, role: UserRole.ADMIN },
+        );
+      } catch (error) {
+        paymentReleaseError =
+          error instanceof Error
+            ? error.message
+            : 'Automatic payment release failed';
+        await this.paymentReleaseRequestsService.notifyPlanningReleaseRequested(
+          result.paymentReleaseRequestId,
+        );
+      }
     }
 
     const planGenerationJob = result.planUnlocked
@@ -441,6 +527,26 @@ export class PlanningSubmissionsService {
           )
         : null;
 
+    let rematching: unknown = null;
+    let rematchingError: string | null = null;
+    if (dto.status === 'rejected') {
+      try {
+        rematching = await this.matchingService.removePlanningAssignee(
+          result.submission.projectId,
+          result.submission.submissionType === 'architecture'
+            ? 'architect'
+            : 'ui_ux',
+          dto.adminNotes?.trim() || 'Planning deliverable rejected',
+          adminUserId,
+        );
+      } catch (error) {
+        rematchingError =
+          error instanceof Error
+            ? error.message
+            : 'Automatic rematching failed';
+      }
+    }
+
     return {
       id: result.submission.id,
       status: result.submission.status,
@@ -454,6 +560,10 @@ export class PlanningSubmissionsService {
       planGenerationJob,
       uiuxEvaluationJob,
       paymentReleaseRequestId: result.paymentReleaseRequestId,
+      paymentRelease,
+      paymentReleaseError,
+      rematching,
+      rematchingError,
     };
   }
 

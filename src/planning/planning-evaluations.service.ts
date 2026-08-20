@@ -21,6 +21,7 @@ import { Brief } from 'src/projects/entities/brief.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { User } from 'src/users/entities/user.entity';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import { AI_JOB_RETRY } from 'src/queues/queue.constants';
 import type { PlanningSubmissionEvaluationJobData } from 'src/queues/queue.types';
@@ -416,6 +417,10 @@ export class PlanningEvaluationsService {
         submission.evaluationError = this.errorMessage(error);
         await this.submissionRepo.save(submission);
         await this.markJobFailed(data.agentJobId, error, attempt);
+        await this.notifyReviewerFailure(
+          submission,
+          this.errorMessage(error),
+        ).catch(() => undefined);
       } else {
         submission.evaluationStatus = 'queued';
         submission.evaluationError = this.errorMessage(error);
@@ -544,13 +549,67 @@ export class PlanningEvaluationsService {
       projectId: submission.projectId,
       title:
         result.recommendation === 'approve'
-          ? 'Planning deliverable ready for admin review'
+          ? 'Planning deliverable ready for principal review'
           : 'AI planning review completed',
       body:
         result.recommendation === 'approve'
-          ? `AI evaluation passed with score ${result.score}. An admin will make the final decision.`
-          : `AI identified possible revisions. An admin will make the final decision. ${result.revisionItems.slice(0, 2).join(' ') || result.summary}`,
+          ? `AI evaluation passed with score ${result.score}. The principal reviewer will make the final decision.`
+          : `AI identified possible revisions. The principal reviewer will make the final decision. ${result.revisionItems.slice(0, 2).join(' ') || result.summary}`,
     });
+    const reviewer = await this.assignmentRepo.findOne({
+      where: {
+        projectId: submission.projectId,
+        phase: 'governance',
+        roleKey: 'principal_reviewer',
+        status: In(['accepted', 'in_progress']),
+      },
+      relations: ['freelancerProfile'],
+    });
+    if (reviewer?.freelancerProfile?.userId) {
+      await this.notificationsService.createNotification({
+        userId: reviewer.freelancerProfile.userId,
+        projectId: submission.projectId,
+        type: 'reviewer_attention',
+        title: `${submission.submissionType.replace('_', '/')} evaluation ready`,
+        body: `AI recommends ${result.recommendation.replace('_', ' ')} with score ${result.score}. Your decision is required.`,
+        actionUrl: `/reviewer/projects/${submission.projectId}`,
+      });
+    }
+  }
+
+  private async notifyReviewerFailure(
+    submission: ProjectPlanningSubmission,
+    error: string,
+  ) {
+    const reviewer = await this.assignmentRepo.findOne({
+      where: {
+        projectId: submission.projectId,
+        phase: 'governance',
+        roleKey: 'principal_reviewer',
+        status: In(['accepted', 'in_progress']),
+      },
+      relations: ['freelancerProfile'],
+    });
+    const admins = await this.assignmentRepo.manager.getRepository(User).find({
+      where: { role: UserRole.ADMIN },
+      select: { id: true },
+    });
+    const recipientIds = new Set(admins.map((admin) => admin.id));
+    if (reviewer?.freelancerProfile?.userId) {
+      recipientIds.add(reviewer.freelancerProfile.userId);
+    }
+    await Promise.all(
+      [...recipientIds].map((userId) =>
+        this.notificationsService.createNotification({
+          userId,
+          projectId: submission.projectId,
+          type: 'technical_attention',
+          title: 'Planning evaluation needs technical attention',
+          body: `Automated evaluation exhausted its retries and remains blocked. Nexus operations can retry it. ${error.slice(0, 300)}`,
+          actionUrl: '/messages',
+        }),
+      ),
+    );
   }
 
   private async latestApprovedArchitecture(projectId: string) {

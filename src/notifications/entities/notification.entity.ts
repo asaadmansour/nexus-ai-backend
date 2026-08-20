@@ -37,6 +37,15 @@ export class Notification {
   @Column({ type: 'text', nullable: true })
   body!: string | null;
 
+  @Column({ type: 'varchar', length: 60, default: 'general' })
+  type!: string;
+
+  @Column({ name: 'action_url', type: 'text', nullable: true })
+  actionUrl!: string | null;
+
+  @Column({ type: 'jsonb', nullable: true })
+  metadata!: Record<string, unknown> | null;
+
   @Column({ name: 'is_read', type: 'boolean', default: false })
   isRead!: boolean;
 

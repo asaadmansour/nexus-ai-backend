@@ -141,4 +141,10 @@ export class PaymentsController {
   getAdminPayments() {
     return this.paymentsService.getAdminPayments();
   }
+
+  @Get('admin/revenue')
+  @Roles(UserRole.ADMIN)
+  getAdminRevenue() {
+    return this.paymentsService.getAdminRevenue();
+  }
 }

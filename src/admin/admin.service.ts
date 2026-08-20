@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -13,6 +14,7 @@ import { FreelancerAssessmentQuestion } from 'src/freelancers/entities/freelance
 import { FreelancerAssessmentAnswer } from 'src/freelancers/entities/freelancer-assessment-answer.entity';
 import { FreelancerAssessmentEvent } from 'src/freelancers/entities/freelancer-assessment-event.entity';
 import { FreelancerSkillScore } from 'src/freelancers/entities/freelancer-skill-score.entity';
+import { calculateAssessedHourlyRate } from 'src/freelancers/freelancer-rate';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -228,9 +230,31 @@ export class AdminService {
 
     if (dto.firstName !== undefined) user.firstName = dto.firstName.trim();
     if (dto.lastName !== undefined) user.lastName = dto.lastName.trim();
-    if (dto.email !== undefined) user.email = dto.email.trim().toLowerCase();
+    if (dto.email !== undefined) {
+      const email = dto.email.trim().toLowerCase();
+      const existing = await this.userRepository.findOne({ where: { email } });
+      if (existing && existing.id !== user.id) {
+        throw new ConflictException('This email address is already registered');
+      }
+      user.email = email;
+    }
     if (dto.phoneNumber !== undefined) {
-      user.phoneNumber = dto.phoneNumber?.trim() || null;
+      const phoneNumber = dto.phoneNumber?.trim() || null;
+      if (phoneNumber !== user.phoneNumber) {
+        if (phoneNumber) {
+          const existing = await this.userRepository.findOne({
+            where: { phoneNumber },
+          });
+          if (existing && existing.id !== user.id) {
+            throw new ConflictException(
+              'This phone number is already registered',
+            );
+          }
+        }
+        user.phoneNumber = phoneNumber;
+        user.isPhoneVerified = false;
+        user.phoneVerifiedAt = null;
+      }
     }
     if (dto.role !== undefined) user.role = dto.role;
     if (dto.isEmailVerified !== undefined) {
@@ -250,31 +274,60 @@ export class AdminService {
 
   // ===== Projects =====
 
-  async getProjects(pageNum: number, limitNum: number) {
-    const [projects, total] = await this.projectRepository.findAndCount({
-      order: { createdAt: 'DESC', id: 'DESC' },
-      skip: (pageNum - 1) * limitNum,
-      take: limitNum,
-      relations: ['customer'],
-      select: {
-        id: true,
-        title: true,
-        description: true,
-        budgetMin: true,
-        budgetMax: true,
-        currency: true,
-        deadline: true,
-        status: true,
-        createdAt: true,
-        customer: {
-          id: true,
-          firstName: true,
-          lastName: true,
-          email: true,
-          role: true,
-        },
-      },
-    });
+  async getProjects(
+    pageNum: number,
+    limitNum: number,
+    filters: {
+      status?: string;
+      automationStatus?: string;
+      search?: string;
+      customerId?: string;
+      dateFrom?: string;
+      dateTo?: string;
+    } = {},
+  ) {
+    const query = this.projectRepository
+      .createQueryBuilder('project')
+      .leftJoinAndSelect('project.customer', 'customer')
+      .orderBy('project.createdAt', 'DESC')
+      .addOrderBy('project.id', 'DESC')
+      .skip((pageNum - 1) * limitNum)
+      .take(limitNum);
+    if (filters.status) {
+      query.andWhere('project.status = :status', { status: filters.status });
+    }
+    if (filters.automationStatus) {
+      query.andWhere('project.automationStatus = :automationStatus', {
+        automationStatus: filters.automationStatus,
+      });
+    }
+    if (filters.customerId) {
+      query.andWhere('project.customerId = :customerId', {
+        customerId: filters.customerId,
+      });
+    }
+    if (filters.search?.trim()) {
+      query.andWhere(
+        `(project.title ILIKE :search OR project.description ILIKE :search OR customer.email ILIKE :search OR CONCAT(customer.firstName, ' ', customer.lastName) ILIKE :search)`,
+        { search: `%${filters.search.trim()}%` },
+      );
+    }
+    if (filters.dateFrom) {
+      const date = new Date(filters.dateFrom);
+      if (Number.isNaN(date.getTime())) {
+        throw new BadRequestException('dateFrom must be a valid date');
+      }
+      query.andWhere('project.createdAt >= :dateFrom', { dateFrom: date });
+    }
+    if (filters.dateTo) {
+      const date = new Date(filters.dateTo);
+      if (Number.isNaN(date.getTime())) {
+        throw new BadRequestException('dateTo must be a valid date');
+      }
+      date.setUTCHours(23, 59, 59, 999);
+      query.andWhere('project.createdAt <= :dateTo', { dateTo: date });
+    }
+    const [projects, total] = await query.getManyAndCount();
     return { projects, total };
   }
 
@@ -673,6 +726,12 @@ export class AdminService {
       profile.approvedAt = new Date();
       profile.rejectedAt = null;
       profile.rejectionReason = null;
+      const assessedRate = await this.assessHourlyRate(profile);
+      profile.recommendedHourlyRate = assessedRate.toFixed(2);
+      // The platform-owned rate is the matching and compensation source of
+      // truth. Freelancers may display it but cannot self-inflate it.
+      profile.hourlyRate = assessedRate.toFixed(2);
+      profile.hourlyRateAssessedAt = new Date();
     } else if (payload.status === 'rejected') {
       profile.rejectedAt = new Date();
       profile.rejectionReason = payload.reason || 'No reason provided';
@@ -691,7 +750,7 @@ export class AdminService {
             : 'Verification status updated',
       body:
         payload.status === 'approved'
-          ? 'Your freelancer verification was approved. You can now receive matched work.'
+          ? `Your freelancer verification was approved. Your assessed rate is ${profile.hourlyRate} ${process.env.FREELANCER_RATE_BASE_CURRENCY ?? 'EGP'}/hour and you can now receive matched work.`
           : payload.status === 'rejected'
             ? `Your freelancer verification was not approved. ${profile.rejectionReason ?? ''}`.trim()
             : `Your verification status changed to ${payload.status}.`,
@@ -710,6 +769,14 @@ export class AdminService {
     await this.freelancerProfileRepository.save(profile);
 
     return profile;
+  }
+
+  private async assessHourlyRate(profile: FreelancerProfile) {
+    const skillScores = await this.skillScoreRepository.find({
+      where: { freelancerProfileId: profile.id },
+      select: { score: true },
+    });
+    return calculateAssessedHourlyRate(profile, skillScores);
   }
 
   async updateFreelancerSkillScore(

@@ -46,7 +46,7 @@ describe('EvaluationsService implementation rubric payload', () => {
       contractReferences: ['API contract: POST /orders'],
       ownedPaths: ['src/orders/**'],
     },
-  } as ProjectTask;
+  } as unknown as ProjectTask;
 
   it('includes task requirements, contracts, scope, and quality policy for a PR', () => {
     const payload = buildTaskPayload(task, submission, 'pull_request');
@@ -82,7 +82,7 @@ describe('EvaluationsService implementation rubric payload', () => {
         description: 'Show the approved string on one static page.',
         acceptanceCriteria: ['The page displays Hello World'],
         metadata: { deliverables: ['One working page'] },
-      } as ProjectTask,
+      } as unknown as ProjectTask,
       submission,
       'pull_request',
     );
@@ -188,7 +188,7 @@ describe('EvaluationsService evaluation dispatch recovery', () => {
       startedAt: null,
       completedAt: null,
       error: null,
-    } as EvaluationRun;
+    } as unknown as EvaluationRun;
     const submission = {
       id: 'submission-id',
       projectId: 'project-id',
@@ -256,7 +256,7 @@ describe('EvaluationsService evaluation dispatch recovery', () => {
       submissionId: 'submission-id',
       status: 'running',
       agentJobId: 'job-id',
-    } as EvaluationRun;
+    } as unknown as EvaluationRun;
     const service = Object.create(
       EvaluationsService.prototype,
     ) as EvaluationsService;
@@ -329,7 +329,7 @@ describe('EvaluationsService rubric snapshot consistency', () => {
       id: 'old-run',
       status: 'completed',
       acceptanceCoverage: { rubricSnapshot },
-    } as EvaluationRun;
+    } as unknown as EvaluationRun;
     const createdRun = {
       id: 'new-run',
       status: 'queued',
@@ -502,7 +502,7 @@ describe('EvaluationsService revision verdict', () => {
         generatedBy: 'submission_evaluation_agent',
         evaluatedCommitSha: commitSha,
       },
-    } as ProjectRevisionRequest;
+    } as unknown as ProjectRevisionRequest;
     const submissionRepo = {
       createQueryBuilder: jest.fn().mockReturnValue({
         setLock: jest.fn().mockReturnThis(),

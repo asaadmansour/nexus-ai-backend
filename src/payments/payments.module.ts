@@ -24,6 +24,7 @@ import {
   PaymentReleaseRequestDetailController,
   ProjectPaymentReleaseRequestsController,
 } from './payment-release-requests.controller';
+import { PayoutAutomationService } from './payout-automation.service';
 
 @Module({
   imports: [
@@ -45,7 +46,12 @@ import {
     ]),
   ],
   exports: [TypeOrmModule, PaymentReleaseRequestsService],
-  providers: [PaymentsService, StripeService, PaymentReleaseRequestsService],
+  providers: [
+    PaymentsService,
+    StripeService,
+    PaymentReleaseRequestsService,
+    PayoutAutomationService,
+  ],
   controllers: [
     PaymentsController,
     StripeWebhookController,

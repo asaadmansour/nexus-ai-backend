@@ -13,6 +13,10 @@ import {
 } from './matching.controller';
 import { AdminMatchingController } from './admin-matching.controller';
 import { MatchingService } from './matching.service';
+import { ProjectInvitation } from './entities/project-invitation.entity';
+import { InvitationsController } from './invitations.controller';
+import { MatchingAutomationService } from './matching-automation.service';
+import { RepositoriesModule } from 'src/repositories/repositories.module';
 
 @Module({
   imports: [
@@ -20,15 +24,21 @@ import { MatchingService } from './matching.service';
     ProjectsModule,
     FreelancersModule,
     NotificationsModule,
-    TypeOrmModule.forFeature([MatchingRun, MatchingCandidate]),
+    RepositoriesModule,
+    TypeOrmModule.forFeature([
+      MatchingRun,
+      MatchingCandidate,
+      ProjectInvitation,
+    ]),
   ],
   controllers: [
     ProjectMatchingController,
     MatchingController,
     ProjectTaskAssignmentController,
     AdminMatchingController,
+    InvitationsController,
   ],
-  providers: [MatchingService],
+  providers: [MatchingService, MatchingAutomationService],
   exports: [TypeOrmModule, MatchingService],
 })
 export class MatchingModule {}

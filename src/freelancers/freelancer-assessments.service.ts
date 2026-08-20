@@ -11,6 +11,7 @@ import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { Notification } from 'src/notifications/entities/notification.entity';
+import { NotificationsService } from 'src/notifications/notifications.service';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import { ReviewAssessmentDto } from 'src/admin/dtos/review-assessment.dto';
 import { FreelancerAssessment } from './entities/freelancer-assessment.entity';
@@ -20,6 +21,7 @@ import { FreelancerAssessmentQuestion } from './entities/freelancer-assessment-q
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
 import { FreelancerVerificationEvent } from './entities/freelancer-verification-event.entity';
+import { calculateAssessedHourlyRate } from './freelancer-rate';
 import { SaveAssessmentAnswersDto } from './dtos/save-assessment-answers.dto';
 import { SubmitAssessmentDto } from './dtos/submit-assessment.dto';
 import { TrackAssessmentEventDto } from './dtos/track-assessment-event.dto';
@@ -102,6 +104,7 @@ export class FreelancerAssessmentsService {
     private readonly skillScoreRepo: Repository<FreelancerSkillScore>,
     private readonly aiService: AiService,
     private readonly aiJobsProducer: AiJobsProducer,
+    private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -715,15 +718,6 @@ export class FreelancerAssessmentsService {
           });
         }
 
-        await manager.save(
-          Notification,
-          manager.create(Notification, {
-            userId,
-            title: 'Assessment submitted',
-            body: 'Your assessment was submitted and is waiting for manual review.',
-          }),
-        );
-
         return { assessment: locked, shouldEmbedProfile: false };
       }
 
@@ -758,7 +752,40 @@ export class FreelancerAssessmentsService {
         questionResults: grade.questionResults ?? [],
         reason: dto.reason ?? 'manual_submit',
       };
-      await manager.save(FreelancerAssessment, locked);
+      const warningCount = await manager.count(FreelancerAssessmentEvent, {
+        where: {
+          assessmentId: locked.id,
+          eventType: In(WARNING_EVENT_TYPES),
+        },
+      });
+      const numericScore = Number(score);
+      const confidence = Number(grade.graderConfidence ?? 0);
+      const recommendation = grade.recommendation ?? 'needs_review';
+      const autoDecision =
+        warningCount === 0 &&
+        confidence >= 0.65 &&
+        recommendation === 'pass' &&
+        numericScore >= 80
+          ? 'approved'
+          : warningCount === 0 &&
+              confidence >= 0.75 &&
+              recommendation === 'fail' &&
+              numericScore < 50
+            ? 'rejected'
+            : 'needs_review';
+      locked.status =
+        autoDecision === 'approved'
+          ? 'passed'
+          : autoDecision === 'rejected'
+            ? 'failed'
+            : 'needs_review';
+      locked.aiFeedback = {
+        ...locked.aiFeedback,
+        manualReviewRequired: autoDecision === 'needs_review',
+        automationDecision: autoDecision,
+        graderConfidence: confidence,
+        integrityWarningCount: warningCount,
+      };
 
       const profile = await manager.findOne(FreelancerProfile, {
         where: { id: locked.freelancerProfileId },
@@ -781,9 +808,29 @@ export class FreelancerAssessmentsService {
           shouldEmbedProfile = score != null;
         }
 
-        profile.verificationStatus = 'assessment_submitted';
         profile.assessmentScore = score;
         profile.assessmentSubmittedAt = submittedAt;
+        if (autoDecision === 'approved') {
+          profile.verificationStatus = 'approved';
+          profile.approvedAt = submittedAt;
+          profile.rejectedAt = null;
+          profile.rejectionReason = null;
+          const assessedRate = calculateAssessedHourlyRate(
+            profile,
+            skillScores,
+          );
+          profile.recommendedHourlyRate = assessedRate.toFixed(2);
+          profile.hourlyRate = assessedRate.toFixed(2);
+          profile.hourlyRateAssessedAt = submittedAt;
+        } else if (autoDecision === 'rejected') {
+          profile.verificationStatus = 'rejected';
+          profile.approvedAt = null;
+          profile.rejectedAt = submittedAt;
+          profile.rejectionReason =
+            grade.feedback ?? 'Assessment did not meet the required score.';
+        } else {
+          profile.verificationStatus = 'assessment_submitted';
+        }
         await this.syncProfileAssessmentAttemptState(
           manager,
           profile,
@@ -811,31 +858,53 @@ export class FreelancerAssessmentsService {
         await manager.save(FreelancerProfile, profile);
         await this.recordVerificationEvent(manager, {
           profile,
-          eventType: 'assessment_submitted',
+          eventType:
+            autoDecision === 'approved'
+              ? 'assessment_auto_approved'
+              : autoDecision === 'rejected'
+                ? 'assessment_auto_rejected'
+                : 'assessment_submitted',
           fromStatus: previousStatus,
           toStatus: profile.verificationStatus,
-          actorType: 'freelancer',
-          actorUserId: userId,
+          actorType: autoDecision === 'needs_review' ? 'freelancer' : 'system',
+          actorUserId: autoDecision === 'needs_review' ? userId : null,
           metadata: {
             assessmentId: locked.id,
             score,
             recommendation: grade.recommendation ?? null,
+            graderConfidence: confidence,
+            integrityWarningCount: warningCount,
+            automationDecision: autoDecision,
           },
         });
       }
 
-      await manager.save(
-        Notification,
-        manager.create(Notification, {
-          userId,
-          title: 'Assessment submitted',
-          body: 'Your assessment was submitted and is waiting for admin review.',
-        }),
-      );
+      await manager.save(FreelancerAssessment, locked);
 
       return { assessment: locked, shouldEmbedProfile };
     });
     const claimed = submission.assessment;
+
+    if (claimed) {
+      const decision = claimed.aiFeedback?.automationDecision;
+      await this.notificationsService.createNotification({
+        userId,
+        type: 'freelancer_verification',
+        title:
+          decision === 'approved'
+            ? 'Freelancer profile approved'
+            : decision === 'rejected'
+              ? 'Assessment not approved'
+              : 'Assessment needs review',
+        body:
+          decision === 'approved'
+            ? 'Your assessment passed and your platform hourly rate was calculated automatically. You can now receive project invitations.'
+            : decision === 'rejected'
+              ? 'Your assessment did not meet the approval threshold. The decision and evidence were recorded for review or retry policy.'
+              : 'Your assessment was graded, but confidence, integrity, or provider signals require an admin exception review.',
+        actionUrl: '/freelancer/verification',
+      });
+    }
 
     if (claimed?.freelancerProfileId && submission.shouldEmbedProfile) {
       await this.enqueueProfileEmbedding({
@@ -1514,7 +1583,12 @@ export class FreelancerAssessmentsService {
         feedback: feedback.feedback ?? null,
         questionResults: feedback.questionResults ?? [],
       },
-      nextAction: 'wait_for_review',
+      nextAction:
+        assessment.status === 'passed'
+          ? 'approved'
+          : assessment.status === 'failed'
+            ? 'rejected'
+            : 'wait_for_review',
     };
   }
 

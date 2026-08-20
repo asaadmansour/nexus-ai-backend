@@ -26,6 +26,7 @@ import { ReviewPaymentReleaseRequestDto } from './dtos/review-payment-release-re
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
+import { PayoutAutomationService } from './payout-automation.service';
 
 @Injectable()
 export class PaymentReleaseRequestsService {
@@ -46,12 +47,14 @@ export class PaymentReleaseRequestsService {
     @InjectRepository(User)
     private readonly usersRepository: Repository<User>,
     private readonly notificationsService: NotificationsService,
+    private readonly payoutAutomationService: PayoutAutomationService,
   ) {}
 
   async create(
     projectId: string,
     dto: CreatePaymentReleaseRequestDto,
     requester: JwtPayload,
+    options: { notifyRequested?: boolean } = {},
   ) {
     const result = await this.dataSource.transaction(async (manager) => {
       const project = await manager
@@ -78,6 +81,22 @@ export class PaymentReleaseRequestsService {
       if (!submission.freelancerProfileId) {
         throw new ConflictException(
           'Approved submission has no responsible freelancer',
+        );
+      }
+      if (!submission.taskId) {
+        throw new ConflictException(
+          'Implementation payment release requires an approved task submission',
+        );
+      }
+      const task = await manager.getRepository(ProjectTask).findOne({
+        where: { id: submission.taskId, projectId },
+      });
+      if (
+        !task?.budgetAmount ||
+        task.assignedFreelancerProfileId !== submission.freelancerProfileId
+      ) {
+        throw new ConflictException(
+          'The approved submission no longer matches a funded task assignment',
         );
       }
       const freelancerProfileId =
@@ -135,6 +154,15 @@ export class PaymentReleaseRequestsService {
       if (existing) return { request: existing, created: false };
 
       const amount = this.toCents(dto.amount);
+      const entitledAmount = Math.max(
+        this.toCents(task.budgetAmount) - this.toCents(task.penaltyAmount ?? 0),
+        0,
+      );
+      if (amount !== entitledAmount) {
+        throw new BadRequestException(
+          `Release amount must equal the task's net approved compensation of ${this.fromCents(entitledAmount)} ${currency}`,
+        );
+      }
       const available = await this.availableHeldCents(manager, project);
       if (amount > available) {
         throw new ConflictException(
@@ -180,14 +208,16 @@ export class PaymentReleaseRequestsService {
         rejectedAt: null,
         releasedAt: null,
         metadata: {
-          transferMode: 'ledger_only',
+          transferMode: this.transferMode(),
           stripeTransferId: null,
         },
       });
       return { request, created: true };
     });
 
-    if (result.created) await this.notifyReleaseRequested(result.request);
+    if (result.created && options.notifyRequested !== false) {
+      await this.notifyReleaseRequested(result.request);
+    }
     return result.request;
   }
 
@@ -210,13 +240,26 @@ export class PaymentReleaseRequestsService {
         'Submission owner must match the current task assignee',
       );
     }
+    const existingTaskRelease = await this.releaseRequestsRepository
+      .createQueryBuilder('request')
+      .innerJoin('request.submission', 'submission')
+      .where('submission.taskId = :taskId', { taskId: task.id })
+      .andWhere('request.status IN (:...statuses)', {
+        statuses: ['pending', 'approved', 'released'],
+      })
+      .orderBy('request.createdAt', 'DESC')
+      .getOne();
+    if (existingTaskRelease) return existingTaskRelease;
     if (!task.budgetAmount || !task.currency) {
       throw new BadRequestException(
         'Task compensation must be allocated before approval can create a release request',
       );
     }
     const project = await this.getProjectOrThrow(submission.projectId);
-    const amount = Number(task.budgetAmount);
+    const amount = Math.max(
+      Number(task.budgetAmount) - Number(task.penaltyAmount ?? 0),
+      0,
+    );
     if (!Number.isFinite(amount) || amount <= 0) {
       throw new BadRequestException('Task compensation is invalid');
     }
@@ -228,9 +271,13 @@ export class PaymentReleaseRequestsService {
         freelancerProfileId: submission.freelancerProfileId ?? undefined,
         amount,
         currency: task.currency ?? project.quotedCurrency ?? project.currency,
-        reason: `Approved task: ${task.title}`,
+        reason:
+          Number(task.penaltyAmount ?? 0) > 0
+            ? `Approved task: ${task.title} (after ${Number(task.penaltyAmount).toFixed(2)} ${task.currency} deadline deductions)`
+            : `Approved task: ${task.title}`,
       },
       requester,
+      { notifyRequested: false },
     );
   }
 
@@ -323,7 +370,7 @@ export class PaymentReleaseRequestsService {
           reason: `Approved ${submission.submissionType} planning deliverable`,
           requestedBy: requester.sub,
           metadata: {
-            transferMode: 'ledger_only',
+            transferMode: this.transferMode(),
             workType: 'planning',
             roleKey: assignment.roleKey,
           },
@@ -398,7 +445,11 @@ export class PaymentReleaseRequestsService {
           },
         });
       if (releaseRequest.status === 'released' && existingLedger) {
-        return { releaseRequest, ledgerEntry: existingLedger };
+        return {
+          releaseRequest,
+          ledgerEntry: existingLedger,
+          governanceRelease: null,
+        };
       }
       if (!['pending', 'approved'].includes(releaseRequest.status)) {
         throw new ConflictException(
@@ -414,7 +465,7 @@ export class PaymentReleaseRequestsService {
         releaseRequest.rejectedAt = now;
         releaseRequest.approvedAt = null;
         await requestRepo.save(releaseRequest);
-        return { releaseRequest, ledgerEntry: null };
+        return { releaseRequest, ledgerEntry: null, governanceRelease: null };
       }
 
       releaseRequest.status = 'approved';
@@ -422,7 +473,7 @@ export class PaymentReleaseRequestsService {
       releaseRequest.rejectedAt = null;
       if (!dto.releaseNow) {
         await requestRepo.save(releaseRequest);
-        return { releaseRequest, ledgerEntry: null };
+        return { releaseRequest, ledgerEntry: null, governanceRelease: null };
       }
 
       const approvedImplementation =
@@ -470,7 +521,7 @@ export class PaymentReleaseRequestsService {
         createdBy: requester.sub,
         postedAt: now,
         metadata: {
-          transferMode: 'ledger_only',
+          transferMode: this.transferMode(),
           stripeTransferId: null,
         },
       });
@@ -481,7 +532,7 @@ export class PaymentReleaseRequestsService {
       releaseRequest.releasedAt = now;
       releaseRequest.metadata = {
         ...(releaseRequest.metadata ?? {}),
-        transferMode: 'ledger_only',
+        transferMode: this.transferMode(),
         stripeTransferId: null,
         ledgerEntryId: ledgerEntry.id,
       };
@@ -493,34 +544,135 @@ export class PaymentReleaseRequestsService {
           releaseRequest.milestoneId,
         );
       }
-      const unfinishedTasks = await manager.getRepository(ProjectTask).count({
-        where: {
-          projectId: project.id,
-          status: In([
-            'todo',
-            'blocked',
-            'in_progress',
-            'review',
-            'changes_requested',
-          ]),
-        },
-      });
-      if (
-        unfinishedTasks === 0 &&
-        releasedCents >= this.toCents(project.heldAmount)
-      ) {
-        project.status = ProjectStatus.COMPLETED;
-      }
       await manager.getRepository(Project).save(project);
-      return { releaseRequest, ledgerEntry };
+      return { releaseRequest, ledgerEntry, governanceRelease: null };
     });
 
     await this.notifyReleaseReviewed(result.releaseRequest);
+    const payoutEntries = [result.ledgerEntry].filter(
+      (entry): entry is EscrowLedgerEntry => Boolean(entry),
+    );
+    const payout = await this.payoutAutomationService
+      .processEntries(payoutEntries)
+      .catch((error: unknown) => {
+        this.logger.error(
+          `Immediate payout dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return {
+          inspected: payoutEntries.length,
+          transferred: 0,
+          mode: this.transferMode(),
+        };
+      });
     return {
       ...result,
-      stripeTransferId: null,
-      transferMode: 'ledger_only',
+      stripeTransferId: result.ledgerEntry?.stripeTransferId ?? null,
+      transferMode: this.transferMode(),
+      payout,
     };
+  }
+
+  async completeProjectDelivery(projectId: string, acceptedBy: string) {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      if (project.status === ProjectStatus.COMPLETED) {
+        const existing = await manager
+          .getRepository(EscrowLedgerEntry)
+          .findOne({
+            where: {
+              projectId,
+              entryType: 'governance_release',
+              status: 'posted',
+            },
+          });
+        return { project, governanceRelease: existing, alreadyCompleted: true };
+      }
+      const taskRepo = manager.getRepository(ProjectTask);
+      const [totalTasks, unfinishedTasks] = await Promise.all([
+        taskRepo.count({ where: { projectId } }),
+        taskRepo.count({
+          where: {
+            projectId,
+            status: In([
+              'todo',
+              'blocked',
+              'in_progress',
+              'review',
+              'changes_requested',
+            ]),
+          },
+        }),
+      ]);
+      if (
+        !project.implementationReadyAt ||
+        totalTasks === 0 ||
+        unfinishedTasks > 0
+      ) {
+        throw new ConflictException(
+          'Project completion requires every implementation task to be accepted',
+        );
+      }
+      const now = new Date();
+      const governanceRelease = await this.releasePrincipalReviewerAllocation(
+        manager,
+        project,
+        acceptedBy,
+        now,
+      );
+      if (governanceRelease) {
+        project.releasedAmount = this.fromCents(
+          this.toCents(project.releasedAmount) +
+            this.toCents(governanceRelease.amount),
+        );
+      }
+      if (
+        this.toCents(project.releasedAmount) < this.toCents(project.heldAmount)
+      ) {
+        throw new ConflictException(
+          'Project escrow still contains unreleased contributor allocations',
+        );
+      }
+      project.status = ProjectStatus.COMPLETED;
+      project.automationStatus = 'completed';
+      await manager.save(Project, project);
+      return { project, governanceRelease, alreadyCompleted: false };
+    });
+
+    const payout = result.governanceRelease
+      ? await this.payoutAutomationService
+          .processEntries([result.governanceRelease])
+          .catch((error: unknown) => {
+            this.logger.error(
+              `Principal payout dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return {
+              inspected: 1,
+              transferred: 0,
+              mode: this.transferMode(),
+              retryable: true,
+            };
+          })
+      : { inspected: 0, transferred: 0, mode: this.transferMode() };
+    if (result.governanceRelease?.freelancerProfileId) {
+      const profile = await this.freelancerProfilesRepository.findOne({
+        where: { id: result.governanceRelease.freelancerProfileId },
+      });
+      if (profile) {
+        await this.notifyUsers(
+          [profile.userId],
+          'Principal reviewer payment released',
+          `${result.governanceRelease.amount} ${result.governanceRelease.currency} was added to your earnings after the client accepted the integrated delivery.`,
+          projectId,
+        );
+      }
+    }
+    return { ...result, payout };
   }
 
   private async list(
@@ -616,7 +768,9 @@ export class PaymentReleaseRequestsService {
       .createQueryBuilder('entry')
       .select('COALESCE(SUM(entry.amount), 0)', 'amount')
       .where('entry.milestoneId = :milestoneId', { milestoneId })
-      .andWhere('entry.entryType = :entryType', { entryType: 'release' })
+      .andWhere('entry.entryType IN (:...entryTypes)', {
+        entryTypes: ['release', 'penalty'],
+      })
       .andWhere('entry.status = :status', { status: 'posted' })
       .getRawOne<{ amount: string }>();
     if (
@@ -627,6 +781,83 @@ export class PaymentReleaseRequestsService {
         .getRepository(ProjectMilestone)
         .update(milestoneId, { status: 'paid' });
     }
+  }
+
+  private async releasePrincipalReviewerAllocation(
+    manager: EntityManager,
+    project: Project,
+    createdBy: string,
+    now: Date,
+  ) {
+    const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
+    const existing = await ledgerRepo.findOne({
+      where: {
+        projectId: project.id,
+        entryType: 'governance_release',
+        status: 'posted',
+      },
+    });
+    if (existing) return null;
+
+    const assignment = await manager
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: project.principalReviewerAssignmentId
+          ? { id: project.principalReviewerAssignmentId, projectId: project.id }
+          : {
+              projectId: project.id,
+              phase: 'governance',
+              roleKey: 'principal_reviewer',
+              status: In(['accepted', 'in_progress', 'completed']),
+            },
+      });
+    if (!assignment?.freelancerProfileId || !assignment.budgetAmount) {
+      return null;
+    }
+
+    const amountCents = this.toCents(assignment.budgetAmount);
+    const remainingCents =
+      this.toCents(project.heldAmount) - this.toCents(project.releasedAmount);
+    if (amountCents <= 0 || amountCents > remainingCents) {
+      throw new ConflictException(
+        'Principal reviewer allocation does not match remaining escrow',
+      );
+    }
+
+    const entry = await ledgerRepo.save(
+      ledgerRepo.create({
+        projectId: project.id,
+        paymentId: null,
+        milestoneId: null,
+        approvedSubmissionId: null,
+        releaseRequestId: null,
+        freelancerProfileId: assignment.freelancerProfileId,
+        entryType: 'governance_release',
+        amount: assignment.budgetAmount,
+        currency:
+          assignment.currency ?? project.quotedCurrency ?? project.currency,
+        status: 'posted',
+        reason: 'Principal reviewer project oversight completed',
+        stripeTransferId: null,
+        stripeRefundId: null,
+        createdBy,
+        postedAt: now,
+        metadata: {
+          transferMode: this.transferMode(),
+          assignmentId: assignment.id,
+        },
+      }),
+    );
+    assignment.status = 'completed';
+    assignment.completedAt = assignment.completedAt ?? now;
+    await manager.getRepository(ProjectRoleAssignment).save(assignment);
+    return entry;
+  }
+
+  private transferMode() {
+    return process.env.STRIPE_ENABLE_TRANSFERS === 'true'
+      ? 'stripe_connect'
+      : 'ledger_only';
   }
 
   private async getProjectOrThrow(projectId: string) {
@@ -658,13 +889,30 @@ export class PaymentReleaseRequestsService {
   }
 
   private async notifyReleaseRequested(request: PaymentReleaseRequest) {
-    const admins = await this.usersRepository.find({
-      where: { role: UserRole.ADMIN },
-      select: { id: true },
-    });
     const project = await this.getProjectOrThrow(request.projectId);
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId: request.projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+    let operationalReviewerIds = reviewer?.freelancerProfile?.userId
+      ? [reviewer.freelancerProfile.userId]
+      : [];
+    if (!operationalReviewerIds.length) {
+      const admins = await this.usersRepository.find({
+        where: { role: UserRole.ADMIN },
+        select: { id: true },
+      });
+      operationalReviewerIds = admins.map((admin) => admin.id);
+    }
     await this.notifyUsers(
-      [...new Set([project.customerId, ...admins.map((admin) => admin.id)])],
+      [...new Set([project.customerId, ...operationalReviewerIds])],
       'Payment release requested',
       request.reason ??
         `Release request for ${request.amount} ${request.currency}`,

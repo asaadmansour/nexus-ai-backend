@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Not, Repository } from 'typeorm';
+import { DataSource, In, Not, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import Stripe from 'stripe';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -24,7 +24,7 @@ import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
 import {
   planningRoleAllocation,
-  requiredProjectTotalForRate,
+  principalReviewerRoleAllocation,
 } from 'src/planning/project-budget-allocation';
 import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
@@ -68,6 +68,7 @@ export class PaymentsService {
     private readonly planningSubmissionsRepository: Repository<ProjectPlanningSubmission>,
     @InjectRepository(StripeWebhookEvent)
     private readonly webhookEventsRepository: Repository<StripeWebhookEvent>,
+    private readonly dataSource: DataSource,
     private readonly stripeService: StripeService,
     private readonly configService: ConfigService,
     private readonly matchingService: MatchingService,
@@ -394,11 +395,12 @@ export class PaymentsService {
       this.roleAssignmentsRepository.find({
         where: {
           freelancerProfileId,
-          phase: 'planning',
+          phase: In(['planning', 'governance']),
           status: In(['assigned', 'accepted', 'in_progress', 'completed']),
         },
         select: {
           id: true,
+          phase: true,
           budgetAmount: true,
           currency: true,
         },
@@ -417,7 +419,7 @@ export class PaymentsService {
       this.ledgerRepository.find({
         where: {
           freelancerProfileId,
-          entryType: 'release',
+          entryType: In(['release', 'governance_release']),
           status: 'posted',
         },
         select: { amount: true, currency: true },
@@ -470,7 +472,10 @@ export class PaymentsService {
       if (!totals) continue;
       const cents = this.toCents(assignment.budgetAmount);
       totals.allocatedCents += cents;
-      if (approvedPlanningAssignmentIds.has(assignment.id)) {
+      if (
+        assignment.phase === 'governance' ||
+        approvedPlanningAssignmentIds.has(assignment.id)
+      ) {
         totals.approvedCents += cents;
       }
     }
@@ -820,46 +825,10 @@ export class PaymentsService {
     if (user.role !== UserRole.ADMIN) {
       throw new ForbiddenException('Only admins can release payments');
     }
-
-    if (payment.status !== 'succeeded') {
-      throw new ConflictException('Only succeeded escrow payments can release');
-    }
-
-    const existingRelease = await this.ledgerRepository.findOne({
-      where: {
-        paymentId,
-        entryType: 'release',
-        status: 'posted',
-      },
-    });
-
-    if (existingRelease) {
-      throw new ConflictException('Payment has already been released');
-    }
-
-    const ledgerEntry = await this.ledgerRepository.save(
-      this.ledgerRepository.create({
-        projectId,
-        paymentId,
-        milestoneId: payment.milestoneId,
-        freelancerProfileId: dto.freelancerProfileId ?? null,
-        entryType: 'release',
-        amount: payment.amount,
-        currency: payment.currency,
-        status: 'posted',
-        reason: dto.reason ?? 'Escrow released',
-        createdBy: user.sub,
-        postedAt: new Date(),
-      }),
+    void dto;
+    throw new ConflictException(
+      'Direct whole-payment release is disabled because it bypasses evaluation, task accounting, penalties, and reviewer approval. Use the project payment-release request workflow instead.',
     );
-
-    return {
-      status: 'success',
-      data: {
-        payment,
-        ledgerEntry,
-      },
-    };
   }
 
   async getAdminPayments() {
@@ -880,6 +849,67 @@ export class PaymentsService {
       total,
       page: 1,
       limit: 20,
+    };
+  }
+
+  async getAdminRevenue() {
+    const rows = await this.ledgerRepository
+      .createQueryBuilder('entry')
+      .select('entry.currency', 'currency')
+      .addSelect('entry.entryType', 'entryType')
+      .addSelect('COALESCE(SUM(entry.amount), 0)', 'amount')
+      .addSelect('COUNT(*)', 'count')
+      .where('entry.status = :status', { status: 'posted' })
+      .andWhere('entry.entryType IN (:...types)', {
+        types: ['platform_fee', 'penalty'],
+      })
+      .groupBy('entry.currency')
+      .addGroupBy('entry.entryType')
+      .orderBy('entry.currency', 'ASC')
+      .addOrderBy('entry.entryType', 'ASC')
+      .getRawMany<{
+        currency: string;
+        entryType: string;
+        amount: string;
+        count: string;
+      }>();
+
+    const byCurrency: Record<
+      string,
+      {
+        grossRevenue: number;
+        platformFees: number;
+        deadlinePenalties: number;
+        entries: number;
+      }
+    > = {};
+    for (const row of rows) {
+      const bucket = (byCurrency[row.currency] ??= {
+        grossRevenue: 0,
+        platformFees: 0,
+        deadlinePenalties: 0,
+        entries: 0,
+      });
+      const amount = Number(row.amount);
+      bucket.grossRevenue += amount;
+      bucket.entries += Number(row.count);
+      if (row.entryType === 'platform_fee') bucket.platformFees += amount;
+      if (row.entryType === 'penalty') bucket.deadlinePenalties += amount;
+    }
+
+    const recentEntries = await this.ledgerRepository.find({
+      where: [
+        { entryType: 'platform_fee', status: 'posted' },
+        { entryType: 'penalty', status: 'posted' },
+      ],
+      relations: { project: true, freelancerProfile: { user: true } },
+      order: { postedAt: 'DESC', createdAt: 'DESC' },
+      take: 50,
+    });
+
+    return {
+      status: 'success',
+      data: { byCurrency, recentEntries },
     };
   }
 
@@ -1061,32 +1091,49 @@ export class PaymentsService {
     payment: ProjectPayment,
     metadata: Record<string, unknown>,
   ) {
-    await this.paymentsRepository.save(
-      this.paymentsRepository.create({
-        id: payment.id,
-        status: 'succeeded',
-        paidAt: payment.paidAt ?? new Date(),
-        failedAt: null,
-        stripeCheckoutSessionId: payment.stripeCheckoutSessionId,
-        stripePaymentIntentId: payment.stripePaymentIntentId,
-        metadata: {
-          ...(payment.metadata ?? {}),
-          ...metadata,
+    await this.dataSource.transaction(async (manager) => {
+      const paymentRepo = manager.getRepository(ProjectPayment);
+      const lockedPayment = await paymentRepo
+        .createQueryBuilder('payment')
+        .setLock('pessimistic_write')
+        .where('payment.id = :paymentId', { paymentId: payment.id })
+        .getOne();
+      if (!lockedPayment) return;
+
+      lockedPayment.status = 'succeeded';
+      lockedPayment.paidAt = lockedPayment.paidAt ?? new Date();
+      lockedPayment.failedAt = null;
+      lockedPayment.stripeCheckoutSessionId =
+        payment.stripeCheckoutSessionId ??
+        lockedPayment.stripeCheckoutSessionId;
+      lockedPayment.stripePaymentIntentId =
+        payment.stripePaymentIntentId ?? lockedPayment.stripePaymentIntentId;
+      lockedPayment.metadata = {
+        ...(lockedPayment.metadata ?? {}),
+        ...metadata,
+      };
+      await paymentRepo.save(lockedPayment);
+
+      const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
+      const existingHold = await ledgerRepo.findOne({
+        where: {
+          paymentId: payment.id,
+          entryType: 'hold',
+          status: 'posted',
         },
-      }),
-    );
+      });
+      if (existingHold) return;
 
-    const existingHold = await this.ledgerRepository.findOne({
-      where: {
-        paymentId: payment.id,
-        entryType: 'hold',
-        status: 'posted',
-      },
-    });
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId: payment.projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Payment project not found');
 
-    if (!existingHold) {
-      await this.ledgerRepository.save(
-        this.ledgerRepository.create({
+      await ledgerRepo.save(
+        ledgerRepo.create({
           projectId: payment.projectId,
           paymentId: payment.id,
           milestoneId: payment.milestoneId,
@@ -1098,20 +1145,52 @@ export class PaymentsService {
           postedAt: new Date(),
         }),
       );
-      await this.projectsRepository
-        .createQueryBuilder()
-        .update(Project)
-        .set({
-          heldAmount: () => '"held_amount" + :amount',
-          quoteStatus: 'accepted',
-        })
-        .where('id = :projectId', { projectId: payment.projectId })
-        .setParameter('amount', payment.amount)
-        .execute();
-    }
+      project.heldAmount = this.fromCents(
+        this.toCents(project.heldAmount) + this.toCents(payment.amount),
+      );
+      project.quoteStatus = 'accepted';
+
+      const platformFee = Number(project.platformFeeAmount ?? 0);
+      if (platformFee > 0 && payment.purpose === 'full_project_deposit') {
+        const existingFee = await ledgerRepo.findOne({
+          where: {
+            projectId: payment.projectId,
+            entryType: 'platform_fee',
+            status: 'posted',
+          },
+        });
+        if (!existingFee) {
+          await ledgerRepo.save(
+            ledgerRepo.create({
+              projectId: payment.projectId,
+              paymentId: payment.id,
+              milestoneId: null,
+              entryType: 'platform_fee',
+              amount: platformFee.toFixed(2),
+              currency: payment.currency,
+              status: 'posted',
+              reason: 'Nexus AI platform fee',
+              postedAt: new Date(),
+              metadata: {
+                source: 'budget_allocation',
+                testMode:
+                  !process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_'),
+              },
+            }),
+          );
+          project.releasedAmount = this.fromCents(
+            this.toCents(project.releasedAmount) + this.toCents(platformFee),
+          );
+        }
+      }
+      await manager.getRepository(Project).save(project);
+    });
 
     if (payment.purpose === 'full_project_deposit') {
-      await this.matchingService.autoStartPlanningRoles(payment.projectId);
+      // Funding starts the autonomous staffing chain. A principal reviewer is
+      // invited first; accepting that invitation triggers architect/UIUX
+      // matching, which in turn unlocks planning and implementation staffing.
+      await this.matchingService.autoStartPrincipalReviewer(payment.projectId);
     }
   }
 
@@ -1301,13 +1380,29 @@ export class PaymentsService {
       where: { projectId: project.id },
     });
     const paidAmount = this.sumPayments(existingPayments, ['succeeded']);
-    const remainingAmount = Math.max(quoteAmount - paidAmount, 0);
+    const pendingCutoff = new Date(Date.now() - 30 * 60 * 1000);
+    const reservedAmount = existingPayments
+      .filter(
+        (payment) =>
+          payment.status === 'requires_payment' &&
+          payment.createdAt > pendingCutoff,
+      )
+      .reduce((sum, payment) => sum + Number(payment.amount), 0);
+    const remainingAmount = Math.max(
+      quoteAmount - paidAmount - reservedAmount,
+      0,
+    );
 
     if (remainingAmount <= 0) {
       throw new ConflictException('This project is already fully funded');
     }
 
     if (dto.purpose === 'full_project_deposit') {
+      if (Math.abs(amount - remainingAmount) > 0.005) {
+        throw new BadRequestException(
+          `Full-project funding must cover the exact remaining ${remainingAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}. Use a milestone payment for a smaller amount.`,
+        );
+      }
       await this.assertPlanningBudgetFeasible(project);
     }
 
@@ -1321,20 +1416,28 @@ export class PaymentsService {
   }
 
   private async assertPlanningBudgetFeasible(project: Project) {
+    const principal = principalReviewerRoleAllocation(project.budgetAllocation);
     const architect = planningRoleAllocation(
       project.budgetAllocation,
       'architect',
     );
     const uiux = planningRoleAllocation(project.budgetAllocation, 'ui_ux');
-    if (!architect || !uiux) {
+    if (!principal || !architect || !uiux) {
       throw new ConflictException(
-        'The project price has no valid planning compensation allocation. Reconfirm the brief before funding escrow.',
+        'The project price has no valid reviewer/planning compensation allocation. Reconfirm the brief before funding escrow.',
       );
     }
 
     const profiles = await this.freelancerProfilesRepository
       .createQueryBuilder('profile')
-      .select(['profile.id', 'profile.hourlyRate'])
+      .select([
+        'profile.id',
+        'profile.hourlyRate',
+        'profile.skills',
+        'profile.yearsExperience',
+        'profile.performanceScore',
+        'profile.availabilityHoursPerWeek',
+      ])
       .where('profile.verificationStatus = :approved', {
         approved: 'approved',
       })
@@ -1344,40 +1447,113 @@ export class PaymentsService {
       .andWhere('profile.hourlyRate > 0')
       .orderBy('profile.hourlyRate', 'ASC')
       .getMany();
-    const rates = profiles
-      .map((profile) => Number(profile.hourlyRate))
-      .filter((rate) => Number.isFinite(rate) && rate > 0);
-    const architectMax = Number(architect.maxHourlyRate);
-    const uiuxMax = Number(uiux.maxHourlyRate);
-
-    // Rate-qualified sets are nested, so assigning the narrower role first is
-    // a complete two-role feasibility check while preserving role separation.
-    const caps = [architectMax, uiuxMax].sort((left, right) => left - right);
-    const firstIndex = rates.findIndex((rate) => rate <= caps[0]);
-    const secondIndex = rates.findIndex(
-      (rate, index) => index !== firstIndex && rate <= caps[1],
-    );
-    if (firstIndex >= 0 && secondIndex >= 0) return;
-
-    if (rates.length < 2) {
-      throw new ConflictException(
-        'At least two distinct approved freelancers with hourly rates are required for architecture and UI/UX planning before escrow can be funded.',
+    const specs = [
+      {
+        role: 'principal reviewer',
+        allocation: principal,
+        skills: [
+          'architecture',
+          'system design',
+          'technical leadership',
+          'solution architect',
+          'code review',
+        ],
+        senior: true,
+      },
+      {
+        role: 'architect',
+        allocation: architect,
+        skills: [
+          'architecture',
+          'system design',
+          'api design',
+          'database design',
+          'backend',
+        ],
+        senior: false,
+      },
+      {
+        role: 'UI/UX designer',
+        allocation: uiux,
+        skills: [
+          'ui/ux',
+          'ui ux',
+          'figma',
+          'wireframing',
+          'prototyping',
+          'user flows',
+          'design systems',
+        ],
+        senior: false,
+      },
+    ];
+    const eligibleByRole = specs.map((spec) => {
+      const minimumAvailability = Math.max(
+        1,
+        Math.ceil(spec.allocation.estimatedHours / 4),
       );
-    }
-    const requiredForArchitect = Number(
-      requiredProjectTotalForRate(
-        rates[0],
-        'architect',
-        architect.estimatedHours,
-      ),
-    );
-    const requiredForUiux = Number(
-      requiredProjectTotalForRate(rates[1], 'ui_ux', uiux.estimatedHours),
-    );
-    const requiredTotal = Math.max(requiredForArchitect, requiredForUiux);
+      const roleFit = profiles.filter((profile) => {
+        const skills = (profile.skills ?? []).map((skill) =>
+          skill.toLowerCase(),
+        );
+        const hasRoleSkill = spec.skills.some((required) =>
+          skills.some(
+            (skill) => skill.includes(required) || required.includes(skill),
+          ),
+        );
+        return (
+          hasRoleSkill &&
+          (profile.availabilityHoursPerWeek ?? 0) >= minimumAvailability &&
+          (!spec.senior ||
+            ((profile.yearsExperience ?? 0) >= 5 &&
+              Number(profile.performanceScore ?? 100) >= 80))
+        );
+      });
+      if (!roleFit.length) {
+        throw new ConflictException(
+          `No approved, available ${spec.role} currently meets the role-fit and experience requirements. Add an eligible freelancer before accepting payment.`,
+        );
+      }
+      const maxRate = Number(spec.allocation.maxHourlyRate);
+      return {
+        ...spec,
+        roleFit,
+        affordable: roleFit.filter(
+          (profile) => Number(profile.hourlyRate) <= maxRate,
+        ),
+      };
+    });
+
+    const canAssignDistinctRoles = (
+      index: number,
+      used: Set<string>,
+    ): boolean => {
+      if (index >= eligibleByRole.length) return true;
+      return eligibleByRole[index].affordable.some((profile) => {
+        if (used.has(profile.id)) return false;
+        used.add(profile.id);
+        const matched = canAssignDistinctRoles(index + 1, used);
+        used.delete(profile.id);
+        return matched;
+      });
+    };
+    if (canAssignDistinctRoles(0, new Set())) return;
+
     const currentTotal = Number(project.quotedAmount) || 0;
+    const requiredTotal = Math.max(
+      ...eligibleByRole.map((spec) => {
+        const cheapestRate = Math.min(
+          ...spec.roleFit.map((profile) => Number(profile.hourlyRate)),
+        );
+        const expectedCost = cheapestRate * spec.allocation.estimatedHours;
+        const allocatedAmount = Number(spec.allocation.amount);
+        return allocatedAmount > 0
+          ? (expectedCost * currentTotal) / allocatedAmount
+          : expectedCost;
+      }),
+    );
     throw new ConflictException(
-      `The current planning allocation cannot cover two available freelancers. Increase the project total to at least ${requiredTotal.toFixed(2)} ${project.quotedCurrency ?? project.currency} (an increase of ${Math.max(requiredTotal - currentTotal, 0).toFixed(2)}) before funding escrow.`,
+      `The current allocation cannot fund distinct principal reviewer, architecture, and UI/UX matches. Increase the project total to about ${requiredTotal.toFixed(2)} ${project.quotedCurrency ?? project.currency} (an increase of ${Math.max(requiredTotal - currentTotal, 0).toFixed(2)}) or approve lower-rate role-fit freelancers before funding escrow.`,
     );
   }
 

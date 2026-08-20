@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
@@ -89,8 +93,11 @@ export class FreelancersService {
     if (dto.skills !== undefined) profile.skills = dto.skills;
     if (dto.yearsExperience !== undefined)
       profile.yearsExperience = dto.yearsExperience;
-    if (dto.hourlyRate !== undefined)
-      profile.hourlyRate = dto.hourlyRate.toString();
+    if (dto.hourlyRate !== undefined) {
+      throw new BadRequestException(
+        'Hourly rates are assessed by Nexus AI after verification and cannot be self-edited',
+      );
+    }
     if (dto.isAvailable !== undefined) profile.isAvailable = dto.isAvailable;
     if (dto.availabilityHoursPerWeek !== undefined) {
       profile.availabilityHoursPerWeek = dto.availabilityHoursPerWeek;

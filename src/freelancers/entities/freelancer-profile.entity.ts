@@ -155,6 +155,55 @@ export class FreelancerProfile {
   hourlyRate: string | null;
 
   @Column({
+    name: 'recommended_hourly_rate',
+    type: 'numeric',
+    precision: 8,
+    scale: 2,
+    nullable: true,
+  })
+  recommendedHourlyRate: string | null;
+
+  @Column({
+    name: 'hourly_rate_assessed_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  hourlyRateAssessedAt: Date | null;
+
+  @Column({
+    name: 'performance_score',
+    type: 'numeric',
+    precision: 5,
+    scale: 2,
+    default: 100,
+  })
+  performanceScore: string;
+
+  @Column({ name: 'completed_tasks', type: 'int', default: 0 })
+  completedTasks: number;
+
+  @Column({ name: 'approved_submissions', type: 'int', default: 0 })
+  approvedSubmissions: number;
+
+  @Column({ name: 'rejected_submissions', type: 'int', default: 0 })
+  rejectedSubmissions: number;
+
+  @Column({ name: 'on_time_deliveries', type: 'int', default: 0 })
+  onTimeDeliveries: number;
+
+  @Column({ name: 'late_deliveries', type: 'int', default: 0 })
+  lateDeliveries: number;
+
+  @Column({ name: 'missed_deadlines', type: 'int', default: 0 })
+  missedDeadlines: number;
+
+  @Column({ name: 'project_removals', type: 'int', default: 0 })
+  projectRemovals: number;
+
+  @Column({ name: 'risk_flags', type: 'jsonb', nullable: true })
+  riskFlags: Record<string, unknown>[] | null;
+
+  @Column({
     name: 'stripe_account_id',
     type: 'varchar',
     length: 255,

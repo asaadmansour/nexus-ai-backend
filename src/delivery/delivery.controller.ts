@@ -17,6 +17,9 @@ import { RolesGuard } from 'src/common/guards/roles.guards';
 import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { DeliveryService } from './delivery.service';
+import { ProjectHandoffsService } from './project-handoffs.service';
+import { ClientHandoffDecisionDto } from './dtos/client-handoff-decision.dto';
+import { CreateProjectRatingDto } from './dtos/create-project-rating.dto';
 import { CreateRevisionRequestDto } from './dtos/create-revision-request.dto';
 import { CreateSubmissionDto } from './dtos/create-submission.dto';
 import { ListRevisionRequestsDto } from './dtos/list-revision-requests.dto';
@@ -108,7 +111,7 @@ export class SubmissionDetailController {
   }
 
   @Patch(':submissionId/review')
-  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  @Roles(UserRole.ADMIN)
   async review(
     @Param('submissionId', ParseUUIDPipe) submissionId: string,
     @Body() dto: ReviewSubmissionDto,
@@ -209,5 +212,58 @@ export class AdminSubmissionsController {
   async list(@Query() query: ListSubmissionsDto) {
     const result = await this.deliveryService.listAdminSubmissions(query);
     return { status: 'success', ...result };
+  }
+}
+
+@Controller('projects/:projectId/handoff')
+@UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
+export class ProjectHandoffController {
+  constructor(private readonly handoffs: ProjectHandoffsService) {}
+
+  @Get()
+  @Roles(UserRole.CUSTOMER, UserRole.FREELANCER, UserRole.ADMIN)
+  async get(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.handoffs.getForProject(projectId, user),
+    };
+  }
+
+  @Post('decision')
+  @Roles(UserRole.CUSTOMER)
+  async decide(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() dto: ClientHandoffDecisionDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.handoffs.clientDecision(projectId, dto, user.sub),
+    };
+  }
+
+  @Post('ratings')
+  @Roles(UserRole.CUSTOMER)
+  async rate(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() dto: CreateProjectRatingDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.handoffs.rateContributor(projectId, dto, user.sub),
+    };
+  }
+
+  @Post('retry')
+  @Roles(UserRole.ADMIN)
+  async retry(@Param('projectId', ParseUUIDPipe) projectId: string) {
+    return {
+      status: 'success',
+      data: await this.handoffs.retry(projectId),
+    };
   }
 }

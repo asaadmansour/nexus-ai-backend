@@ -13,20 +13,25 @@ import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
+import { FreelancerPerformanceEvent } from 'src/freelancers/entities/freelancer-performance-event.entity';
 import { NotificationsService } from 'src/notifications/notifications.service';
 import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requests.service';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { ProjectRepository } from 'src/projects/entities/project-repository.entity';
 import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectSubmissionReview } from 'src/projects/entities/project-submission-review.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { ProjectTaskDependency } from 'src/projects/entities/project-task-dependency.entity';
+import { TaskCheckpoint } from 'src/projects/entities/task-checkpoint.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { User } from 'src/users/entities/user.entity';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { EvaluationRun } from 'src/projects/entities/evaluation-run.entity';
 import { GithubService } from 'src/repositories/github.service';
+import { MatchingService } from 'src/matching/matching.service';
+import { ProjectHandoffsService } from './project-handoffs.service';
 import { CreateRevisionRequestDto } from './dtos/create-revision-request.dto';
 import { CreateSubmissionDto } from './dtos/create-submission.dto';
 import { ListRevisionRequestsDto } from './dtos/list-revision-requests.dto';
@@ -232,6 +237,8 @@ export class DeliveryService {
     private readonly notificationsService: NotificationsService,
     private readonly paymentReleaseRequestsService: PaymentReleaseRequestsService,
     private readonly githubService: GithubService,
+    private readonly matchingService: MatchingService,
+    private readonly projectHandoffsService: ProjectHandoffsService,
     @Optional()
     @Inject(SUBMISSION_EVALUATION_DISPATCHER)
     private readonly evaluationDispatcher?: SubmissionEvaluationDispatcher,
@@ -518,6 +525,7 @@ export class DeliveryService {
     submissionId: string,
     dto: ReviewSubmissionDto,
     requester: JwtPayload,
+    reviewerRoleOverride?: string,
   ) {
     if (dto.decision !== 'approved' && !dto.feedback?.trim()) {
       throw new BadRequestException(
@@ -580,7 +588,7 @@ export class DeliveryService {
         milestoneId: submission.milestoneId,
         taskId: submission.taskId,
         reviewerUserId: requester.sub,
-        reviewerRole: requester.role,
+        reviewerRole: reviewerRoleOverride ?? requester.role,
         decision: dto.decision,
         feedback: dto.feedback?.trim() || null,
         requestedChanges: dto.requestedChanges ?? null,
@@ -616,7 +624,59 @@ export class DeliveryService {
       if (submission.taskId) {
         await manager.getRepository(ProjectTask).update(submission.taskId, {
           status: dto.decision === 'approved' ? 'done' : 'changes_requested',
+          assignmentStatus:
+            dto.decision === 'approved' ? 'completed' : 'changes_requested',
         });
+      }
+
+      if (submission.freelancerProfileId) {
+        const profile = await manager.findOne(FreelancerProfile, {
+          where: { id: submission.freelancerProfileId },
+        });
+        if (profile) {
+          const scoreDelta =
+            dto.decision === 'approved'
+              ? 2
+              : dto.decision === 'rejected'
+                ? -8
+                : -2;
+          if (dto.decision === 'approved') {
+            profile.approvedSubmissions += 1;
+            profile.completedTasks += 1;
+            if (!submission.task?.dueAt || now <= submission.task.dueAt) {
+              profile.onTimeDeliveries += 1;
+            } else {
+              profile.lateDeliveries += 1;
+            }
+          } else if (dto.decision === 'rejected') {
+            profile.rejectedSubmissions += 1;
+          }
+          profile.performanceScore = Math.max(
+            0,
+            Math.min(100, Number(profile.performanceScore) + scoreDelta),
+          ).toFixed(2);
+          await manager.save(FreelancerProfile, profile);
+          await manager.save(
+            FreelancerPerformanceEvent,
+            manager.create(FreelancerPerformanceEvent, {
+              freelancerProfileId: profile.id,
+              projectId: submission.projectId,
+              taskId: submission.taskId,
+              eventType: `submission_${dto.decision}`,
+              scoreDelta: scoreDelta.toFixed(2),
+              moneyDelta: '0.00',
+              currency: submission.task?.currency ?? null,
+              reason:
+                dto.feedback?.trim() ||
+                `Implementation submission ${dto.decision.replace('_', ' ')}`,
+              metadata: {
+                submissionId: submission.id,
+                reviewId: review.id,
+                reviewerRole: reviewerRoleOverride ?? requester.role,
+              },
+            }),
+          );
+        }
       }
 
       let revisionRequest: ProjectRevisionRequest | null = null;
@@ -658,23 +718,69 @@ export class DeliveryService {
 
     let releaseRequest: unknown = null;
     let releaseError: string | null = null;
+    let integration: unknown = null;
+    let integrationError: string | null = null;
     if (dto.decision === 'approved') {
       try {
-        releaseRequest =
+        const pending =
           await this.paymentReleaseRequestsService.createForApprovedSubmission(
             result.submission,
             requester,
           );
+        releaseRequest = await this.paymentReleaseRequestsService.review(
+          pending.id,
+          {
+            decision: 'approved',
+            releaseNow: true,
+            reviewNotes:
+              'Automatically released after principal/admin acceptance of verified work.',
+          },
+          requester,
+        );
       } catch (error) {
         releaseError =
           error instanceof Error
             ? error.message
             : 'Payment release request could not be created';
       }
+      try {
+        integration = await this.projectHandoffsService.afterSubmissionApproved(
+          result.submission.id,
+        );
+      } catch (error) {
+        integrationError =
+          error instanceof Error
+            ? error.message
+            : 'Automatic integration failed';
+      }
     }
 
     await this.notifySubmissionReviewed(result.submission, result.review);
-    return { ...result, releaseRequest, releaseError };
+    let rematching: unknown = null;
+    let rematchingError: string | null = null;
+    if (dto.decision === 'rejected' && result.submission.taskId) {
+      try {
+        rematching = await this.matchingService.removeTaskAssignee(
+          result.submission.taskId,
+          dto.feedback?.trim() || 'Submission rejected by technical review',
+          requester.sub,
+        );
+      } catch (error) {
+        rematchingError =
+          error instanceof Error
+            ? error.message
+            : 'Automatic rematching failed';
+      }
+    }
+    return {
+      ...result,
+      releaseRequest,
+      releaseError,
+      integration,
+      integrationError,
+      rematching,
+      rematchingError,
+    };
   }
 
   private async assertPullRequestHeadIsCurrent(
@@ -714,9 +820,17 @@ export class DeliveryService {
       repoName: submission.repository.repoName,
       number,
     });
-    if (pullRequest.state !== 'open' || pullRequest.draft) {
+    if (pullRequest.baseRef !== submission.repository.defaultBranch) {
       throw new ConflictException(
-        'Approval is blocked until the pull request is open and marked ready for review',
+        `Approval is blocked because the pull request must target ${submission.repository.defaultBranch}`,
+      );
+    }
+    if (
+      (pullRequest.state !== 'open' && !pullRequest.merged) ||
+      pullRequest.draft
+    ) {
+      throw new ConflictException(
+        'Approval is blocked until the pull request is open and ready for review, or already merged at the evaluated commit',
       );
     }
     if (
@@ -947,9 +1061,23 @@ export class DeliveryService {
       await manager.getRepository(ProjectSubmission).save(previous);
     }
     if (submission.taskId) {
-      await manager
-        .getRepository(ProjectTask)
-        .update(submission.taskId, { status: 'review' });
+      await manager.getRepository(ProjectTask).update(submission.taskId, {
+        status: 'review',
+        assignmentStatus: 'in_review',
+      });
+      const pendingCheckpoints = await manager
+        .getRepository(TaskCheckpoint)
+        .find({
+          where: { taskId: submission.taskId, status: 'pending' },
+        });
+      for (const checkpoint of pendingCheckpoints) {
+        checkpoint.completedAt = now;
+        checkpoint.assessedAt = now;
+        checkpoint.status = now <= checkpoint.dueAt ? 'met' : 'completed_late';
+      }
+      if (pendingCheckpoints.length) {
+        await manager.getRepository(TaskCheckpoint).save(pendingCheckpoints);
+      }
       if (submission.freelancerProfileId) {
         const revisionRepo = manager.getRepository(ProjectRevisionRequest);
         const revisions = await revisionRepo.find({
@@ -1252,12 +1380,9 @@ export class DeliveryService {
 
   private assertReviewerAccess(project: Project, requester: JwtPayload) {
     if (requester.role === UserRole.ADMIN) return;
-    if (
-      requester.role !== UserRole.CUSTOMER ||
-      project.customerId !== requester.sub
-    ) {
-      throw new ForbiddenException('You cannot review work for this project');
-    }
+    throw new ForbiddenException(
+      'Technical work must be reviewed by the project principal reviewer or an admin override',
+    );
   }
 
   private async assertTaskSubmissionAccess(
@@ -1329,6 +1454,21 @@ export class DeliveryService {
     if (unfinishedDependencies > 0) {
       throw new ConflictException(
         'This task has unfinished blocking dependencies',
+      );
+    }
+
+    const overdueUnassessedCheckpoint = await manager
+      .getRepository(TaskCheckpoint)
+      .createQueryBuilder('checkpoint')
+      .where('checkpoint.task_id = :taskId', { taskId: task.id })
+      .andWhere("checkpoint.status = 'pending'")
+      .andWhere(
+        "checkpoint.due_at + (checkpoint.grace_minutes * interval '1 minute') <= NOW()",
+      )
+      .getOne();
+    if (overdueUnassessedCheckpoint) {
+      throw new ConflictException(
+        'A task checkpoint passed its grace period. Complete it after the automatic deadline assessment before submitting.',
       );
     }
   }
@@ -1598,11 +1738,15 @@ export class DeliveryService {
     submission: ProjectSubmission,
   ) {
     await this.notifyUsers(
-      await this.projectCustomerAndAdminIds(project.customerId),
+      await this.projectCustomerReviewerOrAdmins(
+        project.id,
+        project.customerId,
+      ),
       'Work submitted for review',
       submission.title ?? 'A freelancer submitted a new work version.',
       project.id,
       submission.taskId,
+      '/messages',
     );
   }
 
@@ -1639,6 +1783,9 @@ export class DeliveryService {
         `${submission.title ?? 'Your submitted work'} was ${review.decision.replace(/_/g, ' ')}.`,
       submission.projectId,
       submission.taskId,
+      submission.taskId
+        ? `/freelancer/projects/${submission.projectId}/tasks/${submission.taskId}`
+        : `/freelancer/projects/${submission.projectId}`,
     );
   }
 
@@ -1654,20 +1801,44 @@ export class DeliveryService {
       revision.description?.trim() || revision.title,
       revision.projectId,
       revision.taskId,
+      revision.taskId
+        ? `/freelancer/projects/${revision.projectId}/tasks/${revision.taskId}`
+        : `/freelancer/projects/${revision.projectId}`,
     );
   }
 
   private async notifyRevisionStatusChanged(revision: ProjectRevisionRequest) {
     await this.notifyUsers(
-      await this.projectCustomerAndAdminIds(revision.project.customerId),
+      await this.projectCustomerReviewerOrAdmins(
+        revision.projectId,
+        revision.project.customerId,
+      ),
       `Revision ${revision.status.replace('_', ' ')}`,
       revision.title,
       revision.projectId,
       revision.taskId,
+      '/messages',
     );
   }
 
-  private async projectCustomerAndAdminIds(customerId: string) {
+  private async projectCustomerReviewerOrAdmins(
+    projectId: string,
+    customerId: string,
+  ) {
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      });
+    if (reviewer?.freelancerProfile?.userId) {
+      return [customerId, reviewer.freelancerProfile.userId];
+    }
     const admins = await this.usersRepository.find({
       where: { role: UserRole.ADMIN },
       select: { id: true },
@@ -1681,6 +1852,7 @@ export class DeliveryService {
     body: string,
     projectId: string,
     taskId: string | null,
+    actionUrl?: string | null,
   ) {
     try {
       await Promise.all(
@@ -1691,6 +1863,7 @@ export class DeliveryService {
             body,
             projectId,
             taskId,
+            actionUrl: actionUrl ?? null,
           }),
         ),
       );

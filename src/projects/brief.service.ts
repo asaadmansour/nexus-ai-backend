@@ -14,7 +14,10 @@ import { Project } from './entities/project.entity';
 import { AiService, type ProjectQuoteResult } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { assessPlanningRequirementProfile } from 'src/planning/planning-evaluation-requirements';
-import { createProjectBudgetAllocation } from 'src/planning/project-budget-allocation';
+import {
+  createProjectBudgetAllocation,
+  platformFeeAllocation,
+} from 'src/planning/project-budget-allocation';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
@@ -398,7 +401,33 @@ export class BriefService {
           projectQuote.currency,
           requirementProfile.complexity,
           project.quoteGeneratedAt,
+          Object.fromEntries(
+            projectQuote.roleEstimates.map((role) => [
+              role.roleKey,
+              role.hourlyRate,
+            ]),
+          ),
+          projectQuote.roleEstimates.filter(
+            (
+              role,
+            ): role is typeof role & {
+              roleKey:
+                'principal_reviewer' | 'architect' | 'ui_ux' | 'implementation';
+            } =>
+              [
+                'principal_reviewer',
+                'architect',
+                'ui_ux',
+                'implementation',
+              ].includes(role.roleKey),
+          ),
         );
+        project.platformFeeAmount =
+          platformFeeAllocation(project.budgetAllocation)?.amount ?? '0.00';
+        project.automationStatus =
+          projectQuote.quoteStatus === 'out_of_budget'
+            ? 'budget_revision_required'
+            : 'awaiting_funding';
       } else if (!project.budgetAllocation && project.quotedAmount) {
         project.budgetAllocation = createProjectBudgetAllocation(
           project.quotedAmount,
@@ -406,6 +435,8 @@ export class BriefService {
           requirementProfile.complexity,
           project.quoteGeneratedAt ?? new Date(),
         );
+        project.platformFeeAmount =
+          platformFeeAllocation(project.budgetAllocation)?.amount ?? '0.00';
       }
 
       if (this.shouldMarkBriefComplete(project)) {
@@ -825,6 +856,10 @@ export class BriefService {
   private buildProjectQuoteNotes(quote: ProjectQuoteResult) {
     const sections = [
       quote.rationale,
+      `Recommended minimum: ${quote.recommendedMinimum.toFixed(2)} ${quote.currency}. Budget gap: ${quote.budgetGap.toFixed(2)} ${quote.currency}.`,
+      quote.roleEstimates.length
+        ? `Team cost assumptions: ${quote.roleEstimates.map((role) => `${role.people} ${role.roleKey} × ${role.hoursEach}h × ${role.hourlyRate.toFixed(2)} ${quote.currency}`).join('; ')}.`
+        : null,
       quote.assumptions.length
         ? `Assumptions: ${quote.assumptions.join(' ')}`
         : null,

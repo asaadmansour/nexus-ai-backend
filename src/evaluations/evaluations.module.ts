@@ -69,6 +69,10 @@ const queueProcessors = areQueuesEnabled()
     },
     ...queueProcessors,
   ],
-  exports: [EvaluationsService, SUBMISSION_EVALUATION_DISPATCHER],
+  exports: [
+    EvaluationsService,
+    ImplementationEvaluationSandboxService,
+    SUBMISSION_EVALUATION_DISPATCHER,
+  ],
 })
 export class EvaluationsModule {}

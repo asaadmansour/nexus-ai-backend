@@ -7,6 +7,7 @@ import {
   Patch,
   Query,
   Request,
+  Sse,
   UseGuards,
 } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
@@ -17,6 +18,11 @@ import type { AuthenticatedRequest } from 'src/common/interfaces/jwt-payload.int
 @UseGuards(AuthGuard)
 export class NotificationsController {
   constructor(private readonly notificationsService: NotificationsService) {}
+
+  @Sse('stream')
+  stream(@Request() req: AuthenticatedRequest) {
+    return this.notificationsService.stream(req.user.sub);
+  }
 
   @Get()
   async getNotifications(
@@ -38,6 +44,13 @@ export class NotificationsController {
     };
   }
 
+  @Patch('read-all')
+  async markAllAsRead(@Request() req: AuthenticatedRequest) {
+    const userId = req.user.sub;
+    const data = await this.notificationsService.markAllAsRead(userId);
+    return { status: 'success', data };
+  }
+
   @Patch(':id/read')
   async markAsRead(
     @Param('id') id: string,
@@ -45,13 +58,6 @@ export class NotificationsController {
   ) {
     const userId = req.user.sub;
     const data = await this.notificationsService.markAsRead(id, userId);
-    return { status: 'success', data };
-  }
-
-  @Patch('read-all')
-  async markAllAsRead(@Request() req: AuthenticatedRequest) {
-    const userId = req.user.sub;
-    const data = await this.notificationsService.markAllAsRead(userId);
     return { status: 'success', data };
   }
 }

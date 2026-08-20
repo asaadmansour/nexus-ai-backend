@@ -13,6 +13,9 @@ const dto: EvaluatePlanningSubmissionDto = {
       description: 'Provide a diagram',
       mandatory: true,
       requiresUrl: true,
+      applicability: 'required',
+      allowNotApplicable: false,
+      rationale: 'Architecture deliverable required for this project',
     },
   ],
   submission: {

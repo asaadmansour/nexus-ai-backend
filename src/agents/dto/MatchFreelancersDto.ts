@@ -65,6 +65,30 @@ export class MatchCandidateInputDto {
   @IsOptional()
   @IsInt()
   activeProjectCount?: number | null;
+
+  @IsOptional()
+  @IsNumber()
+  performanceScore?: number | null;
+
+  @IsOptional()
+  @IsNumber()
+  approvalRate?: number | null;
+
+  @IsOptional()
+  @IsNumber()
+  onTimeRate?: number | null;
+
+  @IsOptional()
+  @IsInt()
+  missedDeadlines?: number | null;
+
+  @IsOptional()
+  @IsInt()
+  projectRemovals?: number | null;
+
+  @IsOptional()
+  @IsArray()
+  riskFlags?: Record<string, unknown>[];
 }
 
 export class MatchFreelancersDto {

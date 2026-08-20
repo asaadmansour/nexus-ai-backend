@@ -23,6 +23,7 @@ import { AssessmentGenerationProcessor } from './jobs/assessment-generation.proc
 import { CvExtractionProcessor } from './jobs/cv-extraction.processor';
 import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
 import { areQueuesEnabled } from 'src/queues/queue-runtime';
+import { FreelancerPerformanceEvent } from './entities/freelancer-performance-event.entity';
 
 const queueProcessors = areQueuesEnabled()
   ? [
@@ -48,6 +49,7 @@ const queueProcessors = areQueuesEnabled()
       FreelancerProfileEmbedding,
       FreelancerSkillScore,
       FreelancerVerificationEvent,
+      FreelancerPerformanceEvent,
     ]),
   ],
   controllers: [

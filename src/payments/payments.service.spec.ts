@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { Project } from 'src/projects/entities/project.entity';
@@ -83,6 +84,7 @@ describe('PaymentsService', () => {
           useFactory: repositoryMock,
         },
         { provide: StripeService, useValue: {} },
+        { provide: DataSource, useValue: { transaction: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn() } },
         { provide: MatchingService, useValue: {} },
       ],
@@ -147,5 +149,41 @@ describe('PaymentsService', () => {
       },
     ]);
     expect(result.data.accountId).toBeNull();
+  });
+
+  it('includes principal-reviewer allocation and governance releases in earnings', async () => {
+    freelancerProfilesRepository.findOne.mockResolvedValue({
+      id: 'reviewer-profile',
+      userId: 'reviewer-user',
+      stripeAccountId: null,
+      stripeOnboardingStatus: 'not_started',
+    });
+    tasksRepository.find.mockResolvedValue([]);
+    submissionsRepository.find.mockResolvedValue([]);
+    roleAssignmentsRepository.find.mockResolvedValue([
+      {
+        id: 'governance-assignment',
+        phase: 'governance',
+        budgetAmount: '120.00',
+        currency: 'EGP',
+      },
+    ]);
+    planningSubmissionsRepository.find.mockResolvedValue([]);
+    releaseRequestsRepository.find.mockResolvedValue([]);
+    ledgerRepository.find.mockResolvedValue([
+      { amount: '120.00', currency: 'EGP' },
+    ]);
+
+    const result = await service.getFreelancerAccount('reviewer-user');
+
+    expect(result.data.earnings.currencies).toEqual([
+      {
+        currency: 'EGP',
+        allocatedAmount: '120.00',
+        approvedAmount: '120.00',
+        pendingReleaseAmount: '0.00',
+        releasedAmount: '120.00',
+      },
+    ]);
   });
 });

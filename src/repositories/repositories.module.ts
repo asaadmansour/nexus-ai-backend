@@ -9,6 +9,7 @@ import {
   RepositoryCollaboratorsController,
 } from './repositories.controller';
 import { RepositoriesService } from './repositories.service';
+import { RepositoryAutomationService } from './repository-automation.service';
 
 @Module({
   imports: [ProjectsModule, FreelancersModule, NotificationsModule],
@@ -17,7 +18,7 @@ import { RepositoriesService } from './repositories.service';
     RepositoryCollaboratorsController,
     AdminRepositoriesController,
   ],
-  providers: [RepositoriesService, GithubService],
+  providers: [RepositoriesService, GithubService, RepositoryAutomationService],
   exports: [RepositoriesService, GithubService],
 })
 export class RepositoriesModule {}

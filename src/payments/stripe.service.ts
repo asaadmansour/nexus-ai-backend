@@ -77,6 +77,13 @@ export class StripeService {
     });
   }
 
+  createTransfer(
+    params: Stripe.TransferCreateParams,
+    options?: Stripe.RequestOptions,
+  ) {
+    return this.stripe.transfers.create(params, options);
+  }
+
   constructWebhookEvent(payload: Buffer | string, signature: string) {
     const webhookSecret = this.configService.get<string>(
       'STRIPE_WEBHOOK_SECRET',

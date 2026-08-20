@@ -43,6 +43,16 @@ export class User {
   @Column({ name: 'is_email_verified', type: 'boolean', default: false })
   isEmailVerified!: boolean;
 
+  @Column({ name: 'is_phone_verified', type: 'boolean', default: false })
+  isPhoneVerified!: boolean;
+
+  @Column({
+    name: 'phone_verified_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  phoneVerifiedAt!: Date | null;
+
   @Column({ name: 'is_id_verified', type: 'boolean', default: false })
   isIdVerified!: boolean;
 
