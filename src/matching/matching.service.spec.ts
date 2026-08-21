@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException } from '@nestjs/common';
 import {
   assertTaskMatchingRunInvariant,
   MatchingService,
+  requiresReviewerCandidateSelection,
 } from './matching.service';
 
 describe('MatchingService task assignment invariants', () => {
@@ -47,6 +48,94 @@ describe('MatchingService task assignment invariants', () => {
         task,
       ),
     ).not.toThrow();
+  });
+
+  it('keeps principal-reviewer matching automatic but routes every other role through reviewer selection', () => {
+    expect(requiresReviewerCandidateSelection('principal_reviewer')).toBe(
+      false,
+    );
+    expect(requiresReviewerCandidateSelection('architect')).toBe(true);
+    expect(requiresReviewerCandidateSelection('ui_ux')).toBe(true);
+    expect(requiresReviewerCandidateSelection('frontend')).toBe(true);
+  });
+
+  it('limits a principal reviewer to the top three candidates', async () => {
+    const inviteNextCandidate = jest.fn();
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      runRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'run-a',
+          targetRoleKey: 'architect',
+          status: 'completed',
+        }),
+      },
+      candidateRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'candidate-four',
+          matchingRunId: 'run-a',
+          freelancerProfileId: 'profile-four',
+          rank: 4,
+        }),
+      },
+      inviteNextCandidate,
+    }) as MatchingService;
+
+    await expect(
+      service.reviewRunWithInvitation(
+        'run-a',
+        { decision: 'approved', selectedCandidateId: 'candidate-four' },
+        'reviewer-a',
+      ),
+    ).rejects.toThrow(BadRequestException);
+    expect(inviteNextCandidate).not.toHaveBeenCalled();
+  });
+
+  it('sends the selected top-three candidate through the invitation flow', async () => {
+    const invitation = {
+      id: 'invitation-a',
+      candidateId: 'candidate-two',
+      status: 'pending',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      respondedAt: null,
+      responseReason: null,
+    };
+    const inviteNextCandidate = jest.fn().mockResolvedValue(invitation);
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      runRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'run-a',
+          targetRoleKey: 'ui_ux',
+          status: 'completed',
+        }),
+      },
+      candidateRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'candidate-two',
+          matchingRunId: 'run-a',
+          freelancerProfileId: 'profile-two',
+          rank: 2,
+        }),
+      },
+      inviteNextCandidate,
+    }) as MatchingService;
+
+    const result = await service.reviewRunWithInvitation(
+      'run-a',
+      { decision: 'approved', selectedCandidateId: 'candidate-two' },
+      'reviewer-a',
+    );
+
+    expect(inviteNextCandidate).toHaveBeenCalledWith(
+      'run-a',
+      'candidate-two',
+      'reviewer-a',
+    );
+    expect(result).toMatchObject({
+      runId: 'run-a',
+      status: 'reviewed',
+      assignment: null,
+      invitation: { id: 'invitation-a', status: 'pending' },
+    });
   });
 
   it('recovers materialized tasks when matching never created a run', async () => {

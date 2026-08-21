@@ -82,6 +82,17 @@ export class ReviewerController {
     };
   }
 
+  @Get('matching-runs/:id')
+  async matchingRun(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.reviewer.getMatchingRun(id, user.sub),
+    };
+  }
+
   @Get('projects/:projectId/submissions')
   async submissions(
     @Param('projectId', ParseUUIDPipe) projectId: string,

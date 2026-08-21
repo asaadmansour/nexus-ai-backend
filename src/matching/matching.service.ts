@@ -56,6 +56,7 @@ import {
 const PLANNING_ROLES = ['architect', 'ui_ux'];
 const INVITATION_TTL_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_LIMIT = 10;
+const REVIEWER_SHORTLIST_LIMIT = 3;
 
 // Sensible default required-skills per planning role, used when the admin does
 // not pass explicit `filters.skills`. Lets the architect and ui_ux runs rank
@@ -144,6 +145,12 @@ export function assertTaskMatchingRunInvariant(
       'The matching run must complete before a task can be assigned',
     );
   }
+}
+
+export function requiresReviewerCandidateSelection(
+  targetRoleKey: string | null,
+) {
+  return targetRoleKey !== PRINCIPAL_REVIEWER_ROLE;
 }
 
 @Injectable()
@@ -279,6 +286,9 @@ export class MatchingService {
     const roles = dto.roles?.length
       ? Array.from(new Set(dto.roles))
       : [...PLANNING_ROLES];
+    if (roles.some(requiresReviewerCandidateSelection)) {
+      await this.assertPrincipalReviewerAssigned(projectId);
+    }
 
     const brief = await this.briefRepo.findOne({ where: { projectId } });
     const candidatePools = new Map(
@@ -349,7 +359,12 @@ export class MatchingService {
         });
 
         const candidateCount = await this.completeRun(run, ai);
-        const invitation = await this.inviteNextCandidate(run.id);
+        const requiresReviewerSelection = requiresReviewerCandidateSelection(
+          run.targetRoleKey,
+        );
+        const invitation = requiresReviewerSelection
+          ? null
+          : await this.inviteNextCandidate(run.id);
         runResults.push({
           id: run.id,
           targetType: 'planning_role',
@@ -357,6 +372,7 @@ export class MatchingService {
           status: 'completed',
           candidateCount,
           summary: ai.summary,
+          selectionRequired: requiresReviewerSelection,
           invitationId: invitation?.id ?? null,
         });
       } catch (error) {
@@ -371,14 +387,22 @@ export class MatchingService {
       }
     }
 
-    if (
-      runResults.some(
-        (result) => result.status === 'failed' || result.invitationId == null,
-      )
-    ) {
+    const staffingFailed = runResults.some(
+      (result) =>
+        result.status === 'failed' ||
+        Number(result.candidateCount ?? 0) === 0 ||
+        (result.targetRoleKey === PRINCIPAL_REVIEWER_ROLE &&
+          result.invitationId == null),
+    );
+    if (staffingFailed) {
       await this.markStaffingBlocked(
         projectId,
-        'One or more planning roles could not be invited automatically.',
+        'One or more planning roles could not produce an eligible shortlist.',
+      );
+    } else if (runResults.some((result) => result.selectionRequired === true)) {
+      await this.markAwaitingReviewerSelection(
+        project,
+        runResults.filter((result) => result.selectionRequired === true),
       );
     }
 
@@ -500,6 +524,7 @@ export class MatchingService {
       );
     }
     this.assertProjectFullyFunded(project);
+    await this.assertPrincipalReviewerAssigned(projectId);
 
     await this.recoverStaleImplementationRuns(projectId);
     const tasks = await this.resolveMatchableTasks(projectId, dto);
@@ -637,7 +662,9 @@ export class MatchingService {
         });
 
         const candidateCount = await this.completeRun(run, ai);
-        const invitation = await this.inviteNextCandidate(run.id);
+        await this.taskRepo.update(task.id, {
+          assignmentStatus: 'awaiting_reviewer_selection',
+        });
         runResults.push({
           id: run.id,
           targetType: 'task',
@@ -647,7 +674,8 @@ export class MatchingService {
           status: 'completed',
           candidateCount,
           summary: ai.summary,
-          invitationId: invitation?.id ?? null,
+          selectionRequired: true,
+          invitationId: null,
         });
       } catch (error) {
         runResults.push({
@@ -662,15 +690,17 @@ export class MatchingService {
         });
       }
     }
-    if (
-      runResults.some(
-        (result) => result.status === 'failed' || result.invitationId == null,
-      )
-    ) {
+    const staffingFailed = runResults.some(
+      (result) =>
+        result.status === 'failed' || Number(result.candidateCount ?? 0) === 0,
+    );
+    if (staffingFailed) {
       await this.markStaffingBlocked(
         input.project.id,
-        'One or more implementation tasks could not be invited automatically.',
+        'One or more implementation tasks could not produce an eligible shortlist.',
       );
+    } else if (runResults.length > 0) {
+      await this.markAwaitingReviewerSelection(input.project, runResults);
     }
     return runResults;
   }
@@ -986,8 +1016,12 @@ export class MatchingService {
       take: query.limit,
     });
 
-    const counts = await this.getCandidateCounts(runs.map((run) => run.id));
-    const selected = await this.getSelectedCandidateIds(runs.map((r) => r.id));
+    const runIds = runs.map((run) => run.id);
+    const [counts, selected, invitations] = await Promise.all([
+      this.getCandidateCounts(runIds),
+      this.getSelectedCandidateIds(runIds),
+      this.getLatestInvitations(runIds),
+    ]);
 
     const data = runs.map((run) => ({
       id: run.id,
@@ -1000,6 +1034,7 @@ export class MatchingService {
       summary: run.summary,
       candidateCount: counts.get(run.id) ?? 0,
       selectedCandidateId: selected.get(run.id) ?? null,
+      invitation: invitations.get(run.id) ?? null,
       reviewedBy: run.reviewedBy,
       reviewedAt: run.reviewedAt,
       startedAt: run.startedAt,
@@ -1028,8 +1063,12 @@ export class MatchingService {
       relations: ['project'],
     });
 
-    const counts = await this.getCandidateCounts(runs.map((run) => run.id));
-    const selected = await this.getSelectedCandidateIds(runs.map((r) => r.id));
+    const runIds = runs.map((run) => run.id);
+    const [counts, selected, invitations] = await Promise.all([
+      this.getCandidateCounts(runIds),
+      this.getSelectedCandidateIds(runIds),
+      this.getLatestInvitations(runIds),
+    ]);
 
     const data = runs.map((run) => ({
       id: run.id,
@@ -1043,6 +1082,7 @@ export class MatchingService {
       summary: run.summary,
       candidateCount: counts.get(run.id) ?? 0,
       selectedCandidateId: selected.get(run.id) ?? null,
+      invitation: invitations.get(run.id) ?? null,
       reviewedAt: run.reviewedAt,
       startedAt: run.startedAt,
       completedAt: run.completedAt,
@@ -1054,18 +1094,24 @@ export class MatchingService {
   async getRun(runId: string) {
     const run = await this.runRepo.findOne({
       where: { id: runId },
-      relations: ['project'],
+      relations: ['project', 'targetTask', 'targetTask.dependencies'],
     });
     if (!run) throw new NotFoundException('Matching run not found');
 
-    const candidates = await this.candidateRepo.find({
-      where: { matchingRunId: runId },
-      order: { rank: 'ASC' },
-      relations: ['freelancerProfile', 'freelancerProfile.user'],
-    });
+    const [candidates, invitation] = await Promise.all([
+      this.candidateRepo.find({
+        where: { matchingRunId: runId },
+        order: { rank: 'ASC' },
+        relations: ['freelancerProfile', 'freelancerProfile.user'],
+      }),
+      this.invitationRepo.findOne({
+        where: { matchingRunId: runId },
+        order: { createdAt: 'DESC' },
+      }),
+    ]);
     const selectedCandidate =
       candidates.find((candidate) =>
-        ['selected', 'assigned'].includes(candidate.status),
+        ['selected', 'invited', 'assigned'].includes(candidate.status),
       ) ?? null;
 
     return {
@@ -1076,12 +1122,31 @@ export class MatchingService {
       targetRoleKey: run.targetRoleKey,
       targetTaskId: run.targetTaskId,
       taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
+      task: run.targetTask
+        ? {
+            id: run.targetTask.id,
+            title: run.targetTask.title,
+            description: run.targetTask.description,
+            roleKey: run.targetTask.roleKey,
+            requiredSkills: run.targetTask.requiredSkills ?? [],
+            startsAt: run.targetTask.startsAt,
+            dueAt: run.targetTask.dueAt,
+            dependencies: (run.targetTask.dependencies ?? []).map(
+              (dependency) => ({
+                dependsOnTaskId: dependency.dependsOnTaskId,
+                type: dependency.dependencyType,
+                notes: dependency.notes,
+              }),
+            ),
+          }
+        : null,
       status: run.status,
       filters: run.filters,
       inputSnapshot: run.inputSnapshot,
       summary: run.summary,
       candidateCount: candidates.length,
       selectedCandidateId: selectedCandidate?.id ?? null,
+      invitation: invitation ? this.buildInvitationSummary(invitation) : null,
       error: run.error,
       reviewedBy: run.reviewedBy,
       reviewedAt: run.reviewedAt,
@@ -1243,6 +1308,76 @@ export class MatchingService {
             freelancerProfileId: result.assignment.freelancerProfileId,
           }
         : null,
+    };
+  }
+
+  async reviewRunWithInvitation(
+    runId: string,
+    dto: ReviewRunDto,
+    reviewerUserId: string,
+  ) {
+    if (dto.decision !== 'approved') {
+      return this.reviewRun(
+        runId,
+        { ...dto, createAssignment: false },
+        reviewerUserId,
+      );
+    }
+    if (!dto.selectedCandidateId) {
+      throw new BadRequestException(
+        'selectedCandidateId is required to approve a matching run',
+      );
+    }
+    if (dto.createAssignment) {
+      throw new BadRequestException(
+        'Reviewer selections must use the invitation flow',
+      );
+    }
+
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) throw new NotFoundException('Matching run not found');
+    if (run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE) {
+      throw new BadRequestException(
+        'Principal-reviewer staffing is automatic and cannot review itself',
+      );
+    }
+    if (!['completed', 'reviewed'].includes(run.status)) {
+      throw new ConflictException(
+        'Candidate selection is available only after matching completes',
+      );
+    }
+
+    const candidate = await this.candidateRepo.findOne({
+      where: {
+        id: dto.selectedCandidateId,
+        matchingRunId: run.id,
+      },
+    });
+    if (!candidate?.freelancerProfileId) {
+      throw new NotFoundException('Selected candidate not found for this run');
+    }
+    if (candidate.rank < 1 || candidate.rank > REVIEWER_SHORTLIST_LIMIT) {
+      throw new BadRequestException(
+        `The principal reviewer can choose only from the top ${REVIEWER_SHORTLIST_LIMIT} candidates`,
+      );
+    }
+
+    const invitation = await this.inviteNextCandidate(
+      run.id,
+      candidate.id,
+      reviewerUserId,
+    );
+    if (!invitation) {
+      throw new ConflictException(
+        'The selected freelancer is no longer eligible. Refresh the shortlist and choose another candidate.',
+      );
+    }
+
+    return {
+      runId: run.id,
+      status: 'reviewed',
+      assignment: null,
+      invitation: this.buildInvitationSummary(invitation),
     };
   }
 
@@ -2082,30 +2217,55 @@ export class MatchingService {
       : [];
   }
 
-  private async inviteNextCandidate(runId: string) {
+  private async inviteNextCandidate(
+    runId: string,
+    preferredCandidateId?: string,
+    selectedBy?: string,
+  ) {
     const run = await this.runRepo.findOne({
       where: { id: runId },
       relations: ['project', 'targetTask'],
     });
     if (!run || !['completed', 'reviewed'].includes(run.status)) return null;
+    const roleKey = run.targetRoleKey ?? 'implementation';
     const existing = await this.invitationRepo.findOne({
       where: {
         projectId: run.projectId,
         taskId: run.targetTaskId ?? IsNull(),
-        roleKey: run.targetRoleKey!,
+        roleKey,
         status: In(['pending', 'accepting']),
       },
     });
-    if (existing) return existing;
+    if (existing) {
+      if (
+        preferredCandidateId &&
+        existing.candidateId !== preferredCandidateId
+      ) {
+        throw new ConflictException(
+          'Another candidate already has an active invitation for this role',
+        );
+      }
+      return existing;
+    }
 
-    const candidates = await this.candidateRepo.find({
+    let candidates = await this.candidateRepo.find({
       where: {
         matchingRunId: run.id,
-        status: In(['recommended', 'shortlisted']),
+        status: In(['recommended', 'shortlisted', 'selected']),
       },
       relations: ['freelancerProfile', 'freelancerProfile.user'],
       order: { rank: 'ASC' },
     });
+    if (preferredCandidateId) {
+      candidates = candidates.filter(
+        (candidate) => candidate.id === preferredCandidateId,
+      );
+      if (!candidates.length) {
+        throw new ConflictException(
+          'The selected candidate is no longer available in this shortlist',
+        );
+      }
+    }
     const candidateIds = candidates
       .map((entry) => entry.freelancerProfileId)
       .filter((id): id is string => Boolean(id));
@@ -2189,6 +2349,7 @@ export class MatchingService {
     let candidate: MatchingCandidate | null = null;
     for (const option of candidates) {
       if (!option.freelancerProfile?.isAvailable) continue;
+      if (!option.freelancerProfile.githubUsername?.trim()) continue;
       if (
         !option.freelancerProfileId ||
         unavailableProfileIds.has(option.freelancerProfileId)
@@ -2222,6 +2383,11 @@ export class MatchingService {
       break;
     }
     if (!candidate?.freelancerProfile) {
+      if (preferredCandidateId) {
+        throw new ConflictException(
+          'The selected freelancer is unavailable or already assigned to this project',
+        );
+      }
       await this.markStaffingBlocked(
         run.projectId,
         `No eligible candidate remains for ${run.targetRoleKey ?? 'this assignment'}.`,
@@ -2234,56 +2400,89 @@ export class MatchingService {
       : run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE
         ? 'governance'
         : 'planning';
-    const invitation = await this.invitationRepo.save(
-      this.invitationRepo.create({
+    const invitation = await this.dataSource.transaction(async (manager) => {
+      const created = await manager.save(
+        ProjectInvitation,
+        manager.create(ProjectInvitation, {
+          projectId: run.projectId,
+          taskId: run.targetTaskId,
+          freelancerProfileId: candidate.freelancerProfileId!,
+          matchingRunId: run.id,
+          candidateId: candidate.id,
+          phase,
+          roleKey,
+          status: 'pending',
+          rankSnapshot: candidate.rank,
+          scoreSnapshot: {
+            score: Number(candidate.score),
+            scoreBreakdown: candidate.scoreBreakdown,
+            rationale: candidate.rationale,
+          },
+          expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
+          respondedAt: null,
+          responseReason: null,
+        }),
+      );
+      candidate.status = 'invited';
+      if (selectedBy) {
+        await manager
+          .getRepository(MatchingCandidate)
+          .createQueryBuilder()
+          .update(MatchingCandidate)
+          .set({
+            status: 'skipped',
+            rejectionReason:
+              'The principal reviewer selected a lower-ranked candidate',
+          })
+          .where('matching_run_id = :runId', { runId: run.id })
+          .andWhere('rank < :selectedRank', { selectedRank: candidate.rank })
+          .andWhere('status IN (:...statuses)', {
+            statuses: ['recommended', 'shortlisted'],
+          })
+          .execute();
+        candidate.selectedBy = selectedBy;
+        candidate.selectedAt = new Date();
+        run.reviewedBy = selectedBy;
+        run.reviewedAt = new Date();
+        run.status = 'reviewed';
+        await manager.save(MatchingRun, run);
+      }
+      await manager.save(MatchingCandidate, candidate);
+      if (run.targetTaskId) {
+        await manager.update(ProjectTask, run.targetTaskId, {
+          assignmentStatus: 'invitation_pending',
+        });
+      }
+      await manager.update(Project, run.projectId, {
+        automationStatus:
+          phase === 'governance'
+            ? 'awaiting_principal_reviewer'
+            : phase === 'planning'
+              ? 'awaiting_planning_team'
+              : 'awaiting_implementation_team',
+      });
+      return created;
+    });
+    await this.notificationsService
+      .createNotification({
+        userId: candidate.freelancerProfile.userId,
         projectId: run.projectId,
         taskId: run.targetTaskId,
-        freelancerProfileId: candidate.freelancerProfileId!,
-        matchingRunId: run.id,
-        candidateId: candidate.id,
-        phase,
-        roleKey: run.targetRoleKey ?? 'implementation',
-        status: 'pending',
-        rankSnapshot: candidate.rank,
-        scoreSnapshot: {
-          score: Number(candidate.score),
-          scoreBreakdown: candidate.scoreBreakdown,
-          rationale: candidate.rationale,
+        type: 'project_invitation',
+        title: 'Project invitation',
+        body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within two hours.`,
+        actionUrl: '/invitations',
+        metadata: {
+          invitationId: invitation.id,
+          expiresAt: invitation.expiresAt.toISOString(),
+          phase,
         },
-        expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
-        respondedAt: null,
-        responseReason: null,
-      }),
-    );
-    candidate.status = 'invited';
-    await this.candidateRepo.save(candidate);
-    if (run.targetTaskId) {
-      await this.taskRepo.update(run.targetTaskId, {
-        assignmentStatus: 'invitation_pending',
-      });
-    }
-    await this.projectRepo.update(run.projectId, {
-      automationStatus:
-        phase === 'governance'
-          ? 'awaiting_principal_reviewer'
-          : phase === 'planning'
-            ? 'awaiting_planning_team'
-            : 'awaiting_implementation_team',
-    });
-    await this.notificationsService.createNotification({
-      userId: candidate.freelancerProfile.userId,
-      projectId: run.projectId,
-      taskId: run.targetTaskId,
-      type: 'project_invitation',
-      title: 'Project invitation',
-      body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within two hours.`,
-      actionUrl: '/invitations',
-      metadata: {
-        invitationId: invitation.id,
-        expiresAt: invitation.expiresAt.toISOString(),
-        phase,
-      },
-    });
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `Invitation ${invitation.id} persisted but its notification failed: ${this.safeErrorMessage(error)}`,
+        ),
+      );
     return invitation;
   }
 
@@ -2396,13 +2595,62 @@ export class MatchingService {
     body: string,
     actorUserId?: string,
   ) {
-    await this.notificationsService.createNotification({
-      userId: project.customerId,
-      projectId: project.id,
-      type: 'staffing_update',
-      title,
-      body,
-      actionUrl: `/projects/${project.id}/team`,
+    await this.notificationsService
+      .createNotification({
+        userId: project.customerId,
+        projectId: project.id,
+        type: 'staffing_update',
+        title,
+        body,
+        actionUrl: `/projects/${project.id}/team`,
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `Customer staffing notification failed for ${project.id}: ${this.safeErrorMessage(error)}`,
+        ),
+      );
+    const reviewer = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId: project.id,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress']),
+        },
+        relations: ['freelancerProfile'],
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Could not resolve the principal reviewer for ${project.id}: ${this.safeErrorMessage(error)}`,
+        );
+        return null;
+      });
+    const reviewerUserId = reviewer?.freelancerProfile?.userId;
+    if (reviewerUserId && reviewerUserId !== actorUserId) {
+      await this.notificationsService
+        .createNotification({
+          userId: reviewerUserId,
+          projectId: project.id,
+          type: 'reviewer_attention',
+          title,
+          body,
+          actionUrl: `/reviewer/projects/${project.id}`,
+        })
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `Reviewer staffing notification failed for ${project.id}: ${this.safeErrorMessage(error)}`,
+          ),
+        );
+    }
+  }
+
+  private async markAwaitingReviewerSelection(
+    project: Project,
+    runs: Record<string, unknown>[],
+  ) {
+    await this.projectRepo.update(project.id, {
+      automationStatus: 'awaiting_reviewer_selection',
     });
     const reviewer = await this.dataSource
       .getRepository(ProjectRoleAssignment)
@@ -2414,18 +2662,47 @@ export class MatchingService {
           status: In(['accepted', 'in_progress']),
         },
         relations: ['freelancerProfile'],
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Could not resolve shortlist reviewer for ${project.id}: ${this.safeErrorMessage(error)}`,
+        );
+        return null;
       });
     const reviewerUserId = reviewer?.freelancerProfile?.userId;
-    if (reviewerUserId && reviewerUserId !== actorUserId) {
-      await this.notificationsService.createNotification({
+    if (!reviewerUserId) return;
+
+    const labels = runs
+      .map((run) => {
+        const taskTitle =
+          typeof run.taskTitle === 'string'
+            ? run.taskTitle
+            : 'implementation task';
+        const roleKey =
+          typeof run.targetRoleKey === 'string' ? run.targetRoleKey : 'role';
+        return run.targetType === 'task'
+          ? taskTitle
+          : this.businessRoleLabel(roleKey);
+      })
+      .slice(0, 4);
+    const suffix = runs.length > labels.length ? ' and more' : '';
+    await this.notificationsService
+      .createNotification({
         userId: reviewerUserId,
         projectId: project.id,
         type: 'reviewer_attention',
-        title,
-        body,
+        title: 'Candidate shortlists ready',
+        body: `Choose one of the top three candidates for ${labels.join(', ')}${suffix}. The selected freelancer will receive a two-hour invitation.`,
         actionUrl: `/reviewer/projects/${project.id}`,
-      });
-    }
+        metadata: {
+          matchingRunIds: runs.map((run) => run.id),
+        },
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `Shortlist notification failed for ${project.id}: ${this.safeErrorMessage(error)}`,
+        ),
+      );
   }
 
   private async markStaffingBlocked(projectId: string, reason: string) {
@@ -2834,7 +3111,8 @@ export class MatchingService {
       .leftJoinAndSelect('p.user', 'u')
       .where('p.verificationStatus = :approved', { approved: 'approved' })
       .andWhere('p.deletedAt IS NULL')
-      .andWhere('p.isAvailable = true');
+      .andWhere('p.isAvailable = true')
+      .andWhere("NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL");
 
     if (filters?.minAvailabilityHours != null) {
       qb.andWhere('COALESCE(p.availabilityHoursPerWeek, 0) >= :minAvail', {
@@ -3319,6 +3597,25 @@ export class MatchingService {
     return project;
   }
 
+  private async assertPrincipalReviewerAssigned(projectId: string) {
+    const assignment = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress']),
+        },
+        select: { id: true },
+      });
+    if (!assignment) {
+      throw new ConflictException(
+        'A principal reviewer must accept the project before team matching can start',
+      );
+    }
+  }
+
   private async getCandidateCounts(runIds: string[]) {
     const counts = new Map<string, number>();
     if (!runIds.length) return counts;
@@ -3343,11 +3640,45 @@ export class MatchingService {
       where: runIds.map((runId) => ({ matchingRunId: runId })),
     });
     for (const row of rows) {
-      if (row.status === 'selected' || row.status === 'assigned') {
+      if (
+        row.status === 'selected' ||
+        row.status === 'invited' ||
+        row.status === 'assigned'
+      ) {
         selected.set(row.matchingRunId, row.id);
       }
     }
     return selected;
+  }
+
+  private async getLatestInvitations(runIds: string[]) {
+    const invitations = new Map<
+      string,
+      ReturnType<typeof this.buildInvitationSummary>
+    >();
+    if (!runIds.length) return invitations;
+
+    const rows = await this.invitationRepo.find({
+      where: { matchingRunId: In(runIds) },
+      order: { createdAt: 'DESC' },
+    });
+    for (const row of rows) {
+      if (row.matchingRunId && !invitations.has(row.matchingRunId)) {
+        invitations.set(row.matchingRunId, this.buildInvitationSummary(row));
+      }
+    }
+    return invitations;
+  }
+
+  private buildInvitationSummary(invitation: ProjectInvitation) {
+    return {
+      id: invitation.id,
+      candidateId: invitation.candidateId,
+      status: invitation.status,
+      expiresAt: invitation.expiresAt,
+      respondedAt: invitation.respondedAt,
+      responseReason: invitation.responseReason,
+    };
   }
 
   private buildFreelancerSummary(profile: FreelancerProfile | null) {
@@ -3357,11 +3688,38 @@ export class MatchingService {
       name: this.fullName(profile.user),
       email: profile.user?.email ?? null,
       headline: profile.headline,
+      bio: profile.bio,
+      summary: profile.summary,
+      githubUsername: profile.githubUsername,
+      cvUrl: profile.cvUrl,
       hourlyRate:
         profile.hourlyRate != null ? Number(profile.hourlyRate) : null,
+      recommendedHourlyRate:
+        profile.recommendedHourlyRate != null
+          ? Number(profile.recommendedHourlyRate)
+          : null,
       availabilityHours: profile.availabilityHoursPerWeek,
       yearsExperience: profile.yearsExperience,
       topSkills: profile.skills ?? [],
+      assessmentScore:
+        profile.assessmentScore != null
+          ? Number(profile.assessmentScore)
+          : null,
+      interviewScore:
+        profile.interviewScore != null ? Number(profile.interviewScore) : null,
+      performanceScore: Number(profile.performanceScore ?? 100),
+      avgRating: profile.avgRating != null ? Number(profile.avgRating) : null,
+      ratingsCount: profile.ratingsCount,
+      completedTasks: profile.completedTasks,
+      approvedSubmissions: profile.approvedSubmissions,
+      rejectedSubmissions: profile.rejectedSubmissions,
+      onTimeDeliveries: profile.onTimeDeliveries,
+      lateDeliveries: profile.lateDeliveries,
+      missedDeadlines: profile.missedDeadlines,
+      projectRemovals: profile.projectRemovals,
+      riskFlags: profile.riskFlags ?? [],
+      isAvailable: profile.isAvailable,
+      verificationStatus: profile.verificationStatus,
     };
   }
 
@@ -3372,6 +3730,10 @@ export class MatchingService {
 
   private errorMessage(error: unknown) {
     if (error instanceof ForbiddenException) throw error;
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private safeErrorMessage(error: unknown) {
     return error instanceof Error ? error.message : String(error);
   }
 }

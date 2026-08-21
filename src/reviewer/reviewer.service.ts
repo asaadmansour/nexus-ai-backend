@@ -27,6 +27,7 @@ import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assign
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { ProjectHandoff } from 'src/projects/entities/project-handoff.entity';
+import { Project } from 'src/projects/entities/project.entity';
 
 const ACTIVE_REVIEWER_STATUSES = ['accepted', 'in_progress', 'completed'];
 
@@ -67,7 +68,7 @@ export class ReviewerService {
 
   async overview(projectId: string, userId: string) {
     await this.assertReviewer(projectId, userId);
-    const project = await this.dataSource.getRepository('projects').findOne({
+    const project = await this.dataSource.getRepository(Project).findOne({
       where: { id: projectId },
     });
     if (!project) throw new NotFoundException('Project not found');
@@ -86,9 +87,23 @@ export class ReviewerService {
       this.dataSource.getRepository(ProjectPlan).count({
         where: { projectId, status: 'generated', isCurrent: true },
       }),
-      this.dataSource.getRepository(MatchingRun).count({
-        where: { projectId, status: In(['completed', 'reviewed']) },
-      }),
+      this.dataSource
+        .getRepository(MatchingRun)
+        .createQueryBuilder('run')
+        .where('run.project_id = :projectId', { projectId })
+        .andWhere('run.status = :completed', { completed: 'completed' })
+        .andWhere(
+          '(run.target_role_key IS NULL OR run.target_role_key != :principalReviewer)',
+          { principalReviewer: 'principal_reviewer' },
+        )
+        .andWhere(
+          `NOT EXISTS (
+            SELECT 1 FROM project_invitations invitation
+            WHERE invitation.matching_run_id = run.id
+              AND invitation.status IN ('pending', 'accepting', 'accepted')
+          )`,
+        )
+        .getCount(),
       this.dataSource.getRepository(ProjectSubmission).count({
         where: { projectId, status: In(['submitted', 'under_review']) },
       }),
@@ -152,6 +167,20 @@ export class ReviewerService {
   async listMatchingRuns(projectId: string, userId: string) {
     await this.assertReviewer(projectId, userId);
     return this.matching.listRuns(projectId, { page: 1, limit: 100 });
+  }
+
+  async getMatchingRun(id: string, userId: string) {
+    const item = await this.dataSource.getRepository(MatchingRun).findOne({
+      where: { id },
+      select: { id: true, projectId: true },
+    });
+    if (!item) throw new NotFoundException('Matching run not found');
+    await this.assertReviewer(item.projectId, userId);
+    const run = await this.matching.getRun(id);
+    return {
+      ...run,
+      candidates: run.candidates.slice(0, 3),
+    };
   }
 
   async listSubmissions(projectId: string, userId: string) {
@@ -250,7 +279,7 @@ export class ReviewerService {
       .findOne({ where: { id }, select: { id: true, projectId: true } });
     if (!item) throw new NotFoundException('Matching run not found');
     await this.assertReviewer(item.projectId, userId);
-    return this.matching.reviewRun(id, dto, userId);
+    return this.matching.reviewRunWithInvitation(id, dto, userId);
   }
 
   async reviewSubmission(id: string, dto: ReviewSubmissionDto, userId: string) {
