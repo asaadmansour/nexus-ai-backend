@@ -57,4 +57,40 @@ describe('environment validation', () => {
       }),
     ).toThrow('JWT_SECRET must be a non-placeholder value');
   });
+
+  it('does not require Twilio when phone verification is disabled', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        NODE_ENV: 'production',
+        EVALUATION_SANDBOX_MODE: 'kubernetes',
+        STRIPE_WEBHOOK_SECRET: 'webhook-secret',
+        SMTP_USER: 'smtp-user',
+        SMTP_PASSWORD: 'smtp-password',
+        PHONE_VERIFICATION_REQUIRED: 'false',
+        TWILIO_ACCOUNT_SID: undefined,
+        TWILIO_AUTH_TOKEN: undefined,
+        TWILIO_VERIFY_SERVICE_SID: undefined,
+      }),
+    ).not.toThrow();
+  });
+
+  it('requires Twilio when phone verification is explicitly enabled', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        NODE_ENV: 'production',
+        EVALUATION_SANDBOX_MODE: 'kubernetes',
+        STRIPE_WEBHOOK_SECRET: 'webhook-secret',
+        SMTP_USER: 'smtp-user',
+        SMTP_PASSWORD: 'smtp-password',
+        PHONE_VERIFICATION_REQUIRED: 'true',
+        TWILIO_ACCOUNT_SID: undefined,
+        TWILIO_AUTH_TOKEN: undefined,
+        TWILIO_VERIFY_SERVICE_SID: undefined,
+      }),
+    ).toThrow(
+      'TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SERVICE_SID',
+    );
+  });
 });

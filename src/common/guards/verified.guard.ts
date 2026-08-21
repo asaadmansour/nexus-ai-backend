@@ -42,8 +42,7 @@ export class VerifiedGuard implements CanActivate {
     }
 
     const phoneRequired =
-      (process.env.PHONE_VERIFICATION_REQUIRED ??
-        (process.env.NODE_ENV === 'production' ? 'true' : 'false')) === 'true';
+      (process.env.PHONE_VERIFICATION_REQUIRED ?? 'false') === 'true';
     if (phoneRequired && !currentUser.isPhoneVerified) {
       throw new ForbiddenException(
         'You must verify your phone number to perform this action',

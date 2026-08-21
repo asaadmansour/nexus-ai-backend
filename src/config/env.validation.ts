@@ -25,7 +25,7 @@ export function validateEnv(config: Env): Env {
       'GITHUB_OWNER',
       'GITHUB_WEBHOOK_SECRET',
     );
-    if ((config.PHONE_VERIFICATION_REQUIRED ?? 'true') === 'true') {
+    if ((config.PHONE_VERIFICATION_REQUIRED ?? 'false') === 'true') {
       requiredKeys.push(
         'TWILIO_ACCOUNT_SID',
         'TWILIO_AUTH_TOKEN',
@@ -54,7 +54,7 @@ export function validateEnv(config: Env): Env {
         'EVALUATION_SANDBOX_MODE must be kubernetes in production',
       );
     }
-    const placeholderKeys = [
+    const secretKeys = [
       'GOOGLE_CLIENT_SECRET',
       'CLOUDINARY_API_SECRET',
       'STRIPE_SECRET_KEY',
@@ -62,8 +62,13 @@ export function validateEnv(config: Env): Env {
       'SMTP_PASSWORD',
       'GITHUB_TOKEN',
       'GITHUB_WEBHOOK_SECRET',
-      'TWILIO_AUTH_TOKEN',
-    ].filter((key) => config[key] === 'change-me');
+    ];
+    if ((config.PHONE_VERIFICATION_REQUIRED ?? 'false') === 'true') {
+      secretKeys.push('TWILIO_AUTH_TOKEN');
+    }
+    const placeholderKeys = secretKeys.filter(
+      (key) => config[key] === 'change-me',
+    );
     if (placeholderKeys.length > 0) {
       throw new Error(
         `Production secrets still use placeholder values: ${placeholderKeys.join(', ')}`,
