@@ -39,4 +39,53 @@ describe('AiService requirements guard', () => {
     expect(result.missingFields).toEqual([]);
     expect(result.completionPercentage).toBe(100);
   });
+
+  it('guides an uncertain client instead of accepting idk', async () => {
+    const result = await service.validateBrief({
+      briefText: 'idk',
+      currentBrief: {
+        pendingField: 'scopeDetails',
+        knownFields: {
+          mainGoal: 'Display the business information',
+          targetUsers: ['customers'],
+          coreFeatures: ['Display service information'],
+          platforms: ['website'],
+          solutionType: 'landing page',
+          integrations: 'none',
+          adminNeeds: 'no admin dashboard',
+          deliverables: ['working website'],
+        },
+      },
+    });
+
+    expect(result.isComplete).toBe(false);
+    expect(result.missingFields).toContain('scopeDetails');
+    expect(result.suggestedReply).toContain('page or screen count');
+    expect(result.extractedFields?.scopeDetails).toBeUndefined();
+  });
+
+  it('does not use the customer budget minimum as the project price', async () => {
+    const result = await service.estimateProjectQuote({
+      project: {
+        budgetMin: 275_000,
+        budgetMax: 300_000,
+        currency: 'EGP',
+      },
+      brief: {
+        mainGoal: 'Present the business and collect customer enquiries',
+        targetUsers: ['potential customers'],
+        coreFeatures: ['Show service information', 'Contact enquiry form'],
+        platforms: ['website'],
+        solutionType: 'single landing page',
+        scopeDetails: 'one page with five static sections',
+        integrations: 'none',
+        adminNeeds: 'no admin dashboard',
+        deliverables: ['working website', 'source code', 'live link'],
+        requirementProfile: { complexity: 'trivial' },
+      },
+    });
+
+    expect(result.amount).toBe(result.recommendedMinimum);
+    expect(result.amount).toBeLessThan(275_000);
+  });
 });

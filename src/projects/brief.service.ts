@@ -18,6 +18,15 @@ import {
   createProjectBudgetAllocation,
   platformFeeAllocation,
 } from 'src/planning/project-budget-allocation';
+import {
+  getBriefScopeGaps,
+  isBriefScopeFieldComplete,
+  isRequirementsGuidanceRequest,
+  isUncertainAnswer,
+  PRICEABLE_BRIEF_FIELDS,
+  removeNonAnswerItems,
+  type PriceableBriefField,
+} from './brief-scope-readiness';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
@@ -27,17 +36,7 @@ const MAX_AI_REVISION_MESSAGES = 3;
 const INITIAL_GREETING_MESSAGE =
   'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
 const PROJECT_DERIVED_FIELDS = new Set(['projectType', 'budget', 'deadline']);
-const USER_REQUIRED_BRIEF_FIELDS = [
-  'mainGoal',
-  'targetUsers',
-  'coreFeatures',
-  'platforms',
-  'solutionType',
-  'scopeDetails',
-  'integrations',
-  'adminNeeds',
-  'deliverables',
-];
+const USER_REQUIRED_BRIEF_FIELDS = [...PRICEABLE_BRIEF_FIELDS];
 const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_MATCHING,
   ProjectStatus.PLANNING_ASSIGNED,
@@ -456,12 +455,15 @@ export class BriefService {
       .reverse()
       .find((message) => message.senderType === 'agent');
 
+    const guidanceField = nextQuestionField
+      ? this.resolveGuidanceField(latestMessage, nextQuestionField)
+      : null;
     if (
+      guidanceField &&
       nextQuestionField &&
-      this.isAdviceRequest(latestMessage) &&
       missingFields.includes(nextQuestionField)
     ) {
-      return this.buildAdviceReply(nextQuestionField);
+      return this.buildAdviceReply(guidanceField);
     }
 
     if (
@@ -933,11 +935,18 @@ export class BriefService {
     pendingField: string | null,
   ): ExtractedBriefFields {
     const sanitized: ExtractedBriefFields = {};
-    const adviceRequest = this.isAdviceRequest(latestMessage);
+    const guidanceRequest = isRequirementsGuidanceRequest(latestMessage);
 
     for (const [field, value] of Object.entries(fields ?? {})) {
-      if (adviceRequest && this.isUncertainPlaceholder(value)) continue;
-      sanitized[field] = value;
+      const cleanedValue = removeNonAnswerItems(value);
+      if (!this.hasFieldValue(cleanedValue)) continue;
+      if (
+        USER_REQUIRED_BRIEF_FIELDS.includes(field as PriceableBriefField) &&
+        !isBriefScopeFieldComplete(field as PriceableBriefField, cleanedValue)
+      ) {
+        continue;
+      }
+      sanitized[field] = cleanedValue;
     }
 
     const normalizedMessage = this.normalizeComparableText(latestMessage);
@@ -954,7 +963,7 @@ export class BriefService {
     }
 
     if (
-      !adviceRequest &&
+      !guidanceRequest &&
       pendingField &&
       !this.hasFieldValue(sanitized[pendingField])
     ) {
@@ -962,7 +971,16 @@ export class BriefService {
         pendingField,
         latestMessage,
       );
-      if (deterministicValue !== null) {
+      if (
+        deterministicValue !== null &&
+        (!USER_REQUIRED_BRIEF_FIELDS.includes(
+          pendingField as PriceableBriefField,
+        ) ||
+          isBriefScopeFieldComplete(
+            pendingField as PriceableBriefField,
+            deterministicValue,
+          ))
+      ) {
         sanitized[pendingField] = deterministicValue;
       }
     }
@@ -1053,56 +1071,6 @@ export class BriefService {
     }
     if (typeof value === 'object') return Object.keys(value).length > 0;
     return true;
-  }
-
-  private isAdviceRequest(value: string) {
-    const normalized = this.normalizeComparableText(value);
-    const adviceMarkers = [
-      'what do you suggest',
-      'what do u suggest',
-      'what should',
-      'what would you',
-      'what would u',
-      'recommend',
-      'suggest',
-      'help me choose',
-      'what do you mean',
-      'explain',
-    ];
-    const uncertaintyMarkers = [
-      'idk',
-      'i do not know',
-      "i don't know",
-      'i dont know',
-      'not sure',
-      'notsure',
-    ];
-
-    return (
-      adviceMarkers.some((marker) => normalized.includes(marker)) &&
-      (normalized.includes('?') ||
-        uncertaintyMarkers.some((marker) => normalized.includes(marker)))
-    );
-  }
-
-  private isUncertainPlaceholder(value: unknown): boolean {
-    if (typeof value !== 'string') return false;
-    const normalized = this.normalizeComparableText(
-      value.replace(/[_-]+/g, ' '),
-    );
-
-    return [
-      'idk',
-      'i do not know',
-      "i don't know",
-      'i dont know',
-      'not sure',
-      'not sure yet',
-      'notsure',
-      'no preference',
-      'no preferences',
-      'not decided',
-    ].includes(normalized);
   }
 
   private buildCurrentBriefContext(
@@ -1623,9 +1591,7 @@ export class BriefService {
   }
 
   private getVisibleMissingFieldsFromFields(fields: ExtractedBriefFields) {
-    return USER_REQUIRED_BRIEF_FIELDS.filter(
-      (field) => !this.hasFieldValue(fields[field]),
-    );
+    return getBriefScopeGaps(fields);
   }
 
   private getCompletionPercentageFromMissingFields(missingFields: string[]) {
@@ -1778,6 +1744,12 @@ export class BriefService {
 
   private buildAdviceReply(nextField: string) {
     const replies: Record<string, string> = {
+      mainGoal:
+        'No problem. The goal is the business result, not the technology. Common choices are getting leads, selling online, reducing manual work, or helping customers self-serve. Which result matters most for this first version?',
+      targetUsers:
+        'No problem. Think about the people who will actually use it: customers, staff, admins, or a specific group. Who completes the main action in the first version?',
+      coreFeatures:
+        'No problem. Features are the actions the product must support. For a small website that might be reading key information and sending an enquiry; for an app it could include accounts, booking, or checkout. What is the single most important action a user must complete?',
       deliverables:
         'No problem. For this project, I’d usually suggest a working website or app, an admin dashboard if you need to manage orders or stock, payment setup, deployment, and a short handover guide so you can run it without technical help. Does that feel right, or would you remove anything?',
       suggestedTeamSize:
@@ -1802,5 +1774,38 @@ export class BriefService {
       replies[nextField] ??
       'No problem. I can help you choose. Tell me what matters most here: speed, budget, quality, or ease of use, and I’ll suggest the best option for this project.'
     );
+  }
+
+  private resolveGuidanceField(
+    latestMessage: string,
+    pendingField: string,
+  ): string | null {
+    const normalized = this.normalizeComparableText(latestMessage);
+    const markersByField: Record<string, string[]> = {
+      mainGoal: ['goal', 'outcome', 'business result'],
+      targetUsers: ['target user', 'audience', 'who will use'],
+      coreFeatures: ['feature', 'functionality', 'must have'],
+      platforms: ['platform', 'website or app', 'web or mobile'],
+      solutionType: ['solution type', 'landing page', 'web app'],
+      scopeDetails: ['scope', 'page count', 'screen count', 'user journey'],
+      integrations: ['integration', 'third party', 'external service'],
+      adminNeeds: ['admin', 'dashboard', 'back office'],
+      deliverables: ['deliverable', 'handover', 'receive at the end'],
+    };
+
+    for (const [field, markers] of Object.entries(markersByField)) {
+      if (markers.some((marker) => normalized.includes(marker))) return field;
+    }
+
+    if (
+      isUncertainAnswer(latestMessage) ||
+      /\b(?:suggest|recommend|help me (?:choose|decide)|what do you mean|explain this)\b/.test(
+        normalized,
+      )
+    ) {
+      return pendingField;
+    }
+
+    return null;
   }
 }

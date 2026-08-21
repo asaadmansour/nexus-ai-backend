@@ -1,5 +1,10 @@
 import { createHash } from 'crypto';
-import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { BriefDto } from './dto/BriefDto';
 import { EstimateProjectQuoteDto } from './dto/EstimateProjectQuoteDto';
@@ -19,6 +24,10 @@ import {
   IMPLEMENTATION_QUALITY_CRITERIA,
   IMPLEMENTATION_SUBMISSION_TYPES,
 } from 'src/evaluations/submission-quality-criteria';
+import {
+  getBriefScopeGaps,
+  isRequirementsGuidanceRequest,
+} from 'src/projects/brief-scope-readiness';
 
 type ValidateBriefResult = {
   projectId: string | null;
@@ -449,6 +458,12 @@ export class AiService {
   async estimateProjectQuote(
     dto: EstimateProjectQuoteDto,
   ): Promise<ProjectQuoteResult> {
+    const scopeGaps = getBriefScopeGaps(this.asRecord(dto.brief));
+    if (scopeGaps.length > 0) {
+      throw new BadRequestException(
+        `A reliable quote needs more confirmed scope: ${scopeGaps.join(', ')}.`,
+      );
+    }
     if (this.isMockMode()) {
       return this.getFallbackProjectQuoteResult(dto, 'local_mock');
     }
@@ -674,7 +689,7 @@ export class AiService {
     source: ProjectQuoteResult['source'],
   ): ProjectQuoteResult {
     const fallback = this.getFallbackProjectQuoteResult(dto, source);
-    const { min, max } = this.getQuoteBudgetRange(dto.project);
+    const { max } = this.getQuoteBudgetRange(dto.project);
     const requiredRoles = [
       'principal_reviewer',
       'architect',
@@ -720,17 +735,10 @@ export class AiService {
     const laborMinimum = this.roundMoney(
       roleEstimates.reduce((sum, role) => sum + role.subtotal, 0) / 0.9,
     );
-    const requestedAmount = this.toNumber(result.amount);
     const recommendedMinimum = this.roundMoney(
-      Math.max(
-        laborMinimum,
-        this.toNumber(result.recommendedMinimum) ?? 0,
-        fallback.recommendedMinimum,
-      ),
+      Math.max(laborMinimum, fallback.recommendedMinimum),
     );
-    const amount = this.roundMoney(
-      Math.max(min, requestedAmount ?? 0, recommendedMinimum),
-    );
+    const amount = recommendedMinimum;
     const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
 
     return {
@@ -764,7 +772,7 @@ export class AiService {
     dto: EstimateProjectQuoteDto,
     source: ProjectQuoteResult['source'],
   ): ProjectQuoteResult {
-    const { min, max } = this.getQuoteBudgetRange(dto.project);
+    const { max } = this.getQuoteBudgetRange(dto.project);
     const brief = this.asRecord(dto.brief);
     const project = this.asRecord(dto.project);
     const requirementProfile = this.asRecord(brief.requirementProfile);
@@ -832,7 +840,7 @@ export class AiService {
       0,
     );
     const recommendedMinimum = this.roundMoney(laborTotal / 0.9);
-    const amount = this.roundMoney(Math.max(min, recommendedMinimum));
+    const amount = recommendedMinimum;
     const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
 
     return {
@@ -2261,41 +2269,7 @@ export class AiService {
       ...this.getKnownBriefFields(dto),
       ...this.extractFieldsFromText(dto.briefText),
     };
-    const missingFields: string[] = [];
-
-    if (!this.hasFieldValue(extractedFields.mainGoal)) {
-      missingFields.push('mainGoal');
-    }
-
-    if (!this.hasFieldValue(extractedFields.targetUsers)) {
-      missingFields.push('targetUsers');
-    }
-
-    if (!this.hasFieldValue(extractedFields.coreFeatures)) {
-      missingFields.push('coreFeatures');
-    }
-
-    if (
-      !this.hasFieldValue(extractedFields.platforms) &&
-      !this.hasFieldValue(extractedFields.constraintsPreferences)
-    ) {
-      missingFields.push('platforms');
-    }
-
-    for (const field of [
-      'solutionType',
-      'scopeDetails',
-      'integrations',
-      'adminNeeds',
-    ]) {
-      if (!this.hasFieldValue(extractedFields[field])) {
-        missingFields.push(field);
-      }
-    }
-
-    if (!this.hasFieldValue(extractedFields.deliverables)) {
-      missingFields.push('deliverables');
-    }
+    const missingFields = getBriefScopeGaps(extractedFields);
 
     const requiredCount = 9;
     const completedCount = requiredCount - missingFields.length;
@@ -2308,7 +2282,9 @@ export class AiService {
       missingFields,
       suggestedReply:
         missingFields.length > 0
-          ? this.getNextMockBriefQuestion(missingFields[0])
+          ? isRequirementsGuidanceRequest(dto.briefText)
+            ? this.getMockBriefGuidance(missingFields[0])
+            : this.getNextMockBriefQuestion(missingFields[0])
           : 'The brief has enough detail to continue.',
       extractedFields,
       nextQuestionField: missingFields[0] ?? null,
@@ -2524,6 +2500,30 @@ export class AiService {
     };
 
     return questions[field] ?? 'Please add more detail for the project brief.';
+  }
+
+  private getMockBriefGuidance(field: string) {
+    const guidance: Record<string, string> = {
+      mainGoal:
+        'No problem. The goal is the business result, not the technology. Common choices are getting leads, selling online, reducing manual work, or helping customers self-serve. Which result matters most for this first version?',
+      targetUsers:
+        'No problem. Think about the people who will actually use it: customers, staff, admins, or a specific group. Who completes the main action in the first version?',
+      coreFeatures:
+        'No problem. Features are the actions the product must support. For a small website that might be reading key information and sending an enquiry; for an app it could include accounts, booking, or checkout. What is the single most important action a user must complete?',
+      platforms:
+        'No problem. A responsive website opens in a browser and works on phones; a mobile app is installed from iOS or Android stores and costs more to build. I usually recommend starting with a responsive website unless app-only features are essential. Which should we use?',
+      solutionType:
+        'No problem. A landing page is one focused page, a marketing website has several information pages, a web app supports accounts or workflows, and a mobile app is installed on iOS or Android. Which smallest option meets your first-release goal?',
+      scopeDetails:
+        'No problem. A rough answer is enough: either give a page or screen count, or describe the path from opening the product to completing the main goal. For example, “one page with five sections” or “signup, browse, checkout, confirmation.” What is closest?',
+      integrations:
+        'No problem. Integrations are outside services such as payments, maps, email or SMS, social login, analytics, or an existing business system. I recommend “none” for the first version unless one is essential. Which do you need?',
+      adminNeeds:
+        'No problem. An admin area is a private screen your team uses to manage content, users, orders, bookings, or reports. If nobody needs to manage changing data, I recommend no admin dashboard. Should we include one, and what would it manage?',
+      deliverables:
+        'No problem. Deliverables are what you receive at handover. I recommend the working product, source code, deployment or a live link, and a short setup guide. Should I use that package?',
+    };
+    return guidance[field] ?? this.getNextMockBriefQuestion(field);
   }
 
   private isClearlyUnrelatedRequirementsQuestion(value: string) {
