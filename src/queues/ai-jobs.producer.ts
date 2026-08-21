@@ -73,6 +73,8 @@ export class AiJobsProducer {
     );
 
     try {
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(
         this.planningSubmissionEvaluationQueue,
         QUEUES.PLANNING_SUBMISSION_EVALUATION,
@@ -86,9 +88,6 @@ export class AiJobsProducer {
         },
         { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
       );
-
-      agentJob.queueJobId = agentJob.id;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -132,6 +131,8 @@ export class AiJobsProducer {
     const data = this.readSubmissionEvaluationData(agentJob);
 
     try {
+      agentJob.queueJobId = queueJobId;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(
         this.submissionEvaluationQueue,
         QUEUES.SUBMISSION_EVALUATION,
@@ -139,9 +140,6 @@ export class AiJobsProducer {
         ...AI_QUEUE_JOB_OPTIONS,
         jobId: queueJobId,
       });
-
-      agentJob.queueJobId = queueJobId;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -156,6 +154,60 @@ export class AiJobsProducer {
     );
     const queueJob = await queue.getJob(agentJob.queueJobId ?? agentJob.id);
     return queueJob ? queueJob.getState() : 'missing';
+  }
+
+  async ensureProjectPlanGenerationDispatch(agentJob: AgentJob) {
+    const queue = this.getQueue(
+      this.projectPlanGenerationQueue,
+      QUEUES.PROJECT_PLAN_GENERATION,
+    );
+    const currentJobId = agentJob.queueJobId ?? agentJob.id;
+    const currentJob = await queue.getJob(currentJobId);
+    const currentState = currentJob ? await currentJob.getState() : 'missing';
+    if (
+      [
+        'waiting',
+        'active',
+        'delayed',
+        'prioritized',
+        'waiting-children',
+      ].includes(currentState)
+    ) {
+      return {
+        recovered: false,
+        state: currentState,
+        queueJobId: currentJobId,
+      };
+    }
+
+    const recoveryCount = this.getRecoveryCount(agentJob.output) + 1;
+    const queueJobId = `${agentJob.id}-dispatch-${recoveryCount}`;
+    const data = this.readProjectPlanGenerationData(agentJob);
+    agentJob.status = 'queued';
+    agentJob.queueJobId = queueJobId;
+    agentJob.attempts = 0;
+    agentJob.error = null;
+    agentJob.failedAt = null;
+    agentJob.lockedAt = null;
+    agentJob.output = {
+      ...(agentJob.output ?? {}),
+      recoveryCount,
+      recoveredAt: new Date().toISOString(),
+      recoveredFromQueueState: currentState,
+    };
+    await this.agentJobRepository.save(agentJob);
+    try {
+      // Persist the dispatch identity first. A fast worker can now safely mark
+      // this row running/completed without a later producer save reverting it.
+      await queue.add(JOBS.GENERATE_PROJECT_PLAN, data, {
+        ...AI_QUEUE_JOB_OPTIONS,
+        jobId: queueJobId,
+      });
+    } catch (error) {
+      await this.markQueueAddFailed(agentJob, error);
+      throw error;
+    }
+    return { recovered: true, state: 'waiting', queueJobId };
   }
 
   async emitCvUploaded(input: {
@@ -181,6 +233,8 @@ export class AiJobsProducer {
     );
 
     try {
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(this.cvExtractionQueue, QUEUES.CV_EXTRACTION).add(
         JOBS.EXTRACT_CV,
         {
@@ -191,9 +245,6 @@ export class AiJobsProducer {
         },
         { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
       );
-
-      agentJob.queueJobId = agentJob.id;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -228,6 +279,8 @@ export class AiJobsProducer {
     );
 
     try {
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(
         this.assessmentGenerationQueue,
         QUEUES.ASSESSMENT_GENERATION,
@@ -243,9 +296,6 @@ export class AiJobsProducer {
         },
         { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
       );
-
-      agentJob.queueJobId = agentJob.id;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -279,6 +329,8 @@ export class AiJobsProducer {
     );
 
     try {
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(
         this.profileEmbeddingQueue,
         QUEUES.PROFILE_EMBEDDING,
@@ -293,9 +345,6 @@ export class AiJobsProducer {
         },
         { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
       );
-
-      agentJob.queueJobId = agentJob.id;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -329,6 +378,10 @@ export class AiJobsProducer {
     );
 
     try {
+      // Link the durable row before publishing. Otherwise a fast worker can
+      // complete and then be overwritten back to queued by the producer.
+      agentJob.queueJobId = agentJob.id;
+      await this.agentJobRepository.save(agentJob);
       await this.getQueue(
         this.projectPlanGenerationQueue,
         QUEUES.PROJECT_PLAN_GENERATION,
@@ -344,9 +397,6 @@ export class AiJobsProducer {
         },
         { ...AI_QUEUE_JOB_OPTIONS, jobId: agentJob.id },
       );
-
-      agentJob.queueJobId = agentJob.id;
-      await this.agentJobRepository.save(agentJob);
       return agentJob;
     } catch (error) {
       await this.markQueueAddFailed(agentJob, error);
@@ -390,6 +440,43 @@ export class AiJobsProducer {
       projectId,
       taskId,
     };
+  }
+
+  private readProjectPlanGenerationData(
+    agentJob: AgentJob,
+  ): ProjectPlanGenerationJobData {
+    const input = agentJob.input;
+    const projectId = input?.projectId;
+    const architectureSubmissionId = input?.architectureSubmissionId ?? null;
+    const uiuxSubmissionId = input?.uiuxSubmissionId ?? null;
+    const requestedBy = input?.requestedBy ?? null;
+    const notes = input?.notes ?? null;
+    if (
+      agentJob.jobType !== AI_JOB_TYPES.PROJECT_PLAN_GENERATION ||
+      typeof projectId !== 'string' ||
+      (architectureSubmissionId !== null &&
+        typeof architectureSubmissionId !== 'string') ||
+      (uiuxSubmissionId !== null && typeof uiuxSubmissionId !== 'string') ||
+      (requestedBy !== null && typeof requestedBy !== 'string') ||
+      (notes !== null && typeof notes !== 'string')
+    ) {
+      throw new ServiceUnavailableException(
+        'The saved project-plan job payload cannot be recovered',
+      );
+    }
+    return {
+      agentJobId: agentJob.id,
+      projectId,
+      architectureSubmissionId,
+      uiuxSubmissionId,
+      requestedBy,
+      notes,
+    };
+  }
+
+  private getRecoveryCount(output: Record<string, unknown> | null) {
+    const value = output?.recoveryCount;
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
   }
 
   private async markQueueAddFailed(agentJob: AgentJob, error: unknown) {

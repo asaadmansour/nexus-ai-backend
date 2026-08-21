@@ -22,7 +22,7 @@ import {
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
 const MAX_BRIEF_TEXT_LENGTH = 5000;
-const INITIAL_AGENT_MESSAGE_VERSION = 2;
+const INITIAL_AGENT_MESSAGE_VERSION = 3;
 const MAX_AI_REVISION_MESSAGES = 3;
 const INITIAL_GREETING_MESSAGE =
   'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
@@ -32,6 +32,10 @@ const USER_REQUIRED_BRIEF_FIELDS = [
   'targetUsers',
   'coreFeatures',
   'platforms',
+  'solutionType',
+  'scopeDetails',
+  'integrations',
+  'adminNeeds',
   'deliverables',
 ];
 const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
@@ -209,13 +213,8 @@ export class BriefService {
       const savedAgentMessage = await manager.save(BriefMessage, agentMessage);
       const updatedBrief = await manager.save(Brief, brief);
 
-      if (
-        updatedBrief.isComplete &&
-        project.status !== ProjectStatus.BRIEF_COMPLETE
-      ) {
-        project.status = ProjectStatus.BRIEF_COMPLETE;
-        await manager.save(Project, project);
-      }
+      this.invalidateUnfundedQuote(project, updatedBrief.isComplete);
+      await manager.save(Project, project);
 
       return {
         brief: updatedBrief,
@@ -275,13 +274,8 @@ export class BriefService {
     const result = await this.dataSource.transaction(async (manager) => {
       const updatedBrief = await manager.save(Brief, brief);
 
-      if (
-        updatedBrief.isComplete &&
-        project.status !== ProjectStatus.BRIEF_COMPLETE
-      ) {
-        project.status = ProjectStatus.BRIEF_COMPLETE;
-        await manager.save(Project, project);
-      }
+      this.invalidateUnfundedQuote(project, updatedBrief.isComplete);
+      await manager.save(Project, project);
 
       return updatedBrief;
     });
@@ -539,6 +533,10 @@ export class BriefService {
         'website, mobile app',
         'web and mobile',
       ],
+      solutionType: ['single landing page', 'multi-page website', 'actual ios'],
+      scopeDetails: ['page or screen count', 'main user journey'],
+      integrations: ['connect to payments', 'external systems', 'integrations'],
+      adminNeeds: ['private admin area', 'admin dashboard'],
       deliverables: ['final deliverables', 'what final things', 'handed over'],
       constraintsPreferences: [
         'preferences or constraints',
@@ -772,6 +770,40 @@ export class BriefService {
     );
   }
 
+  private invalidateUnfundedQuote(project: Project, briefComplete: boolean) {
+    if (
+      project.quoteStatus === 'accepted' ||
+      Number(project.heldAmount ?? 0) > 0
+    ) {
+      return;
+    }
+
+    project.quotedAmount = null;
+    project.quotedCurrency = null;
+    project.quoteStatus = 'not_ready';
+    project.quoteGeneratedAt = null;
+    project.quoteNotes = briefComplete
+      ? 'Confirm the updated requirements to generate a scope-based quote.'
+      : 'More scope detail is required before a reliable quote can be generated.';
+    project.budgetAllocation = null;
+    project.platformFeeAmount = '0.00';
+    project.automationStatus = briefComplete
+      ? 'awaiting_quote'
+      : 'awaiting_requirements';
+
+    if (briefComplete) {
+      if (
+        [ProjectStatus.DRAFT, ProjectStatus.IN_PROGRESS].includes(
+          project.status,
+        )
+      ) {
+        project.status = ProjectStatus.BRIEF_COMPLETE;
+      }
+    } else if (project.status === ProjectStatus.BRIEF_COMPLETE) {
+      project.status = ProjectStatus.IN_PROGRESS;
+    }
+  }
+
   private extractProjectDefaultFields(project: Project): ExtractedBriefFields {
     const fields: ExtractedBriefFields = {};
     const budget = this.formatProjectBudget(project);
@@ -838,6 +870,10 @@ export class BriefService {
       coreFeatures: requirementProfile.features,
       requirementProfile,
       platforms: brief.platforms ?? knownFields.platforms,
+      solutionType: knownFields.solutionType,
+      scopeDetails: knownFields.scopeDetails,
+      integrations: knownFields.integrations,
+      adminNeeds: knownFields.adminNeeds,
       deliverables: brief.deliverablesText ?? knownFields.deliverables,
       constraintsPreferences:
         brief.constraintsPreferences ?? knownFields.constraintsPreferences,
@@ -904,6 +940,19 @@ export class BriefService {
       sanitized[field] = value;
     }
 
+    const normalizedMessage = this.normalizeComparableText(latestMessage);
+    const websiteOnly =
+      /\b(?:mobile[- ]friendly|responsive|mobile)\s+web(?:site)?\b/.test(
+        normalizedMessage,
+      );
+    const explicitMobileApp =
+      /\b(?:mobile|native|ios|android)\s+app\b|\bflutter\b|\breact native\b|\bapp store\b|\bplay store\b/.test(
+        normalizedMessage,
+      );
+    if (websiteOnly && !explicitMobileApp) {
+      sanitized.platforms = ['website'];
+    }
+
     if (
       !adviceRequest &&
       pendingField &&
@@ -929,6 +978,17 @@ export class BriefService {
 
     if (pendingField === 'platforms') {
       const platforms = new Set<string>();
+
+      const websiteOnly =
+        /\b(?:mobile[- ]friendly|responsive|mobile)\s+web(?:site)?\b/.test(
+          normalized,
+        );
+      const explicitMobileApp =
+        /\b(?:mobile|native|ios|android)\s+app\b|\bflutter\b|\breact native\b|\bapp store\b|\bplay store\b/.test(
+          normalized,
+        );
+
+      if (websiteOnly && !explicitMobileApp) return ['website'];
 
       if (
         /\bboth\b/.test(normalized) ||
@@ -956,6 +1016,10 @@ export class BriefService {
         'mainGoal',
         'targetUsers',
         'coreFeatures',
+        'solutionType',
+        'scopeDetails',
+        'integrations',
+        'adminNeeds',
         'deliverables',
         'constraintsPreferences',
         'clientBackground',
@@ -1168,6 +1232,10 @@ export class BriefService {
       targetUsers: this.toStringList(fields.targetUsers),
       coreFeatures: this.toStringList(fields.coreFeatures),
       platforms: this.toStringList(fields.platforms),
+      solutionType: this.toTextValue(fields.solutionType),
+      scopeDetails: this.toTextValue(fields.scopeDetails),
+      integrations: this.toStringList(fields.integrations),
+      adminNeeds: this.toTextValue(fields.adminNeeds),
     });
 
     brief.nonFunctional = this.mergeJsonSection(brief.nonFunctional, {
@@ -1208,6 +1276,10 @@ export class BriefService {
       targetUsers: brief.targetUsers ?? technical.targetUsers,
       coreFeatures: brief.coreFeatures ?? technical.coreFeatures,
       platforms: brief.platforms ?? technical.platforms,
+      solutionType: technical.solutionType,
+      scopeDetails: technical.scopeDetails,
+      integrations: technical.integrations,
+      adminNeeds: technical.adminNeeds,
       budget: brief.budget ?? nonFunctional.budget,
       deadline: brief.deadlineText ?? nonFunctional.deadline,
       constraintsPreferences:
@@ -1238,6 +1310,8 @@ export class BriefService {
     const mainGoal = this.toTextValue(fields.mainGoal);
     const targetUsers = this.toStringList(fields.targetUsers);
     const coreFeatures = this.toStringList(fields.coreFeatures);
+    const solutionType = this.toTextValue(fields.solutionType);
+    const scopeDetails = this.toTextValue(fields.scopeDetails);
 
     const parts: string[] = [];
 
@@ -1254,6 +1328,8 @@ export class BriefService {
     if (coreFeatures.length > 0) {
       parts.push(`Core features: ${coreFeatures.slice(0, 6).join(', ')}`);
     }
+    if (solutionType) parts.push(`Solution: ${solutionType}`);
+    if (scopeDetails) parts.push(`Scope: ${scopeDetails}`);
 
     const summary = parts.filter(Boolean).join('. ');
     return summary ? this.truncate(summary, MAX_SUMMARY_LENGTH) : null;
@@ -1270,6 +1346,10 @@ export class BriefService {
       ['Target users', this.toStringList(fields.targetUsers).join(', ')],
       ['Core features', this.toStringList(fields.coreFeatures).join(', ')],
       ['Platforms', this.toStringList(fields.platforms).join(', ')],
+      ['Solution type', this.toTextValue(fields.solutionType)],
+      ['Scope details', this.toTextValue(fields.scopeDetails)],
+      ['Integrations', this.toStringList(fields.integrations).join(', ')],
+      ['Admin needs', this.toTextValue(fields.adminNeeds)],
       ['Budget', this.toTextValue(fields.budget)],
       ['Deadline', this.toTextValue(fields.deadline)],
       ['Deliverables', this.toStringList(fields.deliverables).join(', ')],
@@ -1634,6 +1714,10 @@ export class BriefService {
       targetUsers: dto.targetUsers,
       coreFeatures: dto.coreFeatures,
       platforms: dto.platforms,
+      solutionType: dto.solutionType,
+      scopeDetails: dto.scopeDetails,
+      integrations: dto.integrations,
+      adminNeeds: dto.adminNeeds,
       deliverables: dto.deliverables,
       constraintsPreferences: dto.constraintsPreferences,
       clientBackground: dto.clientBackground,
@@ -1664,6 +1748,14 @@ export class BriefService {
         'Great. What are the must-have features you want in the first version?',
       platforms:
         'Makes sense. Where should this run: website, mobile app, both, or something else?',
+      solutionType:
+        'To price this correctly, is this a single landing page, a multi-page website, a web application, or an actual iOS/Android mobile app? A mobile-friendly website still counts as a website.',
+      scopeDetails:
+        'What should the first version contain? A rough page or screen count and the main user journey are enough.',
+      integrations:
+        'Does it connect to payments, maps, email or SMS, social login, analytics, or another system? You can simply say "none".',
+      adminNeeds:
+        'Will your team need a private admin area to manage content, users, orders, or reports? If not, say "no admin dashboard".',
       deliverables:
         'Good. What final deliverables would feel complete to you, like a working website, mobile app, dashboard, source code, setup help, or simply "not sure"?',
       constraintsPreferences:
@@ -1696,6 +1788,14 @@ export class BriefService {
         'You do not need to know this exactly. For a project like this, I’d usually set the minimum around 3 years for core implementation, with stronger senior review for architecture and payments. Should I use 3 years, or keep it open and match by skill scores?',
       platforms:
         'If customers need to order easily, I’d usually start with a responsive website first, then add a mobile app if repeat ordering is important. If you already want both, I can capture website and mobile app. Which direction feels right?',
+      solutionType:
+        'To avoid overpricing, I recommend choosing the smallest product shape that meets the goal. A landing page suits presentation or lead collection; a web app suits accounts and workflows; a mobile app is separate iOS/Android software. Which one describes the first release?',
+      scopeDetails:
+        'A rough estimate is enough. Tell me approximately how many pages or screens you imagine and the main path a user follows from opening the product to completing their goal.',
+      integrations:
+        'If you are unsure, start with none unless the first release must take payments, use maps, send SMS/email, support social login, or connect to an existing system. Which of those are essential?',
+      adminNeeds:
+        'An admin dashboard is useful only if your team must regularly manage content, users, orders, or reports. Should the first version include that, or can those updates be handled manually?',
     };
 
     return (

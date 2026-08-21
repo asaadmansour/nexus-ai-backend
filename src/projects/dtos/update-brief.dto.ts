@@ -28,6 +28,26 @@ export class UpdateBriefDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(160)
+  solutionType?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1500)
+  scopeDetails?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  integrations?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  adminNeeds?: string;
+
+  @IsOptional()
+  @IsString()
   @MaxLength(1000)
   deliverables?: string;
 

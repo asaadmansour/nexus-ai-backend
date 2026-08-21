@@ -143,13 +143,75 @@ export class NotificationsService {
         ? notification.actionUrl
         : `${baseUrl}${notification.actionUrl}`
       : null;
+    const content = this.businessEmailContent(notification);
     await this.emailService.sendTransactionalEmail(
       user.email,
-      notification.title,
+      content.subject,
       {
-        body: notification.body ?? notification.title,
+        body: content.body,
         actionUrl,
+        actionLabel: content.actionLabel,
       },
     );
+  }
+
+  private businessEmailContent(notification: Notification) {
+    const normalizedBody = (notification.body ?? notification.title)
+      .replaceAll('principal_reviewer', 'principal reviewer')
+      .replaceAll('ui_ux', 'UI/UX')
+      .replaceAll('changes_requested', 'changes requested')
+      .replaceAll('_', ' ');
+
+    const templates: Record<
+      string,
+      { subject: string; body?: string; actionLabel?: string }
+    > = {
+      project_invitation: {
+        subject: 'You have a new Nexus AI project invitation',
+        actionLabel: 'Review invitation',
+      },
+      invitation_expired: {
+        subject: 'Your project invitation expired',
+        actionLabel: 'View invitations',
+      },
+      staffing_update: {
+        subject: 'Your project team has an update',
+        actionLabel: 'View project team',
+      },
+      reviewer_attention: {
+        subject: 'A project decision needs your review',
+        actionLabel: 'Open reviewer workspace',
+      },
+      task_assignment: {
+        subject: 'You have a new project task',
+        actionLabel: 'Open task',
+      },
+      repository_access: {
+        subject: 'Your project repository access is ready',
+        actionLabel: 'Open project',
+      },
+      github_action_required: {
+        subject: 'Add your GitHub username to receive project access',
+        actionLabel: 'Update profile',
+      },
+      technical_issue: {
+        subject: 'A project setup step needs attention',
+        body: 'A technical project setup step could not finish automatically. Open the Nexus AI operations view for the exact issue and recovery action.',
+        actionLabel: 'Open project operations',
+      },
+      principal_reviewer_status: {
+        subject: 'Your principal reviewer status changed',
+        actionLabel: 'View reviewer profile',
+      },
+    };
+    const template = templates[notification.type] ?? {
+      subject: notification.title,
+      actionLabel: 'Open Nexus AI',
+    };
+    return {
+      subject: template.subject,
+      body: template.body ?? normalizedBody,
+      actionLabel: template.actionLabel ?? 'Open Nexus AI',
+    };
   }
 }

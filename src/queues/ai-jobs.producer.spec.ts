@@ -1,8 +1,12 @@
 import { Queue } from 'bullmq';
 import { Repository } from 'typeorm';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
+import { AI_JOB_TYPES } from './queue.constants';
 import { AiJobsProducer } from './ai-jobs.producer';
-import { SubmissionEvaluationJobData } from './queue.types';
+import {
+  ProjectPlanGenerationJobData,
+  SubmissionEvaluationJobData,
+} from './queue.types';
 
 describe('AiJobsProducer', () => {
   it('links evaluation jobs to delivery submissions, not planning submissions', async () => {
@@ -53,6 +57,64 @@ describe('AiJobsProducer', () => {
         submissionId: 'delivery-submission-id',
       }),
       expect.objectContaining({ jobId: agentJob.id }),
+    );
+  });
+
+  it('recreates an orphaned project-plan queue dispatch from saved input', async () => {
+    const addJob = jest.fn().mockResolvedValue(undefined);
+    const queue = {
+      getJob: jest.fn().mockResolvedValue(null),
+      add: addJob,
+    } as unknown as Queue<ProjectPlanGenerationJobData>;
+    const agentJob = {
+      id: 'plan-agent-job-id',
+      jobType: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+      status: 'queued',
+      queueJobId: 'missing-queue-job-id',
+      attempts: 1,
+      error: null,
+      output: null,
+      input: {
+        projectId: 'project-id',
+        architectureSubmissionId: 'architecture-id',
+        uiuxSubmissionId: 'uiux-id',
+        requestedBy: 'reviewer-id',
+        notes: 'Generate the approved planning handoff.',
+      },
+    } as AgentJob;
+    const saveAgentJob = jest.fn((job: AgentJob) => Promise.resolve(job));
+    const repository = {
+      save: saveAgentJob,
+    } as unknown as Repository<AgentJob>;
+    const producer = new AiJobsProducer(
+      null,
+      null,
+      null,
+      queue,
+      null,
+      null,
+      repository,
+    );
+
+    const result = await producer.ensureProjectPlanGenerationDispatch(agentJob);
+
+    expect(result).toMatchObject({ recovered: true, state: 'waiting' });
+    expect(addJob).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        agentJobId: agentJob.id,
+        projectId: 'project-id',
+        architectureSubmissionId: 'architecture-id',
+        uiuxSubmissionId: 'uiux-id',
+      }),
+      expect.objectContaining({ jobId: 'plan-agent-job-id-dispatch-1' }),
+    );
+    expect(saveAgentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'queued',
+        queueJobId: 'plan-agent-job-id-dispatch-1',
+        attempts: 0,
+      }),
     );
   });
 });

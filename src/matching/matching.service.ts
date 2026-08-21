@@ -213,7 +213,7 @@ export class MatchingService {
       const project = await this.projectRepo.findOne({
         where: { id: projectId },
       });
-      if (!project || project.status !== ProjectStatus.BRIEF_COMPLETE) return;
+      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) return;
 
       await this.startPlanningRoles(projectId, { roles: missingRoles }, null);
     } catch (error) {
@@ -1252,11 +1252,16 @@ export class MatchingService {
       freelancerProfileId: profile.id,
     };
     if (status) where.status = status;
-    return this.invitationRepo.find({
+    const invitations = await this.invitationRepo.find({
       where,
       relations: ['project', 'task'],
       order: { createdAt: 'DESC' },
     });
+    return invitations.map((invitation) => ({
+      ...invitation,
+      githubUsername: profile.githubUsername,
+      githubReady: Boolean(profile.githubUsername),
+    }));
   }
 
   async respondToInvitation(
@@ -1328,6 +1333,12 @@ export class MatchingService {
       );
       await this.inviteNextCandidate(invitation.matchingRunId!);
       return { id: invitation.id, status: invitation.status };
+    }
+
+    if (!profile.githubUsername?.trim()) {
+      throw new BadRequestException(
+        'Add your GitHub username to your freelancer profile before accepting. Your invitation will remain available until its expiry time.',
+      );
     }
 
     if (!invitation.matchingRun || !invitation.candidate) {
@@ -1665,6 +1676,84 @@ export class MatchingService {
       }
     }
     return { inspected: projects.length, restarted };
+  }
+
+  async recoverPlanningRolesAfterReviewerAcceptance() {
+    const reviewerAssignments = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .find({
+        where: {
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress']),
+        },
+        order: { createdAt: 'ASC' },
+        take: 20,
+      });
+
+    let restarted = 0;
+    for (const assignment of reviewerAssignments) {
+      const project = await this.projectRepo.findOne({
+        where: { id: assignment.projectId },
+        select: { id: true, status: true },
+      });
+      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) {
+        continue;
+      }
+
+      const existingRuns = await this.runRepo.find({
+        where: {
+          projectId: assignment.projectId,
+          targetType: 'planning_role',
+          targetRoleKey: In(PLANNING_ROLES),
+          status: In(['queued', 'running', 'completed', 'reviewed']),
+        },
+        select: { targetRoleKey: true },
+      });
+      const startedRoles = new Set(
+        existingRuns
+          .map((run) => run.targetRoleKey)
+          .filter((role): role is string => Boolean(role)),
+      );
+      if (PLANNING_ROLES.every((role) => startedRoles.has(role))) continue;
+
+      await this.autoStartPlanningRoles(assignment.projectId);
+      restarted += 1;
+    }
+
+    return { inspected: reviewerAssignments.length, restarted };
+  }
+
+  async recoverImplementationTasksWithoutMatchingRuns() {
+    const rows = await this.taskRepo
+      .createQueryBuilder('task')
+      .select('DISTINCT task.project_id', 'projectId')
+      .innerJoin(Project, 'project', 'project.id = task.project_id')
+      .leftJoin(
+        MatchingRun,
+        'run',
+        "run.target_type = 'task' AND run.target_task_id = task.id",
+      )
+      .where('task.assigned_freelancer_profile_id IS NULL')
+      .andWhere('task.status IN (:...taskStatuses)', {
+        taskStatuses: MATCHABLE_TASK_STATUSES,
+      })
+      .andWhere('project.status IN (:...projectStatuses)', {
+        projectStatuses: Array.from(IMPLEMENTATION_MATCH_ALLOWED_STATUSES),
+      })
+      .andWhere('run.id IS NULL')
+      .limit(10)
+      .getRawMany<{ projectId: string }>();
+
+    let restarted = 0;
+    for (const row of rows) {
+      const result = await this.autoStartImplementationTasks(
+        row.projectId,
+        null,
+      );
+      if (result.triggered) restarted += 1;
+    }
+    return { inspected: rows.length, restarted };
   }
 
   async removeTaskAssignee(
@@ -2187,7 +2276,7 @@ export class MatchingService {
       taskId: run.targetTaskId,
       type: 'project_invitation',
       title: 'Project invitation',
-      body: `You are invited as ${invitation.roleKey}. Respond within two hours before the invitation moves to the next match.`,
+      body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within two hours.`,
       actionUrl: '/invitations',
       metadata: {
         invitationId: invitation.id,
@@ -2345,12 +2434,13 @@ export class MatchingService {
         where: { id: projectId },
       });
       if (!project || project.automationStatus === 'staffing_blocked') return;
+      this.logger.error(`Staffing blocked for ${projectId}: ${reason}`);
       project.automationStatus = 'staffing_blocked';
       await this.projectRepo.save(project);
       await this.notifyProjectOwner(
         project,
         'Automatic staffing needs attention',
-        `Automatic matching is retrying this project. Current blocker: ${reason}`,
+        'We could not complete the next team invitation yet. Nexus AI will retry automatically; the project reviewer or operations team can view the exact blocker and intervene if needed.',
       );
     } catch (error) {
       this.logger.error(
@@ -2362,6 +2452,20 @@ export class MatchingService {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private businessRoleLabel(roleKey: string) {
+    const labels: Record<string, string> = {
+      principal_reviewer: 'principal reviewer',
+      ui_ux: 'UI/UX designer',
+      architect: 'solution architect',
+      implementation: 'implementation freelancer',
+      frontend: 'frontend developer',
+      backend: 'backend developer',
+      fullstack: 'full-stack developer',
+      qa: 'quality engineer',
+    };
+    return labels[roleKey] ?? roleKey.replaceAll('_', ' ');
+  }
 
   private async createPlanningAssignment(
     manager: EntityManager,

@@ -32,7 +32,9 @@ export class MatchingAutomationService
     try {
       await this.matchingService.recoverAcceptingInvitations();
       await this.matchingService.expirePendingInvitations();
+      await this.matchingService.recoverPlanningRolesAfterReviewerAcceptance();
       await this.matchingService.recoverBlockedStaffing();
+      await this.matchingService.recoverImplementationTasksWithoutMatchingRuns();
     } catch (error) {
       this.logger.error(
         `Invitation reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,

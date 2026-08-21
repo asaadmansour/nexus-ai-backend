@@ -2079,6 +2079,24 @@ export class AiService {
   async validateBrief(dto: BriefDto): Promise<ValidateBriefResult> {
     const aiServiceUrl = this.configService.get<string>('AI_SERVICE_URL');
 
+    if (this.isClearlyUnrelatedRequirementsQuestion(dto.briefText)) {
+      return {
+        projectId: dto.projectId ?? null,
+        briefId: dto.briefId ?? null,
+        isComplete: false,
+        completionPercentage: 0,
+        missingFields: [],
+        suggestedReply:
+          'I’m here to help define and price your project, so I can’t help with unrelated trivia. Let’s continue with the project scope—what should the first version let its users do?',
+        assistantReply:
+          'I’m here to help define and price your project, so I can’t help with unrelated trivia. Let’s continue with the project scope—what should the first version let its users do?',
+        extractedFields: {},
+        nextQuestionField: null,
+        extractionSource: 'scope_guard',
+        source: this.isMockMode() ? 'local_mock' : 'fastapi',
+      };
+    }
+
     if (this.isMockMode()) {
       return this.getMockValidateBriefResult(dto);
     }
@@ -2264,15 +2282,22 @@ export class AiService {
       missingFields.push('platforms');
     }
 
-    if (!this.hasFieldValue(extractedFields.deadline)) {
-      missingFields.push('deadline');
+    for (const field of [
+      'solutionType',
+      'scopeDetails',
+      'integrations',
+      'adminNeeds',
+    ]) {
+      if (!this.hasFieldValue(extractedFields[field])) {
+        missingFields.push(field);
+      }
     }
 
-    if (!this.hasFieldValue(extractedFields.budget)) {
-      missingFields.push('budget');
+    if (!this.hasFieldValue(extractedFields.deliverables)) {
+      missingFields.push('deliverables');
     }
 
-    const requiredCount = 6;
+    const requiredCount = 9;
     const completedCount = requiredCount - missingFields.length;
 
     return {
@@ -2351,6 +2376,48 @@ export class AiService {
       'built with',
     ]);
     if (platforms.length > 0) fields.platforms = platforms;
+
+    if (
+      /\b(?:mobile[- ]friendly|responsive|mobile)\s+web(?:site)?\b/.test(
+        lowered,
+      ) &&
+      !/\b(?:mobile|native|ios|android)\s+app\b|\bflutter\b|\breact native\b/.test(
+        lowered,
+      )
+    ) {
+      fields.platforms = ['website'];
+    }
+    if (lowered.includes('landing page')) fields.solutionType = 'landing page';
+    else if (lowered.includes('marketing website'))
+      fields.solutionType = 'marketing website';
+    else if (lowered.includes('web app')) fields.solutionType = 'web app';
+    else if (/\b(?:mobile|native|ios|android)\s+app\b/.test(lowered))
+      fields.solutionType = 'mobile app';
+    else if (/\b(?:responsive|mobile[- ]friendly)\s+website\b/.test(lowered))
+      fields.solutionType = 'responsive website';
+
+    const scopeDetails = this.extractAfterMarker(normalized, [
+      'scope is',
+      'pages are',
+      'screens are',
+      'main journey is',
+    ]);
+    if (scopeDetails) fields.scopeDetails = scopeDetails;
+    const integrations = this.extractAfterMarker(normalized, [
+      'integrations are',
+      'integrations',
+      'connects to',
+    ]);
+    if (integrations) fields.integrations = integrations;
+    else if (/\bno integrations?\b/.test(lowered)) fields.integrations = 'none';
+    const adminNeeds = this.extractAfterMarker(normalized, [
+      'admin needs are',
+      'admin dashboard',
+      'admin area',
+    ]);
+    if (adminNeeds) fields.adminNeeds = adminNeeds;
+    else if (/\bno admin(?: dashboard| area)?\b/.test(lowered))
+      fields.adminNeeds = 'no admin dashboard';
 
     const budget =
       this.extractAfterMarker(normalized, ['budget is', 'budget']) ??
@@ -2444,11 +2511,55 @@ export class AiService {
         'What are the core features? List the must-have workflows or screens.',
       platforms:
         'Any tech preferences or platform requirements? If not, say no preference.',
+      solutionType:
+        'Is this a landing page, multi-page website, web application, or a separate iOS/Android mobile app?',
+      scopeDetails:
+        'Roughly how many pages or screens are in the first version, and what is the main user journey?',
+      integrations:
+        'Does it need payments, maps, email/SMS, social login, analytics, or another integration? You can say none.',
+      adminNeeds:
+        'Does your team need a private admin dashboard, or should the first version have no admin area?',
       deadline: 'What timeline or deadline should we plan around?',
       budget: 'What budget or budget range should we use for planning?',
     };
 
     return questions[field] ?? 'Please add more detail for the project brief.';
+  }
+
+  private isClearlyUnrelatedRequirementsQuestion(value: string) {
+    const normalized = value.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!normalized) return false;
+    if (
+      [
+        'project',
+        'website',
+        'web app',
+        'mobile app',
+        'software',
+        'feature',
+        'screen',
+        'page',
+        'user',
+        'design',
+        'build',
+        'price',
+        'cost',
+        'budget',
+        'deadline',
+        'integration',
+        'dashboard',
+      ].some((marker) => normalized.includes(marker))
+    ) {
+      return false;
+    }
+    return [
+      /\b(?:what|which)\s+(?:is|was)\s+the\s+capital\s+of\b/,
+      /\bwho\s+(?:is|was)\s+(?:the\s+)?(?:president|king|queen|prime minister)\b/,
+      /\b(?:weather|temperature|forecast)\s+(?:in|for|today|tomorrow)\b/,
+      /\b(?:football|soccer|basketball|tennis)\s+(?:score|result|standings)\b/,
+      /\b(?:stock|crypto|bitcoin|ethereum)\s+price\b/,
+      /\b(?:tell|write)\s+(?:me\s+)?(?:a\s+)?(?:joke|poem|story|song)\b/,
+    ].some((pattern) => pattern.test(normalized));
   }
 
   private getMockGenerateAssessmentResult(dto: GenerateAssessmentDto) {

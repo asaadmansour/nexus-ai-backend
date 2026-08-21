@@ -81,18 +81,26 @@ export class EmailService {
       );
     }
 
-    const escapedBody = input.body
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>');
+    const escapeHtml = (value: string) =>
+      value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    const escapedSubject = escapeHtml(subject);
+    const escapedBody = escapeHtml(input.body).replace(/\n/g, '<br>');
+    const escapedActionUrl = input.actionUrl
+      ? escapeHtml(input.actionUrl)
+      : null;
+    const escapedActionLabel = escapeHtml(input.actionLabel ?? 'Open Nexus AI');
     const action = input.actionUrl
-      ? `<p><a href="${input.actionUrl}" style="display:inline-block;padding:10px 16px;background:#324933;color:#fff;text-decoration:none;border-radius:6px">${input.actionLabel ?? 'Open Nexus AI'}</a></p>`
+      ? `<p><a href="${escapedActionUrl}" style="display:inline-block;padding:10px 16px;background:#324933;color:#fff;text-decoration:none;border-radius:6px">${escapedActionLabel}</a></p>`
       : '';
     await this.mailerService.sendMail({
       to: email,
       subject,
-      html: `<div style="font-family:Arial,sans-serif;padding:20px;color:#222"><h2>${subject}</h2><p>${escapedBody}</p>${action}</div>`,
+      html: `<div style="font-family:Arial,sans-serif;padding:20px;color:#222"><h2>${escapedSubject}</h2><p>${escapedBody}</p>${action}</div>`,
     });
   }
 }

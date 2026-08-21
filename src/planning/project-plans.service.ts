@@ -281,11 +281,18 @@ export class ProjectPlansService {
       order: { createdAt: 'DESC' },
     });
     if (existingJob) {
+      const dispatch =
+        await this.aiJobsProducer.ensureProjectPlanGenerationDispatch(
+          existingJob,
+        );
       return {
-        queued: false,
-        reason: 'generation_already_queued',
+        queued: dispatch.recovered,
+        reason: dispatch.recovered
+          ? 'orphaned_generation_dispatch_recovered'
+          : 'generation_already_queued',
         agentJobId: existingJob.id,
         queueName: existingJob.queueName,
+        queueState: dispatch.state,
       };
     }
 
@@ -594,7 +601,10 @@ export class ProjectPlansService {
       approvedAt: plan.approvedAt,
     };
 
-    if (dto.status === 'approved' && dto.materialize) {
+    // Approval is the principal-reviewer gate. Once that gate passes there is
+    // no useful intermediate "approved but not materialized" state: create the
+    // tasks and begin matching automatically.
+    if (dto.status === 'approved') {
       response.materialization = await this.materialize(
         planId,
         {},
@@ -602,6 +612,96 @@ export class ProjectPlansService {
       );
     }
     return response;
+  }
+
+  async recoverApprovedUnmaterializedPlans() {
+    const cutoff = new Date(Date.now() - 60_000);
+    const plans = await this.planRepo
+      .createQueryBuilder('plan')
+      .leftJoin(ProjectTask, 'task', 'task.project_plan_id = plan.id')
+      .where('plan.status = :status', { status: 'approved' })
+      .andWhere('plan.is_current = true')
+      .andWhere('plan.approved_at IS NOT NULL')
+      .andWhere('plan.approved_at <= :cutoff', { cutoff })
+      .andWhere('task.id IS NULL')
+      .andWhere('plan.approved_by IS NOT NULL')
+      .orderBy('plan.approved_at', 'ASC')
+      .limit(10)
+      .getMany();
+
+    let recovered = 0;
+    const failures: Array<{ planId: string; error: string }> = [];
+    for (const plan of plans) {
+      try {
+        await this.materialize(plan.id, {}, plan.approvedBy!);
+        recovered += 1;
+      } catch (error) {
+        failures.push({
+          planId: plan.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { inspected: plans.length, recovered, failures };
+  }
+
+  async recoverMissingPlanGenerations() {
+    const projects = await this.projectRepo.find({
+      where: { status: ProjectStatus.PLANNING_REVIEW },
+      order: { updatedAt: 'ASC' },
+      take: 10,
+    });
+    let queued = 0;
+    const failures: Array<{ projectId: string; error: string }> = [];
+
+    for (const project of projects) {
+      const currentPlan = await this.planRepo.findOne({
+        where: { projectId: project.id, isCurrent: true },
+      });
+      if (currentPlan) continue;
+
+      const [architecture, uiux] = await Promise.all([
+        this.submissionRepo.findOne({
+          where: {
+            projectId: project.id,
+            submissionType: 'architecture',
+            status: 'approved',
+          },
+          order: { version: 'DESC' },
+        }),
+        this.submissionRepo.findOne({
+          where: {
+            projectId: project.id,
+            submissionType: 'ui_ux',
+            status: 'approved',
+          },
+          order: { version: 'DESC' },
+        }),
+      ]);
+      const requestedBy = uiux?.reviewedBy ?? architecture?.reviewedBy;
+      if (!architecture || !uiux || !requestedBy) continue;
+
+      try {
+        const result = await this.enqueueAutomaticGeneration(
+          project.id,
+          requestedBy,
+          {
+            architectureSubmissionId: architecture.id,
+            uiuxSubmissionId: uiux.id,
+            notes:
+              'Recovered Scrum plan generation after both planning deliverables were approved.',
+          },
+        );
+        if (result.queued) queued += 1;
+      } catch (error) {
+        failures.push({
+          projectId: project.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return { inspected: projects.length, queued, failures };
   }
 
   // ---------------------------------------------------------------------------
