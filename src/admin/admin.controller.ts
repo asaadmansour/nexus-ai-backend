@@ -22,6 +22,7 @@ import { ReviewAssessmentDto } from './dtos/review-assessment.dto';
 import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
 import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
 import { UpdateFreelancerSkillScoreDto } from './dtos/update-freelancer-skill-score.dto';
+import { ReviewPrincipalReviewerDto } from './dtos/review-principal-reviewer.dto';
 
 @Controller('admin')
 @UseGuards(AuthGuard, VerifiedGuard, RolesGuard)
@@ -117,6 +118,7 @@ export class AdminController {
     @Query('skills') skills?: string,
     @Query('dateFrom') dateFrom?: string,
     @Query('dateTo') dateTo?: string,
+    @Query('principalReviewerStatus') principalReviewerStatus?: string,
   ) {
     const { pageNum, limitNum } = this.parsePagination(page, limit);
     const skillsArray = skills ? skills.split(',') : undefined;
@@ -128,6 +130,7 @@ export class AdminController {
       skillsArray,
       dateFrom,
       dateTo,
+      principalReviewerStatus,
     );
     return {
       status: 'success',
@@ -151,6 +154,20 @@ export class AdminController {
     @Body() body: UpdateFreelancerVerificationDto,
   ) {
     const data = await this.adminService.updateFreelancerVerification(
+      id,
+      body,
+      user.sub,
+    );
+    return { status: 'success', data };
+  }
+
+  @Patch('freelancers/:id/principal-reviewer')
+  async reviewPrincipalReviewer(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() body: ReviewPrincipalReviewerDto,
+  ) {
+    const data = await this.adminService.reviewPrincipalReviewer(
       id,
       body,
       user.sub,

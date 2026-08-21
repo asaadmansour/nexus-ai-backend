@@ -46,9 +46,14 @@ import { ReviewRunDto } from './dtos/review-run.dto';
 import { ProjectInvitation } from './entities/project-invitation.entity';
 import { FreelancerPerformanceEvent } from 'src/freelancers/entities/freelancer-performance-event.entity';
 import { RepositoriesService } from 'src/repositories/repositories.service';
+import {
+  PRINCIPAL_REVIEWER_MAX_PROJECTS,
+  PRINCIPAL_REVIEWER_MIN_PERFORMANCE_SCORE,
+  PRINCIPAL_REVIEWER_ROLE,
+  PRINCIPAL_REVIEWER_SKILLS,
+} from 'src/freelancers/principal-reviewer-qualification';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
-const PRINCIPAL_REVIEWER_ROLE = 'principal_reviewer';
 const INVITATION_TTL_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_LIMIT = 10;
 
@@ -56,16 +61,7 @@ const DEFAULT_LIMIT = 10;
 // not pass explicit `filters.skills`. Lets the architect and ui_ux runs rank
 // against role-relevant skills instead of one shared list.
 const PLANNING_ROLE_SKILLS: Record<string, string[]> = {
-  principal_reviewer: [
-    'Solution Architecture',
-    'System Design',
-    'Technical Leadership',
-    'Code Review',
-    'Risk Management',
-    'Project Planning',
-    'API Design',
-    'Security',
-  ],
+  principal_reviewer: [...PRINCIPAL_REVIEWER_SKILLS],
   architect: [
     'System Design',
     'API Design',
@@ -195,21 +191,31 @@ export class MatchingService {
           },
         });
       if (!reviewer) return;
-      const existingRuns = await this.runRepo.count({
+      const existingRuns = await this.runRepo.find({
         where: {
           projectId,
           targetType: 'planning_role',
           targetRoleKey: In(PLANNING_ROLES),
+          status: In(['queued', 'running', 'completed', 'reviewed']),
         },
+        select: { targetRoleKey: true },
       });
-      if (existingRuns > 0) return;
+      const startedRoles = new Set(
+        existingRuns
+          .map((run) => run.targetRoleKey)
+          .filter((role): role is string => Boolean(role)),
+      );
+      const missingRoles = PLANNING_ROLES.filter(
+        (role) => !startedRoles.has(role),
+      );
+      if (!missingRoles.length) return;
 
       const project = await this.projectRepo.findOne({
         where: { id: projectId },
       });
       if (!project || project.status !== ProjectStatus.BRIEF_COMPLETE) return;
 
-      await this.startPlanningRoles(projectId, {}, null);
+      await this.startPlanningRoles(projectId, { roles: missingRoles }, null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(
@@ -755,6 +761,23 @@ export class MatchingService {
         where: { id: task.projectId },
       });
       if (!project) throw new NotFoundException('Project not found');
+      const principalReviewerConflict = await manager.exists(
+        ProjectRoleAssignment,
+        {
+          where: {
+            projectId: task.projectId,
+            freelancerProfileId,
+            phase: 'governance',
+            roleKey: PRINCIPAL_REVIEWER_ROLE,
+            status: In(ASSIGNMENT_ACTIVE_STATUSES),
+          },
+        },
+      );
+      if (principalReviewerConflict) {
+        throw new ConflictException(
+          'A project principal reviewer cannot implement or review their own task work',
+        );
+      }
       this.assertTaskCompensationCoverage(task, profile, project);
 
       let sourceRun: MatchingRun | null = candidate?.matchingRun ?? null;
@@ -1308,8 +1331,14 @@ export class MatchingService {
     }
 
     if (!invitation.matchingRun || !invitation.candidate) {
+      const reason =
+        'The invitation is missing its matching evidence and needs manual review';
+      await this.cancelInvalidInvitation(invitation, reason);
+      if (!invitation.matchingRunId) {
+        await this.markStaffingBlocked(invitation.projectId, reason);
+      }
       throw new ConflictException(
-        'The invitation is missing its matching evidence and needs manual review',
+        `${reason}. It was cancelled so it cannot remain stuck as pending.`,
       );
     }
 
@@ -1342,6 +1371,17 @@ export class MatchingService {
           null,
         );
       } catch (error) {
+        if (error instanceof ConflictException) {
+          const cancelled = await this.cancelInvalidInvitation(
+            invitation,
+            error.message,
+          );
+          throw new ConflictException(
+            cancelled
+              ? `${error.message}. This invitation was cancelled and the next eligible freelancer is being invited.`
+              : error.message,
+          );
+        }
         await this.invitationRepo
           .createQueryBuilder()
           .update(ProjectInvitation)
@@ -1365,54 +1405,70 @@ export class MatchingService {
         },
       );
     } else {
-      assignment = await this.dataSource.transaction(async (manager) => {
-        const locked = await manager
-          .getRepository(ProjectInvitation)
-          .createQueryBuilder('invitation')
-          .setLock('pessimistic_write')
-          .where('invitation.id = :id', { id: invitation.id })
-          .getOne();
-        if (!locked || locked.status !== 'pending') {
-          throw new ConflictException('Invitation is no longer pending');
-        }
-        if (locked.expiresAt <= new Date()) {
-          throw new ConflictException(
-            'This invitation expired and matching has continued',
-          );
-        }
-        const created = await this.createPlanningAssignment(manager, {
-          run: invitation.matchingRun!,
-          candidate: invitation.candidate!,
-          adminUserId: null,
-          notes: reason?.trim() || 'Automatically matched and accepted.',
-          phase: invitation.phase === 'governance' ? 'governance' : 'planning',
-          accepted: true,
+      try {
+        assignment = await this.dataSource.transaction(async (manager) => {
+          const locked = await manager
+            .getRepository(ProjectInvitation)
+            .createQueryBuilder('invitation')
+            .setLock('pessimistic_write')
+            .where('invitation.id = :id', { id: invitation.id })
+            .getOne();
+          if (!locked || locked.status !== 'pending') {
+            throw new ConflictException('Invitation is no longer pending');
+          }
+          if (locked.expiresAt <= new Date()) {
+            throw new ConflictException(
+              'This invitation expired and matching has continued',
+            );
+          }
+          const created = await this.createPlanningAssignment(manager, {
+            run: invitation.matchingRun!,
+            candidate: invitation.candidate!,
+            adminUserId: null,
+            notes: reason?.trim() || 'Automatically matched and accepted.',
+            phase:
+              invitation.phase === 'governance' ? 'governance' : 'planning',
+            accepted: true,
+          });
+          locked.status = 'accepted';
+          locked.respondedAt = new Date();
+          locked.responseReason = reason?.trim() || null;
+          await manager.save(ProjectInvitation, locked);
+
+          invitation.candidate!.status = 'assigned';
+          invitation.candidate!.selectedAt = new Date();
+          await manager.save(MatchingCandidate, invitation.candidate!);
+          invitation.matchingRun!.status = 'reviewed';
+          invitation.matchingRun!.reviewedAt = new Date();
+          await manager.save(MatchingRun, invitation.matchingRun!);
+
+          if (invitation.phase === 'governance') {
+            invitation.project.principalReviewerAssignmentId = created.id;
+            invitation.project.automationStatus = 'matching_planning_team';
+            await manager.save(Project, invitation.project);
+          } else {
+            await this.maybeAdvanceToPlanningAssigned(
+              manager,
+              invitation.projectId,
+              null,
+            );
+          }
+          return created;
         });
-        locked.status = 'accepted';
-        locked.respondedAt = new Date();
-        locked.responseReason = reason?.trim() || null;
-        await manager.save(ProjectInvitation, locked);
-
-        invitation.candidate!.status = 'assigned';
-        invitation.candidate!.selectedAt = new Date();
-        await manager.save(MatchingCandidate, invitation.candidate!);
-        invitation.matchingRun!.status = 'reviewed';
-        invitation.matchingRun!.reviewedAt = new Date();
-        await manager.save(MatchingRun, invitation.matchingRun!);
-
-        if (invitation.phase === 'governance') {
-          invitation.project.principalReviewerAssignmentId = created.id;
-          invitation.project.automationStatus = 'matching_planning_team';
-          await manager.save(Project, invitation.project);
-        } else {
-          await this.maybeAdvanceToPlanningAssigned(
-            manager,
-            invitation.projectId,
-            null,
+      } catch (error) {
+        if (error instanceof ConflictException) {
+          const cancelled = await this.cancelInvalidInvitation(
+            invitation,
+            error.message,
+          );
+          throw new ConflictException(
+            cancelled
+              ? `${error.message}. This invitation was cancelled and the next eligible freelancer is being invited.`
+              : error.message,
           );
         }
-        return created;
-      });
+        throw error;
+      }
     }
 
     await this.notifyProjectOwner(
@@ -1628,6 +1684,7 @@ export class MatchingService {
         throw new ConflictException('Task has no assignee to remove');
       }
       const removedProfileId = task.assignedFreelancerProfileId;
+      let principalReviewerSuspendedUserId: string | null = null;
       const removedAt = new Date();
       const priorAssignedAt = task.assignedAt;
       const profile = await manager.findOne(FreelancerProfile, {
@@ -1649,6 +1706,19 @@ export class MatchingService {
             at: new Date().toISOString(),
           },
         ].slice(-20);
+        if (profile.principalReviewerStatus === 'approved') {
+          profile.principalReviewerStatus = 'suspended';
+          profile.principalReviewerReviewedAt = new Date();
+          profile.principalReviewerRejectionReason =
+            'Reviewer eligibility was paused after a task removal risk event.';
+          profile.principalReviewerQualification = {
+            ...(profile.principalReviewerQualification ?? {}),
+            suspendedAt: new Date().toISOString(),
+            source: 'performance_risk',
+            reason: profile.principalReviewerRejectionReason,
+          };
+          principalReviewerSuspendedUserId = profile.userId;
+        }
         await manager.save(FreelancerProfile, profile);
         await manager.save(
           FreelancerPerformanceEvent,
@@ -1720,8 +1790,20 @@ export class MatchingService {
         await manager.getRepository(TaskCheckpoint).save(checkpoints);
       }
       await manager.save(ProjectTask, task);
-      return { task, removedProfileId };
+      return { task, removedProfileId, principalReviewerSuspendedUserId };
     });
+
+    if (result.principalReviewerSuspendedUserId) {
+      await this.notificationsService.createNotification({
+        userId: result.principalReviewerSuspendedUserId,
+        projectId: result.task.projectId,
+        taskId: result.task.id,
+        type: 'principal_reviewer_status',
+        title: 'Principal reviewer eligibility paused',
+        body: 'A task removal created a performance risk flag. Principal reviewer matching is paused until an administrator reviews it.',
+        actionUrl: '/profile',
+      });
+    }
 
     const existingRun = result.task.sourceMatchingRunId
       ? await this.runRepo.findOne({
@@ -1966,7 +2048,7 @@ export class MatchingService {
             where: {
               projectId: run.projectId,
               assignedFreelancerProfileId: In(candidateIds),
-              status: In(ACTIVE_TASK_STATUSES),
+              ...(run.targetTaskId ? { status: In(ACTIVE_TASK_STATUSES) } : {}),
             },
           })
         : Promise.resolve([]);
@@ -1987,7 +2069,7 @@ export class MatchingService {
               roleKey: PRINCIPAL_REVIEWER_ROLE,
             })
             .andWhere('assignment.status IN (:...statuses)', {
-              statuses: ['accepted', 'in_progress'],
+              statuses: ASSIGNMENT_ACTIVE_STATUSES,
             })
             .groupBy('assignment.freelancerProfileId')
             .getRawMany<{ profileId: string; projects: string }>()
@@ -2025,13 +2107,27 @@ export class MatchingService {
         continue;
       }
       if (run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE) {
-        const experience = option.freelancerProfile.yearsExperience ?? 0;
         const performance = Number(
           option.freelancerProfile.performanceScore ?? 100,
         );
         const activeProjects =
           reviewerLoadByProfile.get(option.freelancerProfileId) ?? 0;
-        if (experience < 5 || performance < 80 || activeProjects >= 3) continue;
+        const capacity = Math.min(
+          PRINCIPAL_REVIEWER_MAX_PROJECTS,
+          Math.max(
+            1,
+            option.freelancerProfile.principalReviewerMaxProjects ??
+              PRINCIPAL_REVIEWER_MAX_PROJECTS,
+          ),
+        );
+        if (
+          option.freelancerProfile.principalReviewerStatus !== 'approved' ||
+          !option.freelancerProfile.principalReviewerHourlyRate ||
+          performance < PRINCIPAL_REVIEWER_MIN_PERFORMANCE_SCORE ||
+          (option.freelancerProfile.riskFlags?.length ?? 0) > 0 ||
+          activeProjects >= capacity
+        )
+          continue;
       }
       candidate = option;
       break;
@@ -2172,6 +2268,39 @@ export class MatchingService {
     return profile;
   }
 
+  private async cancelInvalidInvitation(
+    invitation: ProjectInvitation,
+    reason: string,
+  ) {
+    const cancelled = await this.invitationRepo.update(
+      {
+        id: invitation.id,
+        status: In(['pending', 'accepting']),
+      },
+      {
+        status: 'cancelled',
+        respondedAt: new Date(),
+        responseReason: reason,
+      },
+    );
+    if (!cancelled.affected) return false;
+    if (invitation.candidateId) {
+      await this.candidateRepo.update(invitation.candidateId, {
+        status: 'rejected',
+        rejectionReason: reason,
+      });
+    }
+    if (invitation.taskId) {
+      await this.taskRepo.update(invitation.taskId, {
+        assignmentStatus: 'unassigned',
+      });
+    }
+    if (invitation.matchingRunId) {
+      await this.inviteNextCandidate(invitation.matchingRunId);
+    }
+    return true;
+  }
+
   private async notifyProjectOwner(
     project: Project,
     title: string,
@@ -2248,7 +2377,14 @@ export class MatchingService {
     const { run, candidate, adminUserId, notes } = input;
     const phase = input.phase ?? 'planning';
     const roleKey = run.targetRoleKey!;
-    const profile = candidate.freelancerProfile;
+    const profile = await manager
+      .getRepository(FreelancerProfile)
+      .createQueryBuilder('profile')
+      .setLock('pessimistic_write')
+      .where('profile.id = :profileId', {
+        profileId: candidate.freelancerProfileId,
+      })
+      .getOne();
     if (
       !profile ||
       profile.verificationStatus !== 'approved' ||
@@ -2263,6 +2399,56 @@ export class MatchingService {
       where: { id: run.projectId },
     });
     if (!project) throw new NotFoundException('Project not found');
+    const conflictingRole = await manager.findOne(ProjectRoleAssignment, {
+      where: {
+        projectId: run.projectId,
+        freelancerProfileId: profile.id,
+        status: In(ASSIGNMENT_ACTIVE_STATUSES),
+      },
+    });
+    if (conflictingRole) {
+      throw new ConflictException(
+        'One freelancer cannot hold multiple active roles on the same project',
+      );
+    }
+    const conflictingTask = await manager.exists(ProjectTask, {
+      where: {
+        projectId: run.projectId,
+        assignedFreelancerProfileId: profile.id,
+      },
+    });
+    if (conflictingTask) {
+      throw new ConflictException(
+        'A principal or planning reviewer cannot review work they implemented on the same project',
+      );
+    }
+    if (phase === 'governance') {
+      if (
+        profile.principalReviewerStatus !== 'approved' ||
+        !profile.principalReviewerHourlyRate
+      ) {
+        throw new ConflictException(
+          'The selected freelancer is not an approved principal reviewer',
+        );
+      }
+      const activeProjects = await manager.count(ProjectRoleAssignment, {
+        where: {
+          freelancerProfileId: profile.id,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(ASSIGNMENT_ACTIVE_STATUSES),
+        },
+      });
+      const capacity = Math.min(
+        PRINCIPAL_REVIEWER_MAX_PROJECTS,
+        Math.max(1, profile.principalReviewerMaxProjects),
+      );
+      if (activeProjects >= capacity) {
+        throw new ConflictException(
+          'The selected principal reviewer has reached their concurrent project limit',
+        );
+      }
+    }
     const compensation =
       phase === 'governance'
         ? this.principalReviewerCompensation(project, profile)
@@ -2292,7 +2478,10 @@ export class MatchingService {
         sourceMatchingRunId: run.id,
         sourceCandidateId: candidate.id,
         assignedBy: adminUserId,
-        hourlyRateSnapshot: profile?.hourlyRate ?? null,
+        hourlyRateSnapshot:
+          phase === 'governance'
+            ? profile.principalReviewerHourlyRate
+            : profile.hourlyRate,
         budgetAmount: compensation.amount,
         currency: compensation.currency,
         estimatedHours: compensation.estimatedHours,
@@ -2386,7 +2575,13 @@ export class MatchingService {
         ? principalReviewerRoleAllocation(project.budgetAllocation)
         : planningRoleAllocation(project.budgetAllocation, roleKey);
     const rate = Number(allocation?.maxHourlyRate);
-    return Number.isFinite(rate) && rate > 0 ? rate : null;
+    if (Number.isFinite(rate) && rate > 0) return rate;
+    if (roleKey === PRINCIPAL_REVIEWER_ROLE) {
+      const legacyReviewerBudget = Number(project.quotedAmount) * 0.1;
+      const legacyRate = legacyReviewerBudget / 12;
+      return Number.isFinite(legacyRate) && legacyRate > 0 ? legacyRate : null;
+    }
+    return null;
   }
 
   private minimumPlanningAvailability(project: Project, roleKey: string) {
@@ -2469,7 +2664,7 @@ export class MatchingService {
     const total = Number(project.quotedAmount);
     const estimatedHours = allocation?.estimatedHours ?? 12;
     const amount = Number(allocation?.amount ?? total * 0.1);
-    const rate = Number(profile.hourlyRate);
+    const rate = Number(profile.principalReviewerHourlyRate);
     if (!Number.isFinite(amount) || amount <= 0) {
       throw new ConflictException(
         'No principal-reviewer compensation is allocated for this project',
@@ -2477,7 +2672,7 @@ export class MatchingService {
     }
     if (!Number.isFinite(rate) || rate <= 0) {
       throw new ConflictException(
-        'The principal reviewer must have a platform-assessed hourly rate',
+        'The principal reviewer must have an approved reviewer-specific hourly rate',
       );
     }
     if (rate * estimatedHours > amount + 0.005) {
@@ -2571,6 +2766,53 @@ export class MatchingService {
       this.affordablePlanningRate(project, roleKey),
     );
     const cappedQb = qb.clone();
+    cappedQb.andWhere(
+      `NOT EXISTS (
+        SELECT 1 FROM project_role_assignments existing_assignment
+        WHERE existing_assignment.freelancer_profile_id = p.id
+          AND existing_assignment.project_id = :candidateProjectId
+          AND existing_assignment.status IN ('assigned', 'accepted', 'in_progress')
+      )`,
+      { candidateProjectId: project.id },
+    );
+    cappedQb.andWhere(
+      `NOT EXISTS (
+        SELECT 1 FROM project_tasks existing_task
+        WHERE existing_task.assigned_freelancer_profile_id = p.id
+          AND existing_task.project_id = :candidateProjectId
+      )`,
+      { candidateProjectId: project.id },
+    );
+    const rateColumn =
+      roleKey === PRINCIPAL_REVIEWER_ROLE
+        ? 'p.principalReviewerHourlyRate'
+        : 'p.hourlyRate';
+    if (roleKey === PRINCIPAL_REVIEWER_ROLE) {
+      cappedQb.andWhere('p.principalReviewerStatus = :reviewerApproved', {
+        reviewerApproved: 'approved',
+      });
+      cappedQb.andWhere('p.principalReviewerHourlyRate IS NOT NULL');
+      cappedQb.andWhere(
+        'COALESCE(p.performanceScore, 100) >= :reviewerMinPerformance',
+        {
+          reviewerMinPerformance: PRINCIPAL_REVIEWER_MIN_PERFORMANCE_SCORE,
+        },
+      );
+      cappedQb.andWhere(
+        `(
+          SELECT COUNT(DISTINCT reviewer_assignment.project_id)
+          FROM project_role_assignments reviewer_assignment
+          WHERE reviewer_assignment.freelancer_profile_id = p.id
+            AND reviewer_assignment.phase = 'governance'
+            AND reviewer_assignment.role_key = :principalReviewerRole
+            AND reviewer_assignment.status IN ('assigned', 'accepted', 'in_progress')
+        ) < LEAST(:reviewerMaxProjects, GREATEST(1, p.principalReviewerMaxProjects))`,
+        {
+          principalReviewerRole: PRINCIPAL_REVIEWER_ROLE,
+          reviewerMaxProjects: PRINCIPAL_REVIEWER_MAX_PROJECTS,
+        },
+      );
+    }
     const minimumAvailability = Math.max(
       filters?.minAvailabilityHours ?? 0,
       this.minimumPlanningAvailability(project, roleKey),
@@ -2580,8 +2822,8 @@ export class MatchingService {
       { roleMinAvailability: minimumAvailability },
     );
     if (maxRate != null) {
-      cappedQb.andWhere('p.hourlyRate IS NOT NULL');
-      cappedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
+      cappedQb.andWhere(`${rateColumn} IS NOT NULL`);
+      cappedQb.andWhere(`${rateColumn} <= :maxRate`, { maxRate });
     }
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
@@ -2618,7 +2860,12 @@ export class MatchingService {
     ]);
 
     return {
-      candidates: this.toCandidateInputs(profiles, similarity, workload),
+      candidates: this.toCandidateInputs(
+        profiles,
+        similarity,
+        workload,
+        roleKey,
+      ),
     };
   }
 
@@ -2636,6 +2883,20 @@ export class MatchingService {
       : (task.requiredSkills ?? []);
 
     const narrowedQb = qb.clone();
+    narrowedQb.andWhere(
+      `NOT EXISTS (
+        SELECT 1 FROM project_role_assignments reviewer_assignment
+        WHERE reviewer_assignment.freelancer_profile_id = p.id
+          AND reviewer_assignment.project_id = :taskProjectId
+          AND reviewer_assignment.phase = 'governance'
+          AND reviewer_assignment.role_key = :principalReviewerRole
+          AND reviewer_assignment.status IN ('assigned', 'accepted', 'in_progress')
+      )`,
+      {
+        taskProjectId: task.projectId,
+        principalReviewerRole: PRINCIPAL_REVIEWER_ROLE,
+      },
+    );
     if (maxRate != null) {
       narrowedQb.andWhere('p.hourlyRate IS NOT NULL');
       narrowedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
@@ -2668,6 +2929,7 @@ export class MatchingService {
     profiles: FreelancerProfile[],
     similarity: Map<string, number>,
     workload?: Map<string, { tasks: number; projects: number }>,
+    roleKey?: string,
   ): MatchCandidateInputDto[] {
     return profiles.map((profile) => {
       const scores = (profile.skillScores ?? []).map((entry) => ({
@@ -2695,7 +2957,13 @@ export class MatchingService {
         skills: profile.skills ?? [],
         skillScores: scores,
         hourlyRate:
-          profile.hourlyRate != null ? Number(profile.hourlyRate) : null,
+          roleKey === PRINCIPAL_REVIEWER_ROLE
+            ? profile.principalReviewerHourlyRate != null
+              ? Number(profile.principalReviewerHourlyRate)
+              : null
+            : profile.hourlyRate != null
+              ? Number(profile.hourlyRate)
+              : null,
         availabilityHours: profile.availabilityHoursPerWeek ?? null,
         yearsExperience: profile.yearsExperience ?? null,
         averageSkillScore,

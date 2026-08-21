@@ -13,6 +13,7 @@ import {
 import { User } from '../../users/entities/user.entity';
 import { FreelancerProfileEmbedding } from './freelancer-profile-embedding.entity';
 import { FreelancerSkillScore } from './freelancer-skill-score.entity';
+import type { PrincipalReviewerStatus } from '../principal-reviewer-qualification';
 
 @Entity('freelancer_profiles')
 @Index('freelancer_profiles_stripe_account_id_uidx', ['stripeAccountId'], {
@@ -202,6 +203,66 @@ export class FreelancerProfile {
 
   @Column({ name: 'risk_flags', type: 'jsonb', nullable: true })
   riskFlags: Record<string, unknown>[] | null;
+
+  @Index('freelancer_profiles_principal_reviewer_status_idx')
+  @Column({
+    name: 'principal_reviewer_status',
+    type: 'varchar',
+    length: 40,
+    default: 'not_applied',
+  })
+  principalReviewerStatus: PrincipalReviewerStatus;
+
+  @Column({
+    name: 'principal_reviewer_applied_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  principalReviewerAppliedAt: Date | null;
+
+  @Column({
+    name: 'principal_reviewer_reviewed_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  principalReviewerReviewedAt: Date | null;
+
+  @Column({
+    name: 'principal_reviewer_reviewed_by',
+    type: 'uuid',
+    nullable: true,
+  })
+  principalReviewerReviewedBy: string | null;
+
+  @Column({
+    name: 'principal_reviewer_rejection_reason',
+    type: 'text',
+    nullable: true,
+  })
+  principalReviewerRejectionReason: string | null;
+
+  @Column({
+    name: 'principal_reviewer_hourly_rate',
+    type: 'numeric',
+    precision: 8,
+    scale: 2,
+    nullable: true,
+  })
+  principalReviewerHourlyRate: string | null;
+
+  @Column({
+    name: 'principal_reviewer_max_projects',
+    type: 'int',
+    default: 3,
+  })
+  principalReviewerMaxProjects: number;
+
+  @Column({
+    name: 'principal_reviewer_qualification',
+    type: 'jsonb',
+    nullable: true,
+  })
+  principalReviewerQualification: Record<string, unknown> | null;
 
   @Column({
     name: 'stripe_account_id',

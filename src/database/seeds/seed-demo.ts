@@ -263,6 +263,25 @@ async function seedDemo() {
       verificationStatus: 'approved',
       approvedAt: new Date(),
       assessmentScore: seed.assessmentScore,
+      principalReviewerStatus:
+        seed.email === 'arch.omar@nexus-ai.local'
+          ? ('approved' as const)
+          : ('not_applied' as const),
+      principalReviewerAppliedAt:
+        seed.email === 'arch.omar@nexus-ai.local' ? new Date() : null,
+      principalReviewerReviewedAt:
+        seed.email === 'arch.omar@nexus-ai.local' ? new Date() : null,
+      principalReviewerHourlyRate:
+        seed.email === 'arch.omar@nexus-ai.local' ? '40.00' : null,
+      principalReviewerMaxProjects: 3,
+      principalReviewerQualification:
+        seed.email === 'arch.omar@nexus-ai.local'
+          ? {
+              eligibleToApply: true,
+              source: 'demo_seed',
+              reviewedAt: new Date().toISOString(),
+            }
+          : null,
     };
     profile = profile
       ? await profileRepo.save(Object.assign(profile, profileData))

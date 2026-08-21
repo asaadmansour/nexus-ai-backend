@@ -24,6 +24,8 @@ import { CvExtractionProcessor } from './jobs/cv-extraction.processor';
 import { ProfileEmbeddingProcessor } from './jobs/profile-embedding.processor';
 import { areQueuesEnabled } from 'src/queues/queue-runtime';
 import { FreelancerPerformanceEvent } from './entities/freelancer-performance-event.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { User } from 'src/users/entities/user.entity';
 
 const queueProcessors = areQueuesEnabled()
   ? [
@@ -50,6 +52,8 @@ const queueProcessors = areQueuesEnabled()
       FreelancerSkillScore,
       FreelancerVerificationEvent,
       FreelancerPerformanceEvent,
+      ProjectRoleAssignment,
+      User,
     ]),
   ],
   controllers: [

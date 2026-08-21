@@ -26,6 +26,20 @@ import { UpdateAssessmentScoreDto } from './dtos/update-assessment-score.dto';
 import { UpdateAssessmentAnswerScoreDto } from './dtos/update-assessment-answer-score.dto';
 import { UpdateFreelancerSkillScoreDto } from './dtos/update-freelancer-skill-score.dto';
 import { AiOperationsMonitorService } from './ai-operations-monitor.service';
+import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
+import { ReviewPrincipalReviewerDto } from './dtos/review-principal-reviewer.dto';
+import {
+  defaultPrincipalReviewerRate,
+  evaluatePrincipalReviewerQualification,
+  PRINCIPAL_REVIEWER_ROLE,
+} from 'src/freelancers/principal-reviewer-qualification';
+
+const ACTIVE_PRINCIPAL_REVIEWER_STATUSES = [
+  'assigned',
+  'accepted',
+  'in_progress',
+];
 
 @Injectable()
 export class AdminService {
@@ -75,6 +89,10 @@ export class AdminService {
     private agentJobRepository: Repository<AgentJob>,
     @InjectRepository(RefreshToken)
     private refreshTokenRepository: Repository<RefreshToken>,
+    @InjectRepository(FreelancerVerificationEvent)
+    private verificationEventRepository: Repository<FreelancerVerificationEvent>,
+    @InjectRepository(ProjectRoleAssignment)
+    private roleAssignmentRepository: Repository<ProjectRoleAssignment>,
     private readonly notificationsService: NotificationsService,
     private readonly aiJobRecoveryService: AiJobRecoveryService,
     private readonly aiOperationsMonitorService: AiOperationsMonitorService,
@@ -548,6 +566,7 @@ export class AdminService {
     skills?: string[],
     dateFrom?: string,
     dateTo?: string,
+    principalReviewerStatus?: string,
   ) {
     const query = this.freelancerProfileRepository
       .createQueryBuilder('fp')
@@ -573,6 +592,11 @@ export class AdminService {
     }
     if (dateTo) {
       query.andWhere('fp.assessmentSubmittedAt <= :dateTo', { dateTo });
+    }
+    if (principalReviewerStatus) {
+      query.andWhere('fp.principalReviewerStatus = :principalReviewerStatus', {
+        principalReviewerStatus,
+      });
     }
 
     const [profiles, total] = await query.getManyAndCount();
@@ -609,6 +633,9 @@ export class AdminService {
       rejectedAt: profile.rejectedAt,
       aiProfileSummary: this.getProfileSummary(profile.summary),
       topSkillScores: topSkillScoresByProfile.get(profile.id) ?? [],
+      principalReviewerStatus: profile.principalReviewerStatus,
+      principalReviewerHourlyRate: profile.principalReviewerHourlyRate,
+      principalReviewerMaxProjects: profile.principalReviewerMaxProjects,
       createdAt: profile.createdAt,
     }));
 
@@ -633,6 +660,12 @@ export class AdminService {
       where: { freelancerProfileId: id },
       order: { score: 'DESC', skill: 'ASC' },
     });
+    const principalReviewerActiveProjects =
+      await this.countActivePrincipalReviewerProjects(profile.id);
+    const principalReviewerEligibility = evaluatePrincipalReviewerQualification(
+      profile,
+      skillScores,
+    );
 
     let questions: FreelancerAssessmentQuestion[] = [];
     let answers: FreelancerAssessmentAnswer[] = [];
@@ -675,6 +708,17 @@ export class AdminService {
         summary: profile.summary,
         aiProfileSummary: this.getProfileSummary(profile.summary),
         skillScores: skillScores.map((score) => this.toSkillScoreDto(score)),
+        principalReviewerStatus: profile.principalReviewerStatus,
+        principalReviewerAppliedAt: profile.principalReviewerAppliedAt,
+        principalReviewerReviewedAt: profile.principalReviewerReviewedAt,
+        principalReviewerReviewedBy: profile.principalReviewerReviewedBy,
+        principalReviewerRejectionReason:
+          profile.principalReviewerRejectionReason,
+        principalReviewerHourlyRate: profile.principalReviewerHourlyRate,
+        principalReviewerMaxProjects: profile.principalReviewerMaxProjects,
+        principalReviewerQualification: profile.principalReviewerQualification,
+        principalReviewerEligibility,
+        principalReviewerActiveProjects,
         createdAt: profile.createdAt,
         updatedAt: profile.updatedAt,
       },
@@ -737,6 +781,15 @@ export class AdminService {
       profile.rejectionReason = payload.reason || 'No reason provided';
       profile.approvedAt = null;
     }
+    if (
+      payload.status !== 'approved' &&
+      profile.principalReviewerStatus === 'approved'
+    ) {
+      profile.principalReviewerStatus = 'suspended';
+      profile.principalReviewerReviewedAt = new Date();
+      profile.principalReviewerRejectionReason =
+        'Base freelancer verification is no longer approved.';
+    }
 
     await this.freelancerProfileRepository.save(profile);
 
@@ -769,6 +822,173 @@ export class AdminService {
     await this.freelancerProfileRepository.save(profile);
 
     return profile;
+  }
+
+  async reviewPrincipalReviewer(
+    id: string,
+    dto: ReviewPrincipalReviewerDto,
+    adminUserId: string,
+  ) {
+    const profile = await this.freelancerProfileRepository.findOne({
+      where: { id },
+    });
+    if (!profile) throw new NotFoundException('Freelancer profile not found');
+    const skillScores = await this.skillScoreRepository.find({
+      where: { freelancerProfileId: id },
+    });
+    const qualification = evaluatePrincipalReviewerQualification(
+      profile,
+      skillScores,
+    );
+    const reason = dto.reason?.trim() || null;
+    const previousStatus = profile.principalReviewerStatus;
+
+    if (dto.status === 'approved') {
+      if (previousStatus !== 'pending' && !dto.override) {
+        throw new ConflictException(
+          'The freelancer must opt in and submit a principal reviewer application first',
+        );
+      }
+      if (profile.verificationStatus !== 'approved') {
+        throw new ConflictException(
+          'The base freelancer verification must be approved first',
+        );
+      }
+      if (!qualification.eligibleToApply && !dto.override) {
+        throw new ConflictException(
+          `Principal reviewer requirements are not met: ${qualification.gaps.join(' ')}`,
+        );
+      }
+      if (
+        (previousStatus !== 'pending' || !qualification.eligibleToApply) &&
+        !reason
+      ) {
+        throw new BadRequestException(
+          'A documented reason is required for an application or qualification override',
+        );
+      }
+      const reviewerRate =
+        dto.hourlyRate ?? defaultPrincipalReviewerRate(profile.hourlyRate ?? 0);
+      if (!reviewerRate || reviewerRate <= 0) {
+        throw new BadRequestException(
+          'Set a positive principal reviewer hourly rate before approval',
+        );
+      }
+      profile.principalReviewerStatus = 'approved';
+      profile.principalReviewerHourlyRate = reviewerRate.toFixed(2);
+      profile.principalReviewerMaxProjects = dto.maxConcurrentProjects ?? 3;
+      profile.principalReviewerRejectionReason = null;
+    } else {
+      if (dto.status === 'rejected' && previousStatus !== 'pending') {
+        throw new ConflictException(
+          'Only a pending principal reviewer application can be rejected',
+        );
+      }
+      if (dto.status === 'suspended' && previousStatus !== 'approved') {
+        throw new ConflictException(
+          'Only an approved principal reviewer can be suspended',
+        );
+      }
+      if (!reason) {
+        throw new BadRequestException(
+          'A reason is required when rejecting or suspending a principal reviewer',
+        );
+      }
+      profile.principalReviewerStatus = dto.status;
+      profile.principalReviewerRejectionReason = reason;
+      if (dto.status === 'rejected') {
+        profile.principalReviewerHourlyRate = null;
+      }
+    }
+
+    profile.principalReviewerReviewedAt = new Date();
+    profile.principalReviewerReviewedBy = adminUserId;
+    profile.principalReviewerQualification = {
+      ...qualification,
+      application: profile.principalReviewerQualification?.statement ?? null,
+      decision: dto.status,
+      decisionReason: reason,
+      override: dto.override === true,
+      reviewedAt: profile.principalReviewerReviewedAt.toISOString(),
+      reviewedBy: adminUserId,
+    };
+    const decisionQuery = this.freelancerProfileRepository
+      .createQueryBuilder()
+      .update(FreelancerProfile)
+      .set({
+        principalReviewerStatus: profile.principalReviewerStatus,
+        principalReviewerReviewedAt: profile.principalReviewerReviewedAt,
+        principalReviewerReviewedBy: profile.principalReviewerReviewedBy,
+        principalReviewerRejectionReason:
+          profile.principalReviewerRejectionReason,
+        principalReviewerHourlyRate: profile.principalReviewerHourlyRate,
+        principalReviewerMaxProjects: profile.principalReviewerMaxProjects,
+        principalReviewerQualification: () => ':reviewerQualification',
+      })
+      .where('id = :profileId', { profileId: profile.id })
+      .andWhere('principal_reviewer_status = :previousStatus', {
+        previousStatus,
+      })
+      .setParameter(
+        'reviewerQualification',
+        JSON.stringify(profile.principalReviewerQualification),
+      );
+    if (dto.status === 'approved') {
+      decisionQuery.andWhere('verification_status = :baseApproved', {
+        baseApproved: 'approved',
+      });
+    }
+    const savedDecision = await decisionQuery.execute();
+    if (!savedDecision.affected) {
+      throw new ConflictException(
+        'The principal reviewer application changed while it was being reviewed. Refresh before deciding.',
+      );
+    }
+    await this.verificationEventRepository.save(
+      this.verificationEventRepository.create({
+        freelancerProfileId: profile.id,
+        userId: profile.userId,
+        eventType: `principal_reviewer_${dto.status}`,
+        fromStatus: previousStatus,
+        toStatus: dto.status,
+        actorType: 'admin',
+        actorUserId: adminUserId,
+        metadata: {
+          reason,
+          hourlyRate: profile.principalReviewerHourlyRate,
+          maxConcurrentProjects: profile.principalReviewerMaxProjects,
+          override: dto.override === true,
+          qualification,
+        },
+      }),
+    );
+    await this.notificationsService.createNotification({
+      userId: profile.userId,
+      type: 'principal_reviewer_status',
+      title:
+        dto.status === 'approved'
+          ? 'Principal reviewer qualification approved'
+          : dto.status === 'suspended'
+            ? 'Principal reviewer qualification paused'
+            : 'Principal reviewer application not approved',
+      body:
+        dto.status === 'approved'
+          ? `You can now receive principal reviewer invitations at ${profile.principalReviewerHourlyRate} ${process.env.FREELANCER_RATE_BASE_CURRENCY ?? 'EGP'}/hour for up to ${profile.principalReviewerMaxProjects} concurrent projects.`
+          : reason,
+      actionUrl: '/profile',
+    });
+    return this.getFreelancerDetail(id);
+  }
+
+  private countActivePrincipalReviewerProjects(profileId: string) {
+    return this.roleAssignmentRepository.count({
+      where: {
+        freelancerProfileId: profileId,
+        phase: 'governance',
+        roleKey: PRINCIPAL_REVIEWER_ROLE,
+        status: In(ACTIVE_PRINCIPAL_REVIEWER_STATUSES),
+      },
+    });
   }
 
   private async assessHourlyRate(profile: FreelancerProfile) {

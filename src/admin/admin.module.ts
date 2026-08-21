@@ -15,6 +15,8 @@ import { RefreshToken } from 'src/auth/entities/refresh-token.entity';
 import { NotificationsModule } from 'src/notifications/notifications.module';
 import { QueuesModule } from 'src/queues/queues.module';
 import { AiOperationsMonitorService } from './ai-operations-monitor.service';
+import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
+import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 
 @Module({
   imports: [
@@ -31,6 +33,8 @@ import { AiOperationsMonitorService } from './ai-operations-monitor.service';
       FreelancerSkillScore,
       AgentJob,
       RefreshToken,
+      FreelancerVerificationEvent,
+      ProjectRoleAssignment,
     ]),
   ],
   controllers: [AdminController],
