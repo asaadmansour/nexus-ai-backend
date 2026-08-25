@@ -11,6 +11,31 @@ export class EmailService {
 
   constructor(private readonly mailerService: MailerService) {}
 
+  /**
+   * Domains that cannot receive mail. Seeded accounts use `@nexus-ai.local`, a
+   * domain that does not resolve, so every notification to them hard-bounced —
+   * back to the personal Gmail account configured as SMTP_USER. Enough hard
+   * bounces will get that account rate-limited or suspended, which would take
+   * down real verification mail too. See ISSUES.md #23.
+   *
+   * Override with MAIL_UNDELIVERABLE_DOMAINS (comma-separated suffixes).
+   */
+  private static readonly UNDELIVERABLE_SUFFIXES = (
+    process.env.MAIL_UNDELIVERABLE_DOMAINS ??
+    '.local,.localhost,.test,.invalid,.example,example.com'
+  )
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+
+  private isUndeliverable(email: string): boolean {
+    const domain = email.split('@')[1]?.toLowerCase();
+    if (!domain) return true;
+    return EmailService.UNDELIVERABLE_SUFFIXES.some(
+      (suffix) => domain === suffix || domain.endsWith(suffix),
+    );
+  }
+
   private maskEmail(email: string): string {
     const [local, domain] = email.split('@');
     if (!domain) return '***@***';
@@ -71,6 +96,12 @@ export class EmailService {
     input: { body: string; actionUrl?: string | null; actionLabel?: string },
   ) {
     const maskedEmail = this.maskEmail(email);
+    if (this.isUndeliverable(email)) {
+      this.logger.warn(
+        `Skipping "${subject}" to ${maskedEmail}: domain cannot receive mail.`,
+      );
+      return;
+    }
     if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
       if (process.env.NODE_ENV !== 'production') {
         this.logger.log(`[DEV MODE] ${subject} -> ${maskedEmail}`);

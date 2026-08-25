@@ -98,12 +98,34 @@ export class RepositoriesService {
         ? existing.metadata.error
         : null;
     try {
-      const created = await this.github.createRepository({
-        owner,
-        repoName,
-        visibility,
-        description: dto.description ?? project.title,
-      });
+      // If the name is somehow still taken — a leftover repo, or a caller-supplied
+      // name — walk a suffix rather than dead-ending the project. ISSUES.md #3.
+      let created: Awaited<ReturnType<typeof this.github.createRepository>> | null =
+        null;
+      let attemptName = repoName;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          created = await this.github.createRepository({
+            owner,
+            repoName: attemptName,
+            visibility,
+            description: dto.description ?? project.title,
+          });
+          break;
+        } catch (createError) {
+          if (!this.isNameTakenError(createError) || dto.repoName) throw createError;
+          attemptName = this.buildRepoName(project, attempt + 1);
+          this.logger.warn(
+            `Repository name already taken for project ${projectId}; retrying as ${attemptName}`,
+          );
+        }
+      }
+      if (!created) {
+        throw new Error(
+          `Could not find an available repository name for project ${projectId}`,
+        );
+      }
+      row.repoName = attemptName;
       row.externalId = created.externalId;
       row.repoUrl = created.repoUrl;
       row.defaultBranch = created.defaultBranch;
@@ -712,13 +734,26 @@ export class RepositoriesService {
     });
   }
 
-  private buildRepoName(project: Project) {
+  /**
+   * Repository names were derived from the project title alone, so two projects
+   * called "mobile store" and "Mobile Store" both wanted `project-mobile-store`.
+   * GitHub answered 422 and the unique index on (provider, owner, repo) threw
+   * straight after. The project id suffix makes the name unique per project
+   * while staying stable across retries for the same project. ISSUES.md #3.
+   */
+  private buildRepoName(project: Project, attempt = 0) {
     const slug = (project.title ?? 'project')
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
-      .slice(0, 60);
-    return `project-${slug || project.id.slice(0, 8)}`;
+      .slice(0, 48);
+    const base = `project-${slug ? `${slug}-` : ''}${project.id.slice(0, 8)}`;
+    return attempt > 0 ? `${base}-${attempt + 1}` : base;
+  }
+
+  private isNameTakenError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /422|already exists|name already/i.test(message);
   }
 
   private async getCollaboratorCounts(repositoryIds: string[]) {

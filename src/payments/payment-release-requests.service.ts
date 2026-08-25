@@ -256,10 +256,36 @@ export class PaymentReleaseRequestsService {
       );
     }
     const project = await this.getProjectOrThrow(submission.projectId);
-    const amount = Math.max(
+    // Same contract rule as planning assignments: pay the rate the freelancer
+    // agreed, capped by what was allocated for the task. Tasks carry no rate
+    // snapshot, so the assignee's current profile rate is used. ISSUES.md #22.
+    const allocatedTask = Math.max(
       Number(task.budgetAmount) - Number(task.penaltyAmount ?? 0),
       0,
     );
+    const assignee = await this.freelancerProfilesRepository.findOne({
+      where: { id: submission.freelancerProfileId },
+    });
+    const taskRate = Number(assignee?.hourlyRate);
+    const taskHours = Number(task.estimatedHours);
+    const taskEarned =
+      Number.isFinite(taskRate) &&
+      taskRate > 0 &&
+      Number.isFinite(taskHours) &&
+      taskHours > 0
+        ? Math.max(
+            this.roundMoney(taskRate * taskHours) -
+              Number(task.penaltyAmount ?? 0),
+            0,
+          )
+        : null;
+    if (taskEarned == null) {
+      this.logger.warn(
+        `Task ${task.id} has no usable rate/hours to price from; falling back to the allocated amount.`,
+      );
+    }
+    const amount =
+      taskEarned == null ? allocatedTask : Math.min(taskEarned, allocatedTask);
     if (!Number.isFinite(amount) || amount <= 0) {
       throw new BadRequestException('Task compensation is invalid');
     }
@@ -318,10 +344,37 @@ export class PaymentReleaseRequestsService {
           'Planning submission owner must match the role assignment',
         );
       }
-      const amount = Number(assignment.budgetAmount);
+      // Pay what the freelancer actually agreed to, not the market rate the
+      // quote was priced at. `budgetAmount` is the allocation carved out of
+      // escrow; the contract is the rate they accepted. Paying the allocation
+      // overpaid a 60/hour reviewer 27,969.92 for ten hours. The allocation
+      // still caps the payment, so a role can never draw more escrow than was
+      // set aside for it, and any surplus stays held for the customer.
+      // See ISSUES.md #22.
+      const allocated = Number(assignment.budgetAmount);
+      const agreedRate = Number(assignment.hourlyRateSnapshot);
+      const agreedHours = Number(assignment.estimatedHours);
+      const earned =
+        Number.isFinite(agreedRate) &&
+        agreedRate > 0 &&
+        Number.isFinite(agreedHours) &&
+        agreedHours > 0
+          ? this.roundMoney(agreedRate * agreedHours)
+          : null;
+      if (earned == null) {
+        this.logger.warn(
+          `Assignment ${assignment.id} has no usable rate/hours snapshot; falling back to the allocated amount.`,
+        );
+      }
+      const amount = earned == null ? allocated : Math.min(earned, allocated);
       if (!assignment.currency || !Number.isFinite(amount) || amount <= 0) {
         throw new ConflictException(
           'Planning compensation must be allocated before approval',
+        );
+      }
+      if (earned != null && earned !== allocated) {
+        this.logger.log(
+          `Assignment ${assignment.id}: paying ${amount} ${assignment.currency} (${agreedHours}h x ${agreedRate}) against an allocation of ${allocated}.`,
         );
       }
       const existing = await manager.findOne(PaymentReleaseRequest, {
@@ -874,6 +927,11 @@ export class PaymentReleaseRequestsService {
     });
     if (!profile) throw new NotFoundException('Freelancer profile not found');
     return profile;
+  }
+
+  /** Rounds to whole cents so a rate x hours product cannot carry float dust. */
+  private roundMoney(value: number) {
+    return Math.round(value * 100) / 100;
   }
 
   private toCents(value: number | string) {

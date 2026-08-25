@@ -30,6 +30,10 @@ import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ReviewPrincipalReviewerDto } from './dtos/review-principal-reviewer.dto';
 import {
+  describeMissingPrerequisites,
+  missingMatchingPrerequisites,
+} from 'src/freelancers/matching-prerequisites';
+import {
   defaultPrincipalReviewerRate,
   evaluatePrincipalReviewerQualification,
   PRINCIPAL_REVIEWER_ROLE,
@@ -1317,6 +1321,15 @@ export class AdminService {
     // Update freelancer verification status based on decision. Admin decisions
     // are authoritative and can override an AI pass/fail recommendation.
     if (payload.decision === 'pass') {
+      // Approving a profile that matching can never select strands the
+      // freelancer silently — matching reports it as a skills/rate failure.
+      // Refuse with something the admin can act on instead. ISSUES.md #21.
+      const missing = missingMatchingPrerequisites(profile);
+      if (missing.length) {
+        throw new ConflictException(
+          `Cannot approve this freelancer: their profile is missing ${describeMissingPrerequisites(missing)}. Matching requires it, so an approved profile without it can never be staffed.`,
+        );
+      }
       profile.verificationStatus = 'approved';
       profile.approvedAt = new Date();
       profile.rejectedAt = null;

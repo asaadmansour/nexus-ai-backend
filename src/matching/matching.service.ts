@@ -52,9 +52,39 @@ import {
   PRINCIPAL_REVIEWER_ROLE,
   PRINCIPAL_REVIEWER_SKILLS,
 } from 'src/freelancers/principal-reviewer-qualification';
+import { rateInCurrencySql } from 'src/common/currency/currency';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
-const INVITATION_TTL_MS = 2 * 60 * 60 * 1000;
+// How long a freelancer has to accept an invitation. Two hours was the original
+// fixed value, which meant any invitation issued outside working hours died
+// before the freelancer ever saw it. Configurable via MATCHING_INVITATION_TTL_HOURS;
+// the default is a full day so an overnight invitation survives. See ISSUES.md #1.
+const INVITATION_TTL_HOURS = (() => {
+  const raw = Number(process.env.MATCHING_INVITATION_TTL_HOURS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24;
+})();
+const INVITATION_TTL_MS = INVITATION_TTL_HOURS * 60 * 60 * 1000;
+// A flat window ignores how much time the project actually has. Roles are
+// invited one at a time, so on a project due in three days two unanswered
+// invitations can eat most of the schedule before anyone starts. The window is
+// therefore capped at a share of the time remaining, with a floor so it never
+// becomes unanswerably short. See ISSUES.md #25.
+const INVITATION_MIN_TTL_MS = (() => {
+  const raw = Number(process.env.MATCHING_INVITATION_MIN_TTL_HOURS);
+  return (Number.isFinite(raw) && raw > 0 ? raw : 2) * 60 * 60 * 1000;
+})();
+const INVITATION_DEADLINE_SHARE = (() => {
+  const raw = Number(process.env.MATCHING_INVITATION_DEADLINE_SHARE);
+  return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : 0.1;
+})();
+const INVITATION_WINDOW_LABEL =
+  INVITATION_TTL_HOURS === 1
+    ? 'one hour'
+    : INVITATION_TTL_HOURS % 24 === 0 && INVITATION_TTL_HOURS >= 24
+      ? INVITATION_TTL_HOURS === 24
+        ? 'one day'
+        : `${INVITATION_TTL_HOURS / 24} days`
+      : `${INVITATION_TTL_HOURS} hours`;
 const DEFAULT_LIMIT = 10;
 const REVIEWER_SHORTLIST_LIMIT = 3;
 
@@ -919,6 +949,24 @@ export class MatchingService {
           title: 'Task schedule exceeds project deadline',
           body: `The rematched schedule for "${result.task.title}" now ends after the project deadline. Review dependencies and customer expectations.`,
           actionUrl: `/reviewer/projects/${result.task.projectId}`,
+        });
+      }
+      // The customer is the one whose deadline this is, and previously only the
+      // principal reviewer was told. Nothing here changes the deadline or blocks
+      // the work — it just stops the customer being the last to know.
+      // See ISSUES.md #26.
+      const overrunProject = await this.dataSource
+        .getRepository(Project)
+        .findOne({ where: { id: result.task.projectId } });
+      if (overrunProject?.customerId) {
+        await this.notificationsService.createNotification({
+          userId: overrunProject.customerId,
+          projectId: result.task.projectId,
+          taskId: result.task.id,
+          type: 'schedule_risk',
+          title: 'Your project may finish after its deadline',
+          body: `Work on "${result.task.title}" was reassigned and the schedule now runs past your deadline${overrunProject.deadline ? ` of ${overrunProject.deadline.toISOString().slice(0, 10)}` : ''}. Your principal reviewer is reviewing the plan and will follow up.`,
+          actionUrl: `/projects/${result.task.projectId}`,
         });
       }
     }
@@ -2217,6 +2265,25 @@ export class MatchingService {
       : [];
   }
 
+  /**
+   * How long this invitation should stay open. The configured window normally
+   * applies unchanged; it is only shortened when the project deadline cannot
+   * afford it, and never below the floor. ISSUES.md #25.
+   */
+  private invitationTtlMs(project?: { deadline?: Date | null } | null): number {
+    const deadline = project?.deadline ? new Date(project.deadline) : null;
+    if (!deadline || Number.isNaN(deadline.getTime())) return INVITATION_TTL_MS;
+
+    const remainingMs = deadline.getTime() - Date.now();
+    if (remainingMs <= 0) return INVITATION_MIN_TTL_MS;
+
+    const affordable = remainingMs * INVITATION_DEADLINE_SHARE;
+    return Math.max(
+      INVITATION_MIN_TTL_MS,
+      Math.min(INVITATION_TTL_MS, affordable),
+    );
+  }
+
   private async inviteNextCandidate(
     runId: string,
     preferredCandidateId?: string,
@@ -2418,7 +2485,7 @@ export class MatchingService {
             scoreBreakdown: candidate.scoreBreakdown,
             rationale: candidate.rationale,
           },
-          expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
+          expiresAt: new Date(Date.now() + this.invitationTtlMs(run.project)),
           respondedAt: null,
           responseReason: null,
         }),
@@ -2470,7 +2537,7 @@ export class MatchingService {
         taskId: run.targetTaskId,
         type: 'project_invitation',
         title: 'Project invitation',
-        body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within two hours.`,
+        body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within ${INVITATION_WINDOW_LABEL}.`,
         actionUrl: '/invitations',
         metadata: {
           invitationId: invitation.id,
@@ -2503,7 +2570,7 @@ export class MatchingService {
       }
       locked.status = 'expired';
       locked.respondedAt = new Date();
-      locked.responseReason = 'No response within the two-hour window';
+      locked.responseReason = `No response within the ${INVITATION_WINDOW_LABEL} window`;
       await manager.save(ProjectInvitation, locked);
       if (locked.candidateId) {
         await manager
@@ -2532,14 +2599,14 @@ export class MatchingService {
           taskId: invitation.taskId,
           type: 'invitation_expired',
           title: 'Invitation expired',
-          body: 'The two-hour response window ended and the project moved to the next match.',
+          body: `The ${INVITATION_WINDOW_LABEL} response window ended and the project moved to the next match.`,
           actionUrl: '/invitations',
         })
         .catch(() => undefined);
     await this.notifyProjectOwner(
       invitation.project,
       'Invitation expired',
-      `The ${invitation.roleKey} invitation expired after two hours. The next eligible freelancer is being invited automatically.`,
+      `The ${invitation.roleKey} invitation expired after ${INVITATION_WINDOW_LABEL}. The next eligible freelancer is being invited automatically.`,
       profile?.userId,
     );
     if (invitation.matchingRunId) {
@@ -2692,7 +2759,7 @@ export class MatchingService {
         projectId: project.id,
         type: 'reviewer_attention',
         title: 'Candidate shortlists ready',
-        body: `Choose one of the top three candidates for ${labels.join(', ')}${suffix}. The selected freelancer will receive a two-hour invitation.`,
+        body: `Choose one of the top three candidates for ${labels.join(', ')}${suffix}. The selected freelancer will receive a ${INVITATION_WINDOW_LABEL} invitation.`,
         actionUrl: `/reviewer/projects/${project.id}`,
         metadata: {
           matchingRunIds: runs.map((run) => run.id),
@@ -3132,6 +3199,145 @@ export class MatchingService {
     return qb;
   }
 
+  /**
+   * Works out which filter emptied the candidate pool, so the error names the
+   * real blocker instead of always blaming skills, rate and availability.
+   * Only runs when matching has already failed, so the extra queries are cheap.
+   */
+  private async explainEmptyCandidatePool(
+    roleKey: string,
+    project: Project,
+    maxRate: number | null,
+    minimumAvailability: number,
+    survivedSqlFilters: number,
+    requiredRoleSkills: string[],
+  ): Promise<string> {
+    const currency = project.quotedCurrency ?? project.currency ?? '';
+    const rateLabel =
+      maxRate != null ? `${maxRate.toFixed(2)} ${currency}/hour`.trim() : null;
+
+    // The SQL filters passed but the in-memory skills filter rejected everyone.
+    if (survivedSqlFilters > 0) {
+      return `No ${roleKey} freelancer matches the required role skills (${requiredRoleSkills.join(', ')}). ${survivedSqlFilters} otherwise-eligible profile(s) were rejected on skills alone.`;
+    }
+
+    const count = async (where: string, params: Record<string, unknown> = {}) =>
+      this.profileRepo
+        .createQueryBuilder('p')
+        .where(where, params)
+        .getCount();
+
+    const approved = await count("p.verificationStatus = 'approved' AND p.deletedAt IS NULL");
+    if (!approved) {
+      return `No approved freelancer exists yet, so ${roleKey} cannot be staffed. Approve at least one freelancer before matching.`;
+    }
+
+    const available = await count(
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true",
+    );
+    if (!available) {
+      return `All ${approved} approved freelancer(s) are marked unavailable, so ${roleKey} cannot be staffed.`;
+    }
+
+    const withGithub = await count(
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL",
+    );
+    if (!withGithub) {
+      return `None of the ${available} available approved freelancer(s) has a GitHub username, which matching requires. Add one to their profile before matching ${roleKey}.`;
+    }
+
+    const withHours = await count(
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL AND COALESCE(p.availabilityHoursPerWeek, 0) >= :hours",
+      { hours: minimumAvailability },
+    );
+    if (!withHours) {
+      return `None of the ${withGithub} eligible freelancer(s) has the ${minimumAvailability} availability hours/week this ${roleKey} role needs.`;
+    }
+
+    if (roleKey === PRINCIPAL_REVIEWER_ROLE) {
+      const approvedReviewers = await count(
+        "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND p.principalReviewerStatus = 'approved' AND p.principalReviewerHourlyRate IS NOT NULL",
+      );
+      if (!approvedReviewers) {
+        return `No freelancer is an approved principal reviewer with a principal-reviewer rate set, so ${roleKey} cannot be staffed.`;
+      }
+      return `All ${approvedReviewers} approved principal reviewer(s) are excluded — they are already at their concurrent-project limit, are already on this project, or their principal-reviewer rate exceeds${rateLabel ? ` the allocated maximum of ${rateLabel}` : ' the allocated maximum'}. Free up a reviewer or approve another one.`;
+    }
+
+    if (rateLabel) {
+      const withinRate = await count(
+        "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL AND COALESCE(p.availabilityHoursPerWeek, 0) >= :hours AND p.hourlyRate IS NOT NULL AND p.hourlyRate <= :rate",
+        { hours: minimumAvailability, rate: maxRate },
+      );
+      if (!withinRate) {
+        return `None of the ${withHours} eligible freelancer(s) charges within the allocated maximum of ${rateLabel}. Increase the budget or lower the rate expectation for ${roleKey}.`;
+      }
+    }
+
+    return `No ${roleKey} freelancer is selectable: every otherwise-eligible profile is already assigned to this project or holds a task on it.`;
+  }
+
+  /**
+   * Explains which filter emptied an implementation task's candidate pool.
+   * The old message blamed skills, rate and availability regardless of cause —
+   * the same defect #19 fixed for planning roles, left behind on this path.
+   */
+  private async explainEmptyTaskPool(
+    task: ProjectTask,
+    project: Project,
+    maxRate: number | null,
+    skills: string[],
+  ): Promise<string> {
+    const currency = project.quotedCurrency ?? project.currency ?? '';
+    const rateLabel =
+      maxRate != null ? `${maxRate.toFixed(2)} ${currency}`.trim() : null;
+
+    const count = async (where: string, params: Record<string, unknown> = {}) =>
+      this.profileRepo.createQueryBuilder('p').where(where, params).getCount();
+
+    const base =
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL";
+
+    const eligible = await count(base);
+    if (!eligible) {
+      return `No approved, available freelancer with a GitHub username exists, so "${task.title}" cannot be staffed.`;
+    }
+
+    const free = await count(
+      `${base} AND NOT EXISTS (
+         SELECT 1 FROM project_role_assignments a
+         WHERE a.freelancer_profile_id = p.id AND a.project_id = :projectId
+           AND a.status IN ('assigned','accepted','in_progress')
+       )`,
+      { projectId: project.id },
+    );
+    if (!free) {
+      return `All ${eligible} eligible freelancer(s) already hold a role on this project, so nobody is free for "${task.title}". Add another approved freelancer.`;
+    }
+
+    if (skills.length) {
+      const withSkills = await count(
+        `${base} AND EXISTS (SELECT 1 FROM unnest(p.skills) sk WHERE lower(sk) = ANY(:taskSkills))`,
+        { taskSkills: skills.map((skill) => skill.toLowerCase()) },
+      );
+      if (!withSkills) {
+        return `No freelancer has any of the skills "${task.title}" requires (${skills.join(', ')}). ${eligible} eligible profile(s) were checked.`;
+      }
+    }
+
+    if (rateLabel) {
+      const affordable = await count(
+        `${base} AND p.hourlyRate IS NOT NULL AND p.hourlyRate <= :rate`,
+        { rate: maxRate },
+      );
+      if (!affordable) {
+        return `No eligible freelancer charges within the ${rateLabel}/hour allocated to "${task.title}". Increase the task budget.`;
+      }
+    }
+
+    return `No freelancer satisfies every requirement for "${task.title}" at once — skills, the ${rateLabel ?? 'allocated'} rate, availability, and not already holding a role on this project.`;
+  }
+
   private async buildCandidatePool(
     dto: StartPlanningMatchingDto,
     brief: Brief | null,
@@ -3181,9 +3387,15 @@ export class MatchingService {
         },
       );
       cappedQb.andWhere(
+        // Only assignments on live projects count against capacity. Projects are
+        // soft-deleted, so without the deleted_at check a deleted project holds
+        // a reviewer slot forever and silently locks matching out. ISSUES.md #20.
         `(
           SELECT COUNT(DISTINCT reviewer_assignment.project_id)
           FROM project_role_assignments reviewer_assignment
+          INNER JOIN projects reviewer_project
+            ON reviewer_project.id = reviewer_assignment.project_id
+           AND reviewer_project.deleted_at IS NULL
           WHERE reviewer_assignment.freelancer_profile_id = p.id
             AND reviewer_assignment.phase = 'governance'
             AND reviewer_assignment.role_key = :principalReviewerRole
@@ -3204,8 +3416,21 @@ export class MatchingService {
       { roleMinAvailability: minimumAvailability },
     );
     if (maxRate != null) {
+      // The cap is in the project's currency; the freelancer's rate is in
+      // theirs. Compare them in one unit instead of as bare numbers.
+      // See ISSUES.md #9.
+      const capCurrency = project.quotedCurrency ?? project.currency;
+      const converted = rateInCurrencySql(
+        rateColumn,
+        'p.hourlyRateCurrency',
+        capCurrency,
+      );
       cappedQb.andWhere(`${rateColumn} IS NOT NULL`);
-      cappedQb.andWhere(`${rateColumn} <= :maxRate`, { maxRate });
+      cappedQb.andWhere(`${converted.sql} IS NOT NULL`);
+      cappedQb.andWhere(`${converted.sql} <= :maxRate`, {
+        maxRate,
+        ...converted.params,
+      });
     }
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
@@ -3227,8 +3452,19 @@ export class MatchingService {
       : fetchedProfiles;
 
     if (!profiles.length) {
+      // The old message named skills, rate and availability whatever the real
+      // cause was, and sent people hunting in the wrong place — the actual
+      // blocker was usually reviewer capacity or a missing GitHub username.
+      // Report which filter actually emptied the pool. ISSUES.md #19.
       throw new ConflictException(
-        `No ${roleKey} freelancer fits the required role skills${maxRate != null ? `, allocated maximum rate of ${maxRate.toFixed(2)} ${project.quotedCurrency ?? project.currency}/hour,` : ','} and ${minimumAvailability} availability hours/week. Increase the budget or add an eligible approved freelancer before matching.`,
+        await this.explainEmptyCandidatePool(
+          roleKey,
+          project,
+          maxRate,
+          minimumAvailability,
+          fetchedProfiles.length,
+          requiredRoleSkills,
+        ),
       );
     }
 
@@ -3259,6 +3495,10 @@ export class MatchingService {
     filters: PlanningMatchingFiltersDto | undefined,
     maxRate: number | null,
   ): Promise<MatchCandidateInputDto[]> {
+    const project = await this.projectRepo.findOne({
+      where: { id: task.projectId },
+    });
+    if (!project) throw new NotFoundException('Project not found');
     const qb = this.buildProfileQuery(filters);
     const skills = filters?.skills?.length
       ? filters.skills
@@ -3280,8 +3520,22 @@ export class MatchingService {
       },
     );
     if (maxRate != null) {
+      // Convert before comparing — the cap is in the project's currency and the
+      // freelancer's rate is in theirs. The planning path already did this; this
+      // task path was still comparing bare numbers. See ISSUES.md #9.
+      const taskCapCurrency = project.quotedCurrency ?? project.currency;
+      const taskConverted = rateInCurrencySql(
+        'p.hourlyRate',
+        'p.hourlyRateCurrency',
+        taskCapCurrency,
+        'taskfx',
+      );
       narrowedQb.andWhere('p.hourlyRate IS NOT NULL');
-      narrowedQb.andWhere('p.hourlyRate <= :maxRate', { maxRate });
+      narrowedQb.andWhere(`${taskConverted.sql} IS NOT NULL`);
+      narrowedQb.andWhere(`${taskConverted.sql} <= :maxRate`, {
+        maxRate,
+        ...taskConverted.params,
+      });
     }
     if (skills.length) {
       narrowedQb.andWhere(
@@ -3293,8 +3547,10 @@ export class MatchingService {
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
     const profiles = await narrowedQb.take(poolCap).getMany();
     if (!profiles.length) {
+      // Name the filter that actually emptied the pool. This path kept the old
+      // blame-everything message after #19 fixed the planning path.
       throw new ConflictException(
-        'No eligible approved freelancer fits this task required skills, allocated rate, and availability. Increase the budget or add a role-fit freelancer.',
+        await this.explainEmptyTaskPool(task, project, maxRate, skills),
       );
     }
 
@@ -3694,6 +3950,9 @@ export class MatchingService {
       cvUrl: profile.cvUrl,
       hourlyRate:
         profile.hourlyRate != null ? Number(profile.hourlyRate) : null,
+      // Without the unit a reviewer sees "Rate: 40 / hour" and cannot tell
+      // whether that is dollars or pounds. ISSUES.md #9 / #24.
+      hourlyRateCurrency: profile.hourlyRateCurrency ?? null,
       recommendedHourlyRate:
         profile.recommendedHourlyRate != null
           ? Number(profile.recommendedHourlyRate)

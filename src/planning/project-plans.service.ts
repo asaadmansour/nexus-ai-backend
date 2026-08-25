@@ -1,4 +1,5 @@
 import {
+  Logger,
   BadRequestException,
   ConflictException,
   ForbiddenException,
@@ -47,6 +48,7 @@ import {
   platformFeeAllocation,
 } from './project-budget-allocation';
 import { allocateProjectTaskBudgets } from './task-budget-allocation';
+import { NotificationsService } from 'src/notifications/notifications.service';
 
 interface Requester {
   userId: string;
@@ -75,6 +77,7 @@ export function canFreelancerTransitionTask(
 
 @Injectable()
 export class ProjectPlansService {
+  private readonly logger = new Logger(ProjectPlansService.name);
   constructor(
     @InjectRepository(ProjectPlan)
     private readonly planRepo: Repository<ProjectPlan>,
@@ -100,6 +103,7 @@ export class ProjectPlansService {
     private readonly aiJobsProducer: AiJobsProducer,
     private readonly matchingService: MatchingService,
     private readonly dataSource: DataSource,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -726,6 +730,10 @@ export class ProjectPlansService {
       );
     }
 
+    // Set inside the transaction when the generated schedule ends after the
+    // customer's deadline, acted on once the plan is committed. ISSUES.md #26.
+    let scheduleOverrunDays: number | null = null;
+
     const milestones = (plan.milestones ??
       []) as unknown as ProjectPlanMilestone[];
     const tasks = (plan.tasks ?? []) as unknown as ProjectPlanTask[];
@@ -978,6 +986,32 @@ export class ProjectPlansService {
           dependencyCount += 1;
         }
 
+        // A plan can be generated whose last task already ends after the
+        // customer's deadline. Previously nothing compared the two at generation
+        // time — the only check ran on rematch, long after work had started.
+        // This warns; it does not block, and it does not move the deadline.
+        // See ISSUES.md #26.
+        if (project.deadline) {
+          const latestDueAt = await manager
+            .getRepository(ProjectTask)
+            .createQueryBuilder('task')
+            .select('MAX(task.dueAt)', 'latest')
+            .where('task.projectId = :projectId', { projectId: plan.projectId })
+            .getRawOne<{ latest: Date | null }>();
+          const latest = latestDueAt?.latest
+            ? new Date(latestDueAt.latest)
+            : null;
+          if (latest && latest.getTime() > project.deadline.getTime()) {
+            const overrunDays = Math.ceil(
+              (latest.getTime() - project.deadline.getTime()) / 86_400_000,
+            );
+            this.logger.warn(
+              `Plan ${plan.id} for project ${plan.projectId} ends ${overrunDays} day(s) after the customer deadline (${project.deadline.toISOString().slice(0, 10)}).`,
+            );
+            scheduleOverrunDays = overrunDays;
+          }
+        }
+
         const spec = await manager.save(
           ProjectSpec,
           manager.create(ProjectSpec, {
@@ -1054,6 +1088,31 @@ export class ProjectPlansService {
         };
       },
     );
+    // Tell the customer up front if the plan already overruns their deadline,
+    // rather than leaving them to discover it when the work lands late.
+    // Warning only — it does not block materialization. ISSUES.md #26.
+    if (scheduleOverrunDays && scheduleOverrunDays > 0) {
+      const overrunProject = await this.dataSource
+        .getRepository(Project)
+        .findOne({ where: { id: plan.projectId } });
+      if (overrunProject?.customerId) {
+        await this.notificationsService
+          .createNotification({
+            userId: overrunProject.customerId,
+            projectId: plan.projectId,
+            type: 'schedule_risk',
+            title: 'The plan finishes after your deadline',
+            body: `The approved plan currently ends about ${scheduleOverrunDays} day(s) after your deadline${overrunProject.deadline ? ` of ${overrunProject.deadline.toISOString().slice(0, 10)}` : ''}. Your principal reviewer can adjust scope or agree a new date with you.`,
+            actionUrl: `/projects/${plan.projectId}`,
+          })
+          .catch((error: unknown) =>
+            this.logger.error(
+              `Could not notify customer of schedule overrun for project ${plan.projectId}: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+          );
+      }
+    }
+
     const matchingDispatch =
       await this.matchingService.autoStartImplementationTasks(
         plan.projectId,

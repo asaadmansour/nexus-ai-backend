@@ -25,6 +25,10 @@ import { calculateAssessedHourlyRate } from './freelancer-rate';
 import { SaveAssessmentAnswersDto } from './dtos/save-assessment-answers.dto';
 import { SubmitAssessmentDto } from './dtos/submit-assessment.dto';
 import { TrackAssessmentEventDto } from './dtos/track-assessment-event.dto';
+import {
+  describeMissingPrerequisites,
+  missingMatchingPrerequisites,
+} from './matching-prerequisites';
 
 const MAX_WARNING_COUNT = 3;
 const ACTIVE_STATUS = 'in_progress';
@@ -810,7 +814,16 @@ export class FreelancerAssessmentsService {
 
         profile.assessmentScore = score;
         profile.assessmentSubmittedAt = submittedAt;
-        if (autoDecision === 'approved') {
+        // A profile matching can never select must not be auto-approved — it
+        // would leave the freelancer approved but permanently unstaffable. Route
+        // it to manual admin review instead of rejecting anyone. ISSUES.md #21.
+        const missingPrerequisites = missingMatchingPrerequisites(profile);
+        if (autoDecision === 'approved' && missingPrerequisites.length) {
+          this.logger.warn(
+            `Auto-approval held for freelancer profile ${profile.id}: missing ${describeMissingPrerequisites(missingPrerequisites)}. Sent for manual review instead.`,
+          );
+          profile.verificationStatus = 'assessment_submitted';
+        } else if (autoDecision === 'approved') {
           profile.verificationStatus = 'approved';
           profile.approvedAt = submittedAt;
           profile.rejectedAt = null;

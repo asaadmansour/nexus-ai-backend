@@ -1,4 +1,5 @@
 import {
+  IsIn,
   IsString,
   IsOptional,
   IsArray,
@@ -48,6 +49,13 @@ export class UpdateFreelancerDto {
   @IsNumber()
   @Min(0)
   hourlyRate?: number;
+
+  /** Unit for hourlyRate. Defaults to USD when never set. ISSUES.md #9. */
+  @IsOptional()
+  @IsIn(['EGP', 'USD', 'EUR', 'GBP'], {
+    message: 'hourlyRateCurrency must be one of: EGP, USD, EUR, GBP',
+  })
+  hourlyRateCurrency?: string;
 
   @IsOptional()
   @IsBoolean()

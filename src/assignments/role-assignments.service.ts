@@ -468,6 +468,17 @@ export class RoleAssignmentsService {
             .join(', '),
           roleBriefStatus: 'task_contract',
           nextAction: `Open ${tasks.length} implementation task${tasks.length === 1 ? '' : 's'}`,
+          // The row names the work ("Stripe Payment Integration") but carried no
+          // id, so the UI could only link to the project and the freelancer had
+          // to hunt for the task — landing on the wrong deliverable instead.
+          // See ISSUES.md #35.
+          tasks: tasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            assignmentStatus: task.assignmentStatus,
+            dueAt: task.dueAt ?? null,
+          })),
         };
       })
       .filter(

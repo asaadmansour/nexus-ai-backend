@@ -101,7 +101,7 @@ export class BriefService {
 
     return this.briefMessageRepo.find({
       where: { briefId: brief.id },
-      order: { createdAt: 'ASC' },
+      order: { sequence: 'ASC' },
     });
   }
 
@@ -205,6 +205,11 @@ export class BriefService {
     this.applyExtractedFieldsToBrief(brief, extractedFields, dto.content);
 
     const result = await this.dataSource.transaction(async (manager) => {
+      // Number the pair explicitly so the customer's answer always precedes the
+      // agent's reply, whatever the timestamps say. ISSUES.md #12.
+      const firstSequence = await this.nextMessageSequence(manager, brief.id);
+      customerMessage.sequence = firstSequence;
+      agentMessage.sequence = firstSequence + 1;
       const savedCustomerMessage = await manager.save(
         BriefMessage,
         customerMessage,
@@ -316,6 +321,7 @@ export class BriefService {
         BriefMessage,
         manager.create(BriefMessage, {
           briefId: brief.id,
+          sequence: await this.nextMessageSequence(manager, brief.id),
           senderType: 'agent',
           message:
             'Sure, tell me what you want to change or clarify. I can help with a few focused revisions, or you can edit the brief fields directly.',
@@ -466,10 +472,16 @@ export class BriefService {
       return this.buildAdviceReply(guidanceField);
     }
 
+    // A model reply is only usable if it asks about the field the state machine
+    // is actually waiting on. Without this the chat ran one question behind:
+    // the customer was shown the question for the step just completed, answered
+    // it, and saw no progress because the answer was credited elsewhere.
+    // See ISSUES.md #16 (and #14, which is the same defect).
     if (
       assistantReply &&
       !this.looksLikePrematureCompletionReply(assistantReply, missingFields) &&
       !this.looksLikeAnsweredFieldQuestion(assistantReply, missingFields) &&
+      this.replyTargetsField(assistantReply, nextQuestionField) &&
       (!lastAgentMessage ||
         this.normalizeComparableText(lastAgentMessage.content) !==
           this.normalizeComparableText(assistantReply))
@@ -481,11 +493,15 @@ export class BriefService {
       return 'Thanks, the brief has enough detail to continue.';
     }
 
-    const fallbackPrompt = this.buildNaturalFollowUpPrompt(missingFields[0]);
+    // Ask about the pending field, not simply the first missing one.
+    const fallbackPrompt = this.buildNaturalFollowUpPrompt(
+      nextQuestionField ?? missingFields[0],
+    );
 
     if (
       suggestedReply &&
       !this.looksLikeAnsweredFieldQuestion(suggestedReply, missingFields) &&
+      this.replyTargetsField(suggestedReply, nextQuestionField) &&
       (!lastAgentMessage ||
         this.normalizeComparableText(lastAgentMessage.content) !==
           this.normalizeComparableText(suggestedReply))
@@ -519,13 +535,12 @@ export class BriefService {
     ].some((phrase) => normalized.includes(phrase));
   }
 
-  private looksLikeAnsweredFieldQuestion(
-    reply: string,
-    missingFields: string[],
-  ) {
-    const normalized = this.normalizeComparableText(reply);
-    const missing = new Set(missingFields);
-    const markersByField: Record<string, string[]> = {
+  /**
+   * Phrases that identify which brief field a question is asking about. Used
+   * both to spot a question about an already-answered field and to confirm a
+   * reply actually asks about the field the state machine is waiting on.
+   */
+  private static readonly QUESTION_MARKERS_BY_FIELD: Record<string, string[]> = {
       businessDomain: ['what kind of business', 'what domain'],
       mainGoal: ['main outcome', 'main thing', 'want this project to achieve'],
       targetUsers: ['who will use', 'who do you expect will use'],
@@ -547,13 +562,36 @@ export class BriefService {
       clientBackground: ['your background', 'what is your background'],
       suggestedTeamSize: ['team size'],
       experienceLevel: ['junior, mid, senior', 'experience level'],
-      experienceMinYears: ['minimum years', 'years-of-experience'],
-    };
+    experienceMinYears: ['minimum years', 'years-of-experience'],
+  };
 
-    return Object.entries(markersByField).some(([field, markers]) => {
-      if (missing.has(field)) return false;
-      return markers.some((marker) => normalized.includes(marker));
-    });
+  private looksLikeAnsweredFieldQuestion(
+    reply: string,
+    missingFields: string[],
+  ) {
+    const normalized = this.normalizeComparableText(reply);
+    const missing = new Set(missingFields);
+    return Object.entries(BriefService.QUESTION_MARKERS_BY_FIELD).some(
+      ([field, markers]) => {
+        if (missing.has(field)) return false;
+        return markers.some((marker) => normalized.includes(marker));
+      },
+    );
+  }
+
+  /**
+   * True when the reply asks about `field`. The model writes its reply from the
+   * conversation so far and would routinely ask about the step it had just
+   * completed, one behind `next_question_field` — the customer saw a stale
+   * question, answered it, and the answer was credited to a different field.
+   * See ISSUES.md #16.
+   */
+  private replyTargetsField(reply: string, field: string | null) {
+    if (!field) return true;
+    const markers = BriefService.QUESTION_MARKERS_BY_FIELD[field];
+    if (!markers?.length) return true;
+    const normalized = this.normalizeComparableText(reply);
+    return markers.some((marker) => normalized.includes(marker));
   }
 
   private resolveNextQuestionField(
@@ -615,7 +653,7 @@ export class BriefService {
   private async ensureInitialAgentMessage(brief: Brief, project: Project) {
     const firstAgentMessage = await this.briefMessageRepo.findOne({
       where: { briefId: brief.id, senderType: 'agent' },
-      order: { createdAt: 'ASC' },
+      order: { sequence: 'ASC' },
     });
 
     if (firstAgentMessage) {
@@ -721,7 +759,7 @@ export class BriefService {
   private async getRecentMessages(briefId: string) {
     const messages = await this.briefMessageRepo.find({
       where: { briefId },
-      order: { createdAt: 'DESC' },
+      order: { sequence: 'DESC' },
       take: RECENT_BRIEF_MESSAGE_LIMIT,
     });
 
@@ -810,7 +848,11 @@ export class BriefService {
     const fields: ExtractedBriefFields = {};
     const budget = this.formatProjectBudget(project);
 
-    if (project.title) fields.projectType = project.title;
+    // projectType is a classification of the work ("multi-page web application"),
+    // not the project's name. Seeding it from the title made every brief in the
+    // database carry its own title here, which is useless to pricing and
+    // matching. It is derived from solutionType once known instead.
+    // See ISSUES.md #15.
     if (project.description) fields.mainGoal = project.description;
     if (budget) fields.budget = budget;
     if (project.deadline) {
@@ -1136,7 +1178,10 @@ export class BriefService {
   ) {
     const fields = extractedFields ?? {};
 
-    const projectType = this.toSingleLineText(fields.projectType, 100);
+    const projectType = this.toSingleLineText(
+      fields.projectType ?? fields.solutionType,
+      100,
+    );
     if (projectType) brief.projectType = projectType;
 
     const domain = this.toSingleLineText(fields.businessDomain, 100);
@@ -1195,11 +1240,13 @@ export class BriefService {
       brief.experienceMinYears = experienceMinYears;
     }
 
+    // `technical` is for technical requirements only. It used to receive every
+    // answer, including mainGoal, targetUsers, coreFeatures and platforms —
+    // which already have their own columns and are the source of truth. Anything
+    // reading "technical requirements" got the whole interview instead.
+    // Reads still fall back to the old keys for briefs written before this.
+    // See ISSUES.md #17.
     brief.technical = this.mergeJsonSection(brief.technical, {
-      mainGoal: this.toTextValue(fields.mainGoal),
-      targetUsers: this.toStringList(fields.targetUsers),
-      coreFeatures: this.toStringList(fields.coreFeatures),
-      platforms: this.toStringList(fields.platforms),
       solutionType: this.toTextValue(fields.solutionType),
       scopeDetails: this.toTextValue(fields.scopeDetails),
       integrations: this.toStringList(fields.integrations),
@@ -1376,8 +1423,14 @@ export class BriefService {
     const text = this.toTextValue(value);
     if (!text) return [];
 
+    // Do not split on the word "and": it appears inside legitimate feature
+    // names, and splitting there turned the customer's "search by title and
+    // author" into two features, one of them literally called "author".
+    // "Login and registration", "drag and drop upload" and "terms and
+    // conditions" break the same way. Commas, semicolons and newlines are
+    // genuine list separators; "and" is not. See ISSUES.md #28.
     return text
-      .split(/,|;|\n|\band\b/gi)
+      .split(/[,;\n]/g)
       .map((item) => this.toSingleLineText(item, 160))
       .filter((item): item is string => Boolean(item));
   }
@@ -1600,6 +1653,22 @@ export class BriefService {
     return Math.round(
       (completedFields / USER_REQUIRED_BRIEF_FIELDS.length) * 100,
     );
+  }
+
+  /**
+   * Next per-brief message number. Ordering by `created_at` alone was ambiguous
+   * because a customer answer and the agent reply share a timestamp — the pair
+   * could render in either order. See ISSUES.md #12.
+   */
+  private async nextMessageSequence(
+    manager: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+    briefId: string,
+  ): Promise<number> {
+    const rows = (await manager.query(
+      `SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM brief_messages WHERE brief_id = $1`,
+      [briefId],
+    )) as Array<{ next: string | number }>;
+    return Number(rows?.[0]?.next ?? 1);
   }
 
   private getRevisionCount(brief: Brief) {

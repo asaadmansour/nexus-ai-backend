@@ -155,6 +155,19 @@ export class FreelancerProfile {
   })
   hourlyRate: string | null;
 
+  /**
+   * Unit for `hourlyRate` and `principalReviewerHourlyRate`. Without it, rates
+   * were compared straight against project budgets held in a different
+   * currency. See ISSUES.md #9.
+   */
+  @Column({
+    name: 'hourly_rate_currency',
+    type: 'varchar',
+    length: 3,
+    default: 'USD',
+  })
+  hourlyRateCurrency: string;
+
   @Column({
     name: 'recommended_hourly_rate',
     type: 'numeric',
