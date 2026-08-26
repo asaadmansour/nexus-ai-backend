@@ -1268,17 +1268,32 @@ export class BriefService {
       return;
     }
 
-    await this.briefMessageRepo.save(
-      this.briefMessageRepo.create({
-        briefId: brief.id,
-        senderType: 'agent',
-        message: await this.buildInitialAgentMessage(brief, project),
-        metadata: {
-          systemPrompt: true,
-          initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
-        },
-      }),
-    );
+    const message = await this.buildInitialAgentMessage(brief, project);
+    await this.dataSource.transaction(async (manager) => {
+      // Allocate first so this transaction owns the per-brief sequence lock.
+      // Another request may have created the greeting while the AI response was
+      // being prepared, so re-check only after acquiring that lock.
+      const sequence = await this.nextMessageSequence(manager, brief.id);
+      const concurrentlyCreated = await manager.findOne(BriefMessage, {
+        where: { briefId: brief.id, senderType: 'agent' },
+        order: { sequence: 'ASC' },
+      });
+      if (concurrentlyCreated) return;
+
+      await manager.save(
+        BriefMessage,
+        manager.create(BriefMessage, {
+          briefId: brief.id,
+          sequence,
+          senderType: 'agent',
+          message,
+          metadata: {
+            systemPrompt: true,
+            initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
+          },
+        }),
+      );
+    });
   }
 
   private async buildInitialAgentMessage(brief: Brief, project: Project) {
@@ -2335,6 +2350,12 @@ export class BriefService {
     manager: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
     briefId: string,
   ): Promise<number> {
+    // MAX + 1 is safe only while every writer for this brief holds the same
+    // transaction-scoped lock. The unique index remains the final invariant,
+    // while this lock prevents ordinary concurrent sends from colliding with it.
+    await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+      `brief-message-sequence:${briefId}`,
+    ]);
     const rows = (await manager.query(
       `SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM brief_messages WHERE brief_id = $1`,
       [briefId],
