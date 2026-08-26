@@ -17,6 +17,50 @@ describe('AiService requirements guard', () => {
     expect(result.extractionSource).toBe('scope_guard');
   });
 
+  it('blocks malformed unrelated questions and resumes the actual pending field', async () => {
+    const result = await service.validateBrief({
+      briefText: 'what is capital Egypt',
+      currentBrief: {
+        pendingField: 'integrations',
+        missingFields: ['integrations', 'adminNeeds'],
+      },
+    });
+
+    expect(result.extractedFields).toEqual({});
+    expect(result.suggestedReply).not.toContain('Cairo');
+    expect(result.suggestedReply).toContain('outside services');
+    expect(result.replyMode).toBe('scope_boundary');
+  });
+
+  it('blocks arbitrary non-project instructions, not only a trivia allowlist', async () => {
+    const result = await service.validateBrief({
+      briefText: 'Explain photosynthesis to me',
+    });
+
+    expect(result.extractionSource).toBe('scope_guard');
+    expect(result.extractedFields).toEqual({});
+    expect(result.suggestedReply).not.toContain('chlorophyll');
+  });
+
+  it('does not let a project keyword smuggle an unrelated knowledge request through', async () => {
+    const result = await service.validateBrief({
+      briefText: 'Explain photosynthesis for my website project',
+    });
+
+    expect(result.extractionSource).toBe('scope_guard');
+    expect(result.extractedFields).toEqual({});
+    expect(result.suggestedReply).not.toContain('chlorophyll');
+  });
+
+  it('does not perform general writing work inside requirements chat', async () => {
+    const result = await service.validateBrief({
+      briefText: 'Write a business email for me',
+    });
+
+    expect(result.extractionSource).toBe('scope_guard');
+    expect(result.extractedFields).toEqual({});
+  });
+
   it('uses the same nine customer-required fields as the production flow', async () => {
     const result = await service.validateBrief({
       briefText: 'That is all.',

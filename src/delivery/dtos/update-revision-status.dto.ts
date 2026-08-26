@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 
 export class UpdateRevisionStatusDto {
   @IsIn(['open', 'in_progress', 'resolved', 'cancelled'])
@@ -6,5 +6,6 @@ export class UpdateRevisionStatusDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   notes?: string;
 }

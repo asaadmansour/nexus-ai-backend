@@ -1,4 +1,11 @@
-import { IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import {
+  IsNumber,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class UpdateFreelancerSkillScoreDto {
   @IsNumber()
@@ -14,5 +21,6 @@ export class UpdateFreelancerSkillScoreDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   evidence?: string;
 }

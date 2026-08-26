@@ -6,6 +6,7 @@ export const QUEUES = {
   PROJECT_PLAN_GENERATION: 'project-plan-generation',
   PLANNING_SUBMISSION_EVALUATION: 'planning-submission-evaluation',
   SUBMISSION_EVALUATION: 'submission-evaluation',
+  REQUIREMENTS_DOCUMENT_PROCESSING: 'requirements-document-processing',
 } as const;
 
 export const JOBS = {
@@ -16,6 +17,7 @@ export const JOBS = {
   GENERATE_PROJECT_PLAN: 'generate-project-plan',
   EVALUATE_PLANNING_SUBMISSION: 'evaluate-planning-submission',
   EVALUATE_SUBMISSION: 'evaluate-submission',
+  PROCESS_REQUIREMENTS_DOCUMENT: 'process-requirements-document',
 } as const;
 
 export const AI_JOB_TYPES = {

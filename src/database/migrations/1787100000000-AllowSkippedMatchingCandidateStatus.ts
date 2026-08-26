@@ -20,9 +20,7 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  *   expired      invitation timed out
  *   skipped      passed over for another candidate
  */
-export class AllowSkippedMatchingCandidateStatus1787100000000
-  implements MigrationInterface
-{
+export class AllowSkippedMatchingCandidateStatus1787100000000 implements MigrationInterface {
   name = 'AllowSkippedMatchingCandidateStatus1787100000000';
 
   private static readonly ALL_STATUSES = [

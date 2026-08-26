@@ -7,6 +7,7 @@ import {
   IsUUID,
   MaxLength,
 } from 'class-validator';
+import { IsFutureDate } from 'src/common/decorators/is-future-date.decorator';
 
 export class CreateRevisionRequestDto {
   @IsOptional()
@@ -35,6 +36,7 @@ export class CreateRevisionRequestDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(12000)
   description?: string;
 
   @IsOptional()
@@ -47,5 +49,6 @@ export class CreateRevisionRequestDto {
 
   @IsOptional()
   @IsDateString()
+  @IsFutureDate()
   dueAt?: string;
 }

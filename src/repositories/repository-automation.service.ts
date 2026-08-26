@@ -5,6 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { RepositoriesService } from './repositories.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 @Injectable()
 export class RepositoryAutomationService
@@ -14,7 +15,10 @@ export class RepositoryAutomationService
   private timer: NodeJS.Timeout | null = null;
   private running = false;
 
-  constructor(private readonly repositories: RepositoriesService) {}
+  constructor(
+    private readonly repositories: RepositoriesService,
+    private readonly incidents: AutomationIncidentsService,
+  ) {}
 
   onModuleInit() {
     this.timer = setInterval(() => void this.reconcile(), 5 * 60_000);
@@ -31,10 +35,17 @@ export class RepositoryAutomationService
     this.running = true;
     try {
       await this.repositories.reconcileAutomation();
+      await this.incidents.resolveOperation('repositories', 'reconcile');
     } catch (error) {
-      this.logger.error(
-        `Repository automation scan failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Repository automation scan failed: ${message}`);
+      await this.incidents.record({
+        subsystem: 'repositories',
+        operation: 'reconcile',
+        errorCode: 'scan_failed',
+        severity: 'critical',
+        message,
+      });
     } finally {
       this.running = false;
     }

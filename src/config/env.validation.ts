@@ -32,6 +32,11 @@ export function validateEnv(config: Env): Env {
         'TWILIO_VERIFY_SERVICE_SID',
       );
     }
+    if (
+      (config.REQUIREMENTS_DOCUMENT_MALWARE_SCAN_REQUIRED ?? 'true') === 'true'
+    ) {
+      requiredKeys.push('CLAMAV_HOST');
+    }
   }
   const missingKeys = requiredKeys.filter((key) => !config[key]);
 

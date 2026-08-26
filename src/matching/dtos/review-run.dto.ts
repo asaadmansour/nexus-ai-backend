@@ -1,4 +1,11 @@
-import { IsBoolean, IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+} from 'class-validator';
 
 export class ReviewRunDto {
   @IsIn(['approved', 'rejected', 'rerun_required'])
@@ -14,5 +21,6 @@ export class ReviewRunDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   notes?: string;
 }

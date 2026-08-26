@@ -12,9 +12,7 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  * figures — the same numbers read as EGP would be below minimum wage — so USD is
  * the backfill.
  */
-export class AddFreelancerRateCurrency1787000000000
-  implements MigrationInterface
-{
+export class AddFreelancerRateCurrency1787000000000 implements MigrationInterface {
   name = 'AddFreelancerRateCurrency1787000000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {

@@ -7,6 +7,8 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  ArrayMaxSize,
+  MaxLength,
   Max,
   Min,
   ValidateNested,
@@ -18,25 +20,31 @@ export class PlanningMatchingFiltersDto {
   @IsOptional()
   @IsNumber()
   @Min(0)
+  @Max(9_999_999_999.99)
   maxHourlyRate?: number;
 
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(168)
   minAvailabilityHours?: number;
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(50)
   @IsString({ each: true })
+  @MaxLength(80, { each: true })
   skills?: string[];
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(100)
   @IsUUID('4', { each: true })
   includeFreelancerIds?: string[];
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(100)
   @IsUUID('4', { each: true })
   excludeFreelancerIds?: string[];
 

@@ -23,6 +23,7 @@ import {
   SyncCollaboratorsDto,
 } from './dtos/sync-collaborators.dto';
 import { GithubService } from './github.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 type Requester = { userId: string; role: UserRole };
 
@@ -50,6 +51,7 @@ export class RepositoriesService {
     private readonly profileRepo: Repository<FreelancerProfile>,
     private readonly github: GithubService,
     private readonly notificationsService: NotificationsService,
+    private readonly incidents: AutomationIncidentsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -100,8 +102,9 @@ export class RepositoriesService {
     try {
       // If the name is somehow still taken — a leftover repo, or a caller-supplied
       // name — walk a suffix rather than dead-ending the project. ISSUES.md #3.
-      let created: Awaited<ReturnType<typeof this.github.createRepository>> | null =
-        null;
+      let created: Awaited<
+        ReturnType<typeof this.github.createRepository>
+      > | null = null;
       let attemptName = repoName;
       for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
@@ -113,7 +116,8 @@ export class RepositoriesService {
           });
           break;
         } catch (createError) {
-          if (!this.isNameTakenError(createError) || dto.repoName) throw createError;
+          if (!this.isNameTakenError(createError) || dto.repoName)
+            throw createError;
           attemptName = this.buildRepoName(project, attempt + 1);
           this.logger.warn(
             `Repository name already taken for project ${projectId}; retrying as ${attemptName}`,
@@ -538,11 +542,24 @@ export class RepositoriesService {
     for (const projectId of projectIds) {
       try {
         await this.provisionForAssignedTeam(projectId);
+        await this.incidents.resolveOperation(
+          'repositories',
+          'provision_project',
+          projectId,
+        );
         provisioned += 1;
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         this.logger.error(
-          `Automatic repository provisioning failed for ${projectId}: ${error instanceof Error ? error.message : String(error)}`,
+          `Automatic repository provisioning failed for ${projectId}: ${message}`,
         );
+        await this.incidents.record({
+          subsystem: 'repositories',
+          operation: 'provision_project',
+          projectId,
+          errorCode: 'provisioning_failed',
+          message,
+        });
       }
     }
 

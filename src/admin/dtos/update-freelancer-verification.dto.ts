@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 
 export class UpdateFreelancerVerificationDto {
   @IsIn(['approved', 'rejected', 'interview_pending'])
@@ -6,5 +6,6 @@ export class UpdateFreelancerVerificationDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   reason?: string;
 }

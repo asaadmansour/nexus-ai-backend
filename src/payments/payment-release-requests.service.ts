@@ -27,6 +27,7 @@ import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { PayoutAutomationService } from './payout-automation.service';
+import { calculateTaskCompensation } from './task-compensation';
 
 @Injectable()
 export class PaymentReleaseRequestsService {
@@ -256,36 +257,22 @@ export class PaymentReleaseRequestsService {
       );
     }
     const project = await this.getProjectOrThrow(submission.projectId);
-    // Same contract rule as planning assignments: pay the rate the freelancer
-    // agreed, capped by what was allocated for the task. Tasks carry no rate
-    // snapshot, so the assignee's current profile rate is used. ISSUES.md #22.
-    const allocatedTask = Math.max(
-      Number(task.budgetAmount) - Number(task.penaltyAmount ?? 0),
-      0,
-    );
-    const assignee = await this.freelancerProfilesRepository.findOne({
-      where: { id: submission.freelancerProfileId },
+    // Pay the immutable contract rate captured when the task was assigned,
+    // converted into the task's payout currency and capped by escrow.
+    const taskCompensation = calculateTaskCompensation({
+      budgetAmount: task.budgetAmount,
+      penaltyAmount: task.penaltyAmount,
+      estimatedHours: task.estimatedHours,
+      hourlyRateSnapshot: task.hourlyRateSnapshot,
+      hourlyRateCurrencySnapshot: task.hourlyRateCurrencySnapshot,
+      payoutCurrency: task.currency,
     });
-    const taskRate = Number(assignee?.hourlyRate);
-    const taskHours = Number(task.estimatedHours);
-    const taskEarned =
-      Number.isFinite(taskRate) &&
-      taskRate > 0 &&
-      Number.isFinite(taskHours) &&
-      taskHours > 0
-        ? Math.max(
-            this.roundMoney(taskRate * taskHours) -
-              Number(task.penaltyAmount ?? 0),
-            0,
-          )
-        : null;
-    if (taskEarned == null) {
+    if (!taskCompensation.usedRateSnapshot) {
       this.logger.warn(
-        `Task ${task.id} has no usable rate/hours to price from; falling back to the allocated amount.`,
+        `Task ${task.id} has no usable assignment-time rate snapshot; falling back to the remaining allocated amount.`,
       );
     }
-    const amount =
-      taskEarned == null ? allocatedTask : Math.min(taskEarned, allocatedTask);
+    const amount = taskCompensation.amount;
     if (!Number.isFinite(amount) || amount <= 0) {
       throw new BadRequestException('Task compensation is invalid');
     }

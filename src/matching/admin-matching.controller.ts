@@ -29,4 +29,10 @@ export class AdminMatchingController {
     });
     return { status: 'success', data, total, page: pageNum, limit: limitNum };
   }
+
+  @Get('diagnostics')
+  async diagnostics() {
+    const data = await this.matchingService.adminWorkflowDiagnostics();
+    return { status: 'success', data, total: data.length };
+  }
 }

@@ -5,7 +5,11 @@ import {
   IsString,
   IsUUID,
   Min,
+  Max,
+  MaxLength,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { SUPPORTED_CURRENCIES } from 'src/projects/dtos/create-project.dto';
 
 const PAYMENT_PURPOSES = [
   'planning_deposit',
@@ -16,11 +20,17 @@ const PAYMENT_PURPOSES = [
 ] as const;
 
 export class CreateEscrowIntentDto {
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(1)
+  @Max(9_999_999_999.99)
   amount!: number;
 
   @IsString()
+  @MaxLength(3)
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsIn(SUPPORTED_CURRENCIES)
   currency!: string;
 
   @IsOptional()

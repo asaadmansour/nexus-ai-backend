@@ -5,6 +5,7 @@ import {
   IsString,
   Max,
   Min,
+  MaxLength,
 } from 'class-validator';
 
 export class ReviewAssessmentDto {
@@ -13,6 +14,7 @@ export class ReviewAssessmentDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   notes?: string;
 
   @IsOptional()

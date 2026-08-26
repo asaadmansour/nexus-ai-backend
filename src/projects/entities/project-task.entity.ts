@@ -114,6 +114,23 @@ export class ProjectTask {
   @Column({ name: 'assigned_at', type: 'timestamptz', nullable: true })
   assignedAt!: Date | null;
 
+  @Column({
+    name: 'hourly_rate_snapshot',
+    type: 'numeric',
+    precision: 8,
+    scale: 2,
+    nullable: true,
+  })
+  hourlyRateSnapshot!: string | null;
+
+  @Column({
+    name: 'hourly_rate_currency_snapshot',
+    type: 'varchar',
+    length: 3,
+    nullable: true,
+  })
+  hourlyRateCurrencySnapshot!: string | null;
+
   @Column({ type: 'varchar', length: 255 })
   title!: string;
 

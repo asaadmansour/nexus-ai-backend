@@ -1,4 +1,10 @@
-import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
 
 export class ReviewPaymentReleaseRequestDto {
   @IsIn(['approved', 'rejected'])
@@ -6,6 +12,7 @@ export class ReviewPaymentReleaseRequestDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   reviewNotes?: string;
 
   @IsOptional()

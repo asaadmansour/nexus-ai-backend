@@ -1,13 +1,24 @@
-import { IsIn, IsPhoneNumber, IsString, IsOptional } from 'class-validator';
+import {
+  IsIn,
+  IsPhoneNumber,
+  IsString,
+  IsOptional,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 import { UserRole } from 'src/common/enums/user-role.enum';
 
 export class CompleteSignupDto {
   @IsString()
   @IsOptional()
+  @MinLength(1)
+  @MaxLength(100)
   firstName?: string;
 
   @IsString()
   @IsOptional()
+  @MinLength(1)
+  @MaxLength(100)
   lastName?: string;
 
   @IsPhoneNumber('EG')

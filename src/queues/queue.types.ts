@@ -45,3 +45,7 @@ export interface PlanningSubmissionEvaluationJobData {
   projectId: string;
   requestedBy?: string | null;
 }
+
+export interface RequirementsDocumentProcessingJobData {
+  documentId: string;
+}

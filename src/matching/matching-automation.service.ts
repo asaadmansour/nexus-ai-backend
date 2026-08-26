@@ -5,6 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { MatchingService } from './matching.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 @Injectable()
 export class MatchingAutomationService
@@ -14,7 +15,10 @@ export class MatchingAutomationService
   private timer: NodeJS.Timeout | null = null;
   private running = false;
 
-  constructor(private readonly matchingService: MatchingService) {}
+  constructor(
+    private readonly matchingService: MatchingService,
+    private readonly incidents: AutomationIncidentsService,
+  ) {}
 
   onModuleInit() {
     this.timer = setInterval(() => void this.reconcile(), 60_000);
@@ -35,10 +39,17 @@ export class MatchingAutomationService
       await this.matchingService.recoverPlanningRolesAfterReviewerAcceptance();
       await this.matchingService.recoverBlockedStaffing();
       await this.matchingService.recoverImplementationTasksWithoutMatchingRuns();
+      await this.incidents.resolveOperation('matching', 'reconcile');
     } catch (error) {
-      this.logger.error(
-        `Invitation reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Invitation reconciliation failed: ${message}`);
+      await this.incidents.record({
+        subsystem: 'matching',
+        operation: 'reconcile',
+        errorCode: 'scan_failed',
+        severity: 'critical',
+        message,
+      });
     } finally {
       this.running = false;
     }

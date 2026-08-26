@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 
 export const ASSIGNMENT_STATUS_TRANSITIONS = [
   'accepted',
@@ -15,5 +15,6 @@ export class UpdateAssignmentStatusDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   notes?: string;
 }

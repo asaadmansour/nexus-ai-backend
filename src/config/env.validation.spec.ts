@@ -20,6 +20,7 @@ const validConfig = {
   TWILIO_ACCOUNT_SID: 'AC123',
   TWILIO_AUTH_TOKEN: 'twilio-token',
   TWILIO_VERIFY_SERVICE_SID: 'VA123',
+  CLAMAV_HOST: 'clamav',
 };
 
 describe('environment validation', () => {
@@ -92,5 +93,19 @@ describe('environment validation', () => {
     ).toThrow(
       'TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SERVICE_SID',
     );
+  });
+
+  it('requires a malware scanner for production document uploads', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        NODE_ENV: 'production',
+        EVALUATION_SANDBOX_MODE: 'kubernetes',
+        STRIPE_WEBHOOK_SECRET: 'webhook-secret',
+        SMTP_USER: 'smtp-user',
+        SMTP_PASSWORD: 'smtp-password',
+        CLAMAV_HOST: undefined,
+      }),
+    ).toThrow('CLAMAV_HOST');
   });
 });

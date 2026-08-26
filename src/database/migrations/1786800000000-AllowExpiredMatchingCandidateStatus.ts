@@ -7,9 +7,7 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  * the same expiry path first — a freelancer whose invitation had timed out could
  * neither accept nor decline it. See ISSUES.md #1.
  */
-export class AllowExpiredMatchingCandidateStatus1786800000000
-  implements MigrationInterface
-{
+export class AllowExpiredMatchingCandidateStatus1786800000000 implements MigrationInterface {
   name = 'AllowExpiredMatchingCandidateStatus1786800000000';
 
   private static readonly WITH_EXPIRED = [

@@ -634,19 +634,31 @@ export class ProjectPlansService {
       .getMany();
 
     let recovered = 0;
-    const failures: Array<{ planId: string; error: string }> = [];
+    const recoveredProjectIds: string[] = [];
+    const failures: Array<{
+      planId: string;
+      projectId: string;
+      error: string;
+    }> = [];
     for (const plan of plans) {
       try {
         await this.materialize(plan.id, {}, plan.approvedBy!);
         recovered += 1;
+        recoveredProjectIds.push(plan.projectId);
       } catch (error) {
         failures.push({
           planId: plan.id,
+          projectId: plan.projectId,
           error: error instanceof Error ? error.message : String(error),
         });
       }
     }
-    return { inspected: plans.length, recovered, failures };
+    return {
+      inspected: plans.length,
+      recovered,
+      recoveredProjectIds,
+      failures,
+    };
   }
 
   async recoverMissingPlanGenerations() {
@@ -656,6 +668,7 @@ export class ProjectPlansService {
       take: 10,
     });
     let queued = 0;
+    const queuedProjectIds: string[] = [];
     const failures: Array<{ projectId: string; error: string }> = [];
 
     for (const project of projects) {
@@ -696,7 +709,10 @@ export class ProjectPlansService {
               'Recovered Scrum plan generation after both planning deliverables were approved.',
           },
         );
-        if (result.queued) queued += 1;
+        if (result.queued) {
+          queued += 1;
+          queuedProjectIds.push(project.id);
+        }
       } catch (error) {
         failures.push({
           projectId: project.id,
@@ -705,7 +721,7 @@ export class ProjectPlansService {
       }
     }
 
-    return { inspected: projects.length, queued, failures };
+    return { inspected: projects.length, queued, queuedProjectIds, failures };
   }
 
   // ---------------------------------------------------------------------------
@@ -730,10 +746,6 @@ export class ProjectPlansService {
       );
     }
 
-    // Set inside the transaction when the generated schedule ends after the
-    // customer's deadline, acted on once the plan is committed. ISSUES.md #26.
-    let scheduleOverrunDays: number | null = null;
-
     const milestones = (plan.milestones ??
       []) as unknown as ProjectPlanMilestone[];
     const tasks = (plan.tasks ?? []) as unknown as ProjectPlanTask[];
@@ -742,6 +754,7 @@ export class ProjectPlansService {
 
     const materialization = await this.dataSource.transaction(
       async (manager) => {
+        let scheduleOverrunDays: number | null = null;
         const project = await manager
           .getRepository(Project)
           .createQueryBuilder('project')
@@ -951,9 +964,12 @@ export class ProjectPlansService {
                 dueAt: this.dateAtPlanDay(
                   plan.createdAt,
                   (task.startDay ?? 0) +
-                    Math.min(
-                      Math.max(0, checkpoint.offsetDays),
-                      Math.max(1, task.durationDays ?? 1),
+                    Math.max(
+                      1,
+                      Math.min(
+                        Math.max(0, checkpoint.offsetDays),
+                        Math.max(1, task.durationDays ?? 1),
+                      ),
                     ),
                 ),
                 weightPercent: Number(checkpoint.weightPercent).toFixed(2),
@@ -1085,13 +1101,15 @@ export class ProjectPlansService {
           milestoneCount: milestoneIdByKey.size,
           taskCount: taskIdByKey.size,
           dependencyCount,
+          scheduleOverrunDays,
         };
       },
     );
     // Tell the customer up front if the plan already overruns their deadline,
     // rather than leaving them to discover it when the work lands late.
     // Warning only — it does not block materialization. ISSUES.md #26.
-    if (scheduleOverrunDays && scheduleOverrunDays > 0) {
+    const { scheduleOverrunDays, ...materialized } = materialization;
+    if (typeof scheduleOverrunDays === 'number' && scheduleOverrunDays > 0) {
       const overrunProject = await this.dataSource
         .getRepository(Project)
         .findOne({ where: { id: plan.projectId } });
@@ -1118,7 +1136,7 @@ export class ProjectPlansService {
         plan.projectId,
         adminUserId,
       );
-    return { ...materialization, matchingDispatch };
+    return { ...materialized, matchingDispatch };
   }
 
   // ---------------------------------------------------------------------------
@@ -1439,7 +1457,7 @@ export class ProjectPlansService {
   }
 
   private dateAtPlanDay(planCreatedAt: Date, day = 0) {
-    const value = new Date(planCreatedAt);
+    const value = new Date(Math.max(planCreatedAt.getTime(), Date.now()));
     value.setUTCDate(value.getUTCDate() + Math.max(0, Math.floor(day)));
     return value;
   }

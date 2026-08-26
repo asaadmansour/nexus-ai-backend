@@ -142,6 +142,9 @@ export class Project {
   @Column({ name: 'budget_allocation', type: 'jsonb', nullable: true })
   budgetAllocation: Record<string, unknown> | null;
 
+  @Column({ name: 'quote_evidence', type: 'jsonb', nullable: true })
+  quoteEvidence: Record<string, unknown> | null;
+
   @Column({
     name: 'automation_status',
     type: 'varchar',
@@ -149,6 +152,20 @@ export class Project {
     default: 'awaiting_funding',
   })
   automationStatus: string;
+
+  @Column({ name: 'automation_error', type: 'text', nullable: true })
+  automationError: string | null;
+
+  @Column({
+    name: 'automation_error_category',
+    type: 'varchar',
+    length: 50,
+    nullable: true,
+  })
+  automationErrorCategory: string | null;
+
+  @Column({ name: 'automation_error_at', type: 'timestamptz', nullable: true })
+  automationErrorAt: Date | null;
 
   @Column({
     name: 'platform_fee_amount',

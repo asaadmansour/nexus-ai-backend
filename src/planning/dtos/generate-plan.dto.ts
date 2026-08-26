@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
 export class GeneratePlanDto {
   @IsOptional()
@@ -15,5 +15,6 @@ export class GeneratePlanDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   notes?: string;
 }

@@ -39,6 +39,17 @@ export function IsFutureDate(validationOptions?: ValidationOptions) {
           const parsed = value instanceof Date ? value : new Date(value);
           if (Number.isNaN(parsed.getTime())) return false;
 
+          if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            const today = new Date();
+            const earliestDate = new Date(
+              Date.UTC(
+                today.getUTCFullYear(),
+                today.getUTCMonth(),
+                today.getUTCDate() + MIN_DEADLINE_LEAD_DAYS,
+              ),
+            );
+            return parsed.getTime() >= earliestDate.getTime();
+          }
           const earliest =
             Date.now() + MIN_DEADLINE_LEAD_DAYS * 24 * 60 * 60 * 1000;
           return parsed.getTime() > earliest;

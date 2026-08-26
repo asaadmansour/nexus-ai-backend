@@ -1,4 +1,11 @@
-import { IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import {
+  IsNumber,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class UpdateAssessmentScoreDto {
   @IsNumber()
@@ -8,5 +15,6 @@ export class UpdateAssessmentScoreDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(4000)
   notes?: string;
 }

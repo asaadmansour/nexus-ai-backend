@@ -1,4 +1,11 @@
-import { IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class UpdateBriefDto {
   @IsOptional()
@@ -64,6 +71,7 @@ export class UpdateBriefDto {
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(20)
   suggestedTeamSize?: number;
 
   @IsOptional()
@@ -74,5 +82,6 @@ export class UpdateBriefDto {
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(60)
   experienceMinYears?: number;
 }

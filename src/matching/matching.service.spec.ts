@@ -2,7 +2,10 @@ import { BadRequestException, ConflictException } from '@nestjs/common';
 import {
   assertTaskMatchingRunInvariant,
   MatchingService,
+  completedEmptyRunIsCoolingDown,
   requiresReviewerCandidateSelection,
+  resolveInvitationTtlHours,
+  staffingFailureIsCoolingDown,
 } from './matching.service';
 
 describe('MatchingService task assignment invariants', () => {
@@ -57,6 +60,55 @@ describe('MatchingService task assignment invariants', () => {
     expect(requiresReviewerCandidateSelection('architect')).toBe(true);
     expect(requiresReviewerCandidateSelection('ui_ux')).toBe(true);
     expect(requiresReviewerCandidateSelection('frontend')).toBe(true);
+  });
+
+  it('defaults project invitations to the required two-hour window', () => {
+    expect(resolveInvitationTtlHours(undefined)).toBe(2);
+    expect(resolveInvitationTtlHours('')).toBe(2);
+    expect(resolveInvitationTtlHours('0')).toBe(2);
+    expect(resolveInvitationTtlHours('6')).toBe(6);
+  });
+
+  it('backs off briefly before retrying an empty completed shortlist', () => {
+    const now = Date.parse('2030-01-01T00:20:00.000Z');
+    expect(
+      completedEmptyRunIsCoolingDown(
+        'completed',
+        0,
+        new Date('2030-01-01T00:10:00.000Z'),
+        now,
+        15 * 60_000,
+      ),
+    ).toBe(true);
+    expect(
+      completedEmptyRunIsCoolingDown(
+        'completed',
+        0,
+        new Date('2030-01-01T00:00:00.000Z'),
+        now,
+        15 * 60_000,
+      ),
+    ).toBe(false);
+  });
+
+  it('does not hammer a recently blocked staffing flow every minute', () => {
+    const now = Date.parse('2030-01-01T00:20:00.000Z');
+    expect(
+      staffingFailureIsCoolingDown(
+        'staffing_blocked',
+        new Date('2030-01-01T00:10:00.000Z'),
+        now,
+        15 * 60_000,
+      ),
+    ).toBe(true);
+    expect(
+      staffingFailureIsCoolingDown(
+        'staffing_blocked',
+        new Date('2030-01-01T00:00:00.000Z'),
+        now,
+        15 * 60_000,
+      ),
+    ).toBe(false);
   });
 
   it('limits a principal reviewer to the top three candidates', async () => {
@@ -201,7 +253,7 @@ describe('MatchingService task assignment invariants', () => {
   });
 
   it('recovers existing projects whose reviewer accepted before planning-role matching started', async () => {
-    const autoStartPlanningRoles = jest.fn().mockResolvedValue(undefined);
+    const autoStartPlanningRoles = jest.fn().mockResolvedValue(true);
     const service = Object.assign(Object.create(MatchingService.prototype), {
       dataSource: {
         getRepository: jest.fn().mockReturnValue({

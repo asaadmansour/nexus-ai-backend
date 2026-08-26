@@ -11,6 +11,7 @@ import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
 import { User } from 'src/users/entities/user.entity';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 export interface AiOperationsSnapshot {
   status: 'healthy' | 'degraded' | 'failing';
@@ -48,6 +49,7 @@ export class AiOperationsMonitorService
     private readonly users: Repository<User>,
     private readonly notifications: NotificationsService,
     private readonly config: ConfigService,
+    private readonly incidents: AutomationIncidentsService,
   ) {}
 
   onModuleInit() {
@@ -121,6 +123,7 @@ export class AiOperationsMonitorService
       const snapshot = await this.snapshot();
       if (snapshot.status === 'healthy') {
         this.lastAlertSignature = '';
+        await this.incidents.resolveOperation('ai_jobs', 'health_monitor');
         return snapshot;
       }
       const signature = `${snapshot.status}:${snapshot.stuckQueued}:${snapshot.stuckRunning}:${snapshot.failedRecent}`;
@@ -138,6 +141,14 @@ export class AiOperationsMonitorService
       this.logger.error(
         `AI operations ${snapshot.status}: ${snapshot.stuckQueued} queued stuck, ${snapshot.stuckRunning} running stuck, ${snapshot.failedRecent} recent failures`,
       );
+      await this.incidents.record({
+        subsystem: 'ai_jobs',
+        operation: 'health_monitor',
+        errorCode: snapshot.status,
+        severity: snapshot.status === 'failing' ? 'critical' : 'warning',
+        message: `${snapshot.stuckQueued} queued jobs are stuck, ${snapshot.stuckRunning} running jobs are stuck, and ${snapshot.failedRecent} jobs failed in the last 15 minutes.`,
+        context: snapshot as unknown as Record<string, unknown>,
+      });
       const admins = await this.users.find({
         where: { role: UserRole.ADMIN, deletedAt: IsNull() },
         select: { id: true },
@@ -155,9 +166,17 @@ export class AiOperationsMonitorService
       this.lastAlertAt = Date.now();
       return snapshot;
     } catch (error) {
-      this.logger.error(
-        `AI operations monitor failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`AI operations monitor failed: ${message}`);
+      await this.incidents
+        .record({
+          subsystem: 'ai_jobs',
+          operation: 'health_monitor',
+          errorCode: 'monitor_failed',
+          severity: 'critical',
+          message,
+        })
+        .catch(() => undefined);
       return null;
     }
   }

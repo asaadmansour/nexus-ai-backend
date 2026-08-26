@@ -9,6 +9,7 @@ import {
   IsPositive,
   Min,
   MaxLength,
+  Max,
   Matches,
 } from 'class-validator';
 import { Transform } from 'class-transformer';
@@ -38,18 +39,20 @@ export class CreateProjectDto {
   @MaxLength(2000)
   description: string;
 
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
+  @Max(9_999_999_999.99)
   @IsLesserThanOrEqual('budgetMax')
   budgetMin: number;
 
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 2 })
   @IsPositive({ message: 'budgetMax must be greater than 0' })
+  @Max(9_999_999_999.99)
   budgetMax: number;
 
   @IsString()
   @IsOptional()
-  @Transform(({ value }) =>
+  @Transform(({ value }: { value: unknown }) =>
     typeof value === 'string' ? value.trim().toUpperCase() : value,
   )
   @IsIn(SUPPORTED_CURRENCIES, {

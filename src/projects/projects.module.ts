@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { BriefEmbedding } from './entities/brief-embedding.entity';
 import { BriefMessage } from './entities/brief-message.entity';
 import { Brief } from './entities/brief.entity';
+import { BriefDocument } from './entities/brief-document.entity';
 import { EvaluationRun } from './entities/evaluation-run.entity';
 import { ProjectMilestone } from './entities/project-milestone.entity';
 import { ProjectPlan } from './entities/project-plan.entity';
@@ -25,13 +26,26 @@ import { BriefService } from './brief.service';
 import { AgentsModule } from 'src/agents/agents.module';
 import { ProjectPayment } from 'src/payments/entities/project-payment.entity';
 import { TaskCheckpoint } from './entities/task-checkpoint.entity';
+import { QueuesModule } from 'src/queues/queues.module';
+import { areQueuesEnabled } from 'src/queues/queue-runtime';
+import { BriefDocumentSecurityService } from './brief-document-security.service';
+import { BriefDocumentStorageService } from './brief-document-storage.service';
+import { BriefDocumentJobsService } from './brief-document-jobs.service';
+import { BriefDocumentProcessingProcessor } from './jobs/brief-document-processing.processor';
+import { BriefDocumentAutomationService } from './brief-document-automation.service';
+
+const briefDocumentProcessors = areQueuesEnabled()
+  ? [BriefDocumentProcessingProcessor]
+  : [];
 @Module({
   imports: [
     AgentsModule,
+    QueuesModule,
     TypeOrmModule.forFeature([
       Project,
       ProjectStatusHistory,
       Brief,
+      BriefDocument,
       BriefEmbedding,
       BriefMessage,
       ProjectRoleAssignment,
@@ -52,7 +66,15 @@ import { TaskCheckpoint } from './entities/task-checkpoint.entity';
     ]),
   ],
   controllers: [ProjectsController, BriefController],
-  providers: [ProjectsService, BriefService],
+  providers: [
+    ProjectsService,
+    BriefService,
+    BriefDocumentSecurityService,
+    BriefDocumentStorageService,
+    BriefDocumentJobsService,
+    BriefDocumentAutomationService,
+    ...briefDocumentProcessors,
+  ],
   exports: [TypeOrmModule, ProjectsService],
 })
 export class ProjectsModule {}

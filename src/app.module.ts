@@ -22,6 +22,7 @@ import { RepositoriesModule } from './repositories/repositories.module';
 import { DeliveryModule } from './delivery/delivery.module';
 import { EvaluationsModule } from './evaluations/evaluations.module';
 import { ReviewerModule } from './reviewer/reviewer.module';
+import { AutomationModule } from './automation/automation.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { ReviewerModule } from './reviewer/reviewer.module';
       validate: validateEnv,
     }),
     DatabaseModule,
+    AutomationModule,
     UsersModule,
     FreelancersModule,
     ProjectsModule,

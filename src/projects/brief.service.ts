@@ -1,17 +1,26 @@
 import {
   BadRequestException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, In, MoreThan, Repository } from 'typeorm';
 import { CreateBriefMessageDto } from './dtos/create-brief-message.dto';
 import { UpdateBriefDto } from './dtos/update-brief.dto';
 import { BriefMessage } from './entities/brief-message.entity';
 import { Brief } from './entities/brief.entity';
+import { BriefDocument } from './entities/brief-document.entity';
 import { Project } from './entities/project.entity';
-import { AiService, type ProjectQuoteResult } from 'src/agents/ai.service';
+import {
+  AiService,
+  type ProjectQuoteResult,
+  type RequirementsDocumentExtractionResult,
+} from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { assessPlanningRequirementProfile } from 'src/planning/planning-evaluation-requirements';
 import {
@@ -27,11 +36,15 @@ import {
   removeNonAnswerItems,
   type PriceableBriefField,
 } from './brief-scope-readiness';
+import { BriefDocumentSecurityService } from './brief-document-security.service';
+import { BriefDocumentStorageService } from './brief-document-storage.service';
+import { BriefDocumentJobsService } from './brief-document-jobs.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
 const MAX_BRIEF_TEXT_LENGTH = 5000;
-const INITIAL_AGENT_MESSAGE_VERSION = 3;
+const INITIAL_AGENT_MESSAGE_VERSION = 4;
 const MAX_AI_REVISION_MESSAGES = 3;
 const INITIAL_GREETING_MESSAGE =
   'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
@@ -72,10 +85,16 @@ export class BriefService {
     private readonly briefRepo: Repository<Brief>,
     @InjectRepository(BriefMessage)
     private readonly briefMessageRepo: Repository<BriefMessage>,
+    @InjectRepository(BriefDocument)
+    private readonly briefDocumentRepo: Repository<BriefDocument>,
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
     private readonly aiService: AiService,
     private readonly dataSource: DataSource,
+    private readonly documentSecurity: BriefDocumentSecurityService,
+    private readonly documentStorage: BriefDocumentStorageService,
+    private readonly documentJobs: BriefDocumentJobsService,
+    private readonly incidents: AutomationIncidentsService,
   ) {}
 
   async getBrief(projectId: string, userId: string, isAdmin: boolean) {
@@ -103,6 +122,470 @@ export class BriefService {
       where: { briefId: brief.id },
       order: { sequence: 'ASC' },
     });
+  }
+
+  async getDocuments(projectId: string, userId: string, isAdmin: boolean) {
+    await this.findAuthorizedProject(projectId, userId, isAdmin);
+    const brief = await this.getOrCreateBrief(projectId);
+    const documents = await this.briefDocumentRepo.find({
+      where: { briefId: brief.id },
+      order: { createdAt: 'DESC' },
+    });
+    return documents.map((document) => this.toPublicDocument(document));
+  }
+
+  async getDocumentDownload(
+    projectId: string,
+    documentId: string,
+    userId: string,
+    isAdmin: boolean,
+  ) {
+    await this.findAuthorizedProject(projectId, userId, isAdmin);
+    const brief = await this.getOrCreateBrief(projectId);
+    const document = await this.briefDocumentRepo.findOne({
+      where: { id: documentId, briefId: brief.id },
+    });
+    if (!document)
+      throw new NotFoundException('Requirements document not found');
+    return this.documentStorage.signedDownloadUrl(
+      document.storagePublicId,
+      document.storageFormat,
+    );
+  }
+
+  async uploadDocument(
+    projectId: string,
+    userId: string,
+    isAdmin: boolean,
+    file: Express.Multer.File,
+  ) {
+    const project = await this.findAuthorizedProject(
+      projectId,
+      userId,
+      isAdmin,
+    );
+    this.assertBriefCanChange(project);
+    const brief = await this.getOrCreateBrief(projectId);
+    const verified = await this.documentSecurity.validateAndScan(file);
+    const sha256 = createHash('sha256').update(file.buffer).digest('hex');
+    const duplicate = await this.briefDocumentRepo.findOne({
+      where: {
+        briefId: brief.id,
+        sha256,
+        status: In(['queued', 'processing', 'processed']),
+      },
+      order: { createdAt: 'DESC' },
+    });
+    if (duplicate) {
+      return {
+        document: this.toPublicDocument(duplicate),
+        brief,
+        duplicate: true,
+        missingFields: this.getMissingFields(brief),
+      };
+    }
+    await this.assertDocumentUploadRate(userId);
+    const stored = await this.documentStorage.upload(
+      projectId,
+      verified.fileName,
+      file.buffer,
+    );
+    let document: BriefDocument;
+    try {
+      document = await this.dataSource.transaction(async (manager) => {
+        await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+          `requirements-document-upload:${userId}`,
+        ]);
+        await this.assertDocumentUploadRate(
+          userId,
+          manager.getRepository(BriefDocument),
+        );
+        const concurrentDuplicate = await manager.findOne(BriefDocument, {
+          where: {
+            briefId: brief.id,
+            sha256,
+            status: In(['queued', 'processing', 'processed']),
+          },
+          order: { createdAt: 'DESC' },
+        });
+        if (concurrentDuplicate) return concurrentDuplicate;
+
+        const created = await manager.save(
+          BriefDocument,
+          manager.create(BriefDocument, {
+            briefId: brief.id,
+            uploadedByUserId: userId,
+            fileName: verified.fileName,
+            mimeType: verified.mimeType,
+            sizeBytes: file.size,
+            sha256,
+            status: 'queued',
+            scanStatus: verified.scanStatus,
+            storagePublicId: stored.publicId,
+            storageVersion: String(stored.version),
+            storageFormat: stored.format,
+            processingAttempts: 0,
+            processedAt: null,
+            extractedFields: null,
+            summary: null,
+            warnings: null,
+            error: null,
+          }),
+        );
+        await manager.save(
+          BriefMessage,
+          manager.create(BriefMessage, {
+            briefId: brief.id,
+            sequence: await this.nextMessageSequence(manager, brief.id),
+            senderType: 'customer',
+            message: `Uploaded requirements document: ${created.fileName}`,
+            metadata: { briefDocumentId: created.id, status: 'queued' },
+          }),
+        );
+        return created;
+      });
+    } catch (error) {
+      await this.documentStorage.remove(stored.publicId).catch(() => undefined);
+      throw error;
+    }
+    if (document.storagePublicId !== stored.publicId) {
+      await this.documentStorage.remove(stored.publicId).catch(() => undefined);
+      return {
+        document: this.toPublicDocument(document),
+        brief,
+        duplicate: true,
+        missingFields: this.getMissingFields(brief),
+      };
+    }
+
+    if (this.documentJobs.enabled()) {
+      try {
+        await this.documentJobs.enqueue(document.id);
+        return {
+          document: this.toPublicDocument(document),
+          brief,
+          duplicate: false,
+          queued: true,
+          missingFields: this.getMissingFields(brief),
+        };
+      } catch (error) {
+        // Keep it queued: the recovery scanner can safely enqueue this exact
+        // document again once the queue is healthy.
+        document.status = 'queued';
+        document.error = this.errorMessage(error);
+        await this.briefDocumentRepo.save(document);
+        await this.incidents.record({
+          subsystem: 'requirements_documents',
+          operation: 'enqueue',
+          projectId,
+          errorCode: 'queue_failed',
+          message: document.error,
+          context: { documentId: document.id },
+        });
+        throw new ServiceUnavailableException(
+          'The document was stored safely, but processing could not be queued. It will be retried automatically.',
+        );
+      }
+    }
+    return this.processQueuedDocument(document.id, 0, 1, file.buffer);
+  }
+
+  async processQueuedDocument(
+    documentId: string,
+    attemptsMade: number,
+    maxAttempts: number,
+    suppliedContent?: Buffer,
+  ) {
+    const document = await this.briefDocumentRepo.findOne({
+      where: { id: documentId },
+    });
+    if (!document)
+      throw new NotFoundException('Requirements document not found');
+    if (document.status === 'processed') {
+      return { document: this.toPublicDocument(document), reused: true };
+    }
+    document.status = 'processing';
+    document.processingAttempts = Math.max(
+      document.processingAttempts + 1,
+      attemptsMade + 1,
+    );
+    document.error = null;
+    await this.briefDocumentRepo.save(document);
+
+    try {
+      const content =
+        suppliedContent ??
+        (await this.documentStorage.download(
+          document.storagePublicId,
+          document.storageFormat,
+          document.sizeBytes,
+        ));
+      const actualHash = createHash('sha256').update(content).digest('hex');
+      if (actualHash !== document.sha256) {
+        throw new BadRequestException(
+          'Stored requirements document integrity validation failed',
+        );
+      }
+      const brief = await this.briefRepo.findOne({
+        where: { id: document.briefId },
+      });
+      if (!brief) throw new NotFoundException('Requirements brief not found');
+      const project = await this.projectRepo.findOne({
+        where: { id: brief.projectId },
+      });
+      if (!project) throw new NotFoundException('Project not found');
+      this.assertBriefCanChange(project);
+      const projectDefaultFields = this.extractProjectDefaultFields(project);
+      const extraction = await this.aiService.extractRequirementsDocument({
+        fileName: document.fileName,
+        mimeType: document.mimeType,
+        contentBase64: content.toString('base64'),
+        currentBrief: this.buildCurrentBriefContext(
+          brief,
+          projectDefaultFields,
+          this.buildProjectContext(project),
+          'documentImport',
+        ),
+      });
+      const result = await this.applyDocumentExtraction(
+        document.id,
+        extraction,
+      );
+      await this.incidents.resolveOperation(
+        'requirements_documents',
+        'process',
+        project.id,
+      );
+      return result;
+    } catch (error) {
+      document.status = attemptsMade + 1 >= maxAttempts ? 'failed' : 'queued';
+      document.error = this.errorMessage(error);
+      await this.briefDocumentRepo.save(document);
+      if (document.status === 'failed') {
+        const brief = await this.briefRepo.findOne({
+          where: { id: document.briefId },
+        });
+        await this.incidents.record({
+          subsystem: 'requirements_documents',
+          operation: 'process',
+          projectId: brief?.projectId ?? null,
+          errorCode: 'processing_failed',
+          message: document.error,
+          context: {
+            documentId: document.id,
+            attempts: document.processingAttempts,
+          },
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async applyDocumentExtraction(
+    documentId: string,
+    extraction: RequirementsDocumentExtractionResult,
+  ) {
+    return this.dataSource.transaction(async (manager) => {
+      const document = await manager
+        .getRepository(BriefDocument)
+        .createQueryBuilder('document')
+        .setLock('pessimistic_write')
+        .where('document.id = :documentId', { documentId })
+        .getOne();
+      if (!document) {
+        throw new NotFoundException('Requirements document not found');
+      }
+      if (document.status === 'processed') {
+        return { document: this.toPublicDocument(document), reused: true };
+      }
+      const brief = await manager
+        .getRepository(Brief)
+        .createQueryBuilder('brief')
+        .setLock('pessimistic_write')
+        .where('brief.id = :briefId', { briefId: document.briefId })
+        .getOne();
+      if (!brief) throw new NotFoundException('Requirements brief not found');
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId: brief.projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      this.assertBriefCanChange(project);
+
+      const existingFields = this.mergeExtractedFields(
+        this.extractProjectDefaultFields(project),
+        this.buildKnownFieldsFromBrief(brief),
+      );
+      const sanitized = this.sanitizeExtractedFields(
+        extraction.extractedFields,
+        '',
+        null,
+      );
+      const missingOnly = Object.fromEntries(
+        Object.entries(sanitized).filter(
+          ([field]) => !this.hasFieldValue(existingFields[field]),
+        ),
+      );
+      const extractedFields = this.mergeExtractedFields(
+        existingFields,
+        missingOnly,
+      );
+      const missingFields =
+        this.getVisibleMissingFieldsFromFields(extractedFields);
+      const nextQuestionField = missingFields[0] ?? null;
+      const completionPercentage =
+        this.getCompletionPercentageFromMissingFields(missingFields);
+      const importedLabels = Object.keys(missingOnly).map((field) =>
+        this.humanizeFieldName(field).toLowerCase(),
+      );
+      const nextQuestion = nextQuestionField
+        ? this.buildNaturalFollowUpPrompt(nextQuestionField)
+        : 'The first-release scope is now clear enough to review and price.';
+      const warningText = extraction.warnings.length
+        ? ` I also flagged: ${extraction.warnings.join(' ')}`
+        : '';
+      const importText = importedLabels.length
+        ? `I used the document to fill ${importedLabels.join(', ')}.`
+        : 'I reviewed the document, but it did not add any new confirmed requirements.';
+      const agentText = this.truncate(
+        `${importText} ${extraction.documentSummary}${warningText} ${nextQuestion}`,
+        3000,
+      );
+
+      this.applyExtractedFieldsToBrief(brief, extractedFields, '');
+      brief.isComplete = missingFields.length === 0;
+      brief.completedAt =
+        brief.completedAt ?? (brief.isComplete ? new Date() : null);
+      this.setBriefWorkflowState(brief, {
+        missingFields,
+        completionPercentage,
+        extractedFields,
+        pendingField: nextQuestionField,
+        nextQuestionField,
+        extractionSource: 'requirements_document',
+        aiSource: extraction.source,
+        confirmedAt: null,
+      });
+      document.status = 'processed';
+      document.processedAt = new Date();
+      document.extractedFields = missingOnly;
+      document.summary = extraction.documentSummary;
+      document.warnings = extraction.warnings;
+      document.error = null;
+
+      const agentMessage = await manager.save(
+        BriefMessage,
+        manager.create(BriefMessage, {
+          briefId: brief.id,
+          sequence: await this.nextMessageSequence(manager, brief.id),
+          senderType: 'agent',
+          message: agentText,
+          metadata: {
+            briefDocumentId: document.id,
+            extractedFields: missingOnly,
+            warnings: extraction.warnings,
+            nextQuestionField,
+          },
+        }),
+      );
+      const savedDocument = await manager.save(BriefDocument, document);
+      const savedBrief = await manager.save(Brief, brief);
+      this.invalidateUnfundedQuote(project, savedBrief.isComplete);
+      await manager.save(Project, project);
+      return {
+        document: this.toPublicDocument(savedDocument),
+        brief: savedBrief,
+        agentMessage,
+        duplicate: false,
+        queued: false,
+        missingFields,
+      };
+    });
+  }
+
+  private async assertDocumentUploadRate(
+    userId: string,
+    repository = this.briefDocumentRepo,
+  ) {
+    const now = Date.now();
+    const perHour = this.positiveIntegerEnv(
+      'REQUIREMENTS_DOCUMENT_UPLOADS_PER_HOUR',
+      5,
+    );
+    const minimumIntervalSeconds = this.positiveIntegerEnv(
+      'REQUIREMENTS_DOCUMENT_UPLOAD_MIN_INTERVAL_SECONDS',
+      10,
+      true,
+    );
+    // These are intentionally sequential: inside the advisory-lock transaction
+    // they share one PostgreSQL connection, which must not execute concurrently.
+    const recentCount = await repository.count({
+      where: {
+        uploadedByUserId: userId,
+        createdAt: MoreThan(new Date(now - 60 * 60 * 1000)),
+      },
+    });
+    const latest = await repository.findOne({
+      where: { uploadedByUserId: userId },
+      order: { createdAt: 'DESC' },
+    });
+    if (recentCount >= perHour) {
+      throw new HttpException(
+        `Requirements document upload limit reached (${perHour} per hour)`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    if (
+      latest &&
+      latest.createdAt.getTime() + minimumIntervalSeconds * 1000 > now
+    ) {
+      throw new HttpException(
+        `Wait ${minimumIntervalSeconds} seconds between requirements document uploads`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  private positiveIntegerEnv(
+    name: string,
+    fallback: number,
+    allowZero = false,
+  ) {
+    const value = Number(process.env[name]);
+    if (!Number.isInteger(value) || value < (allowZero ? 0 : 1)) {
+      return fallback;
+    }
+    return value;
+  }
+
+  private toPublicDocument(document: BriefDocument) {
+    return {
+      id: document.id,
+      briefId: document.briefId,
+      fileName: document.fileName,
+      mimeType: document.mimeType,
+      sizeBytes: document.sizeBytes,
+      sha256: document.sha256,
+      status: document.status,
+      scanStatus: document.scanStatus,
+      processingAttempts: document.processingAttempts,
+      processedAt: document.processedAt,
+      extractedFields: document.extractedFields,
+      summary: document.summary,
+      warnings: document.warnings,
+      error: document.error,
+      downloadAvailable: Boolean(document.storagePublicId),
+      createdAt: document.createdAt,
+      updatedAt: document.updatedAt,
+    };
+  }
+
+  private errorMessage(error: unknown) {
+    return error instanceof Error
+      ? this.truncate(error.message, 1000)
+      : 'Document extraction failed.';
   }
 
   async sendCustomerMessage(
@@ -173,6 +656,7 @@ export class BriefService {
       recentMessages,
       dto.content,
       nextQuestionField,
+      aiResult.replyMode,
     );
 
     const agentMessage = this.briefMessageRepo.create({
@@ -352,6 +836,17 @@ export class BriefService {
     this.assertBriefCanConfirm(project);
 
     const brief = await this.getOrCreateBrief(projectId);
+    const pendingDocumentCount = await this.briefDocumentRepo.count({
+      where: {
+        briefId: brief.id,
+        status: In(['queued', 'processing']),
+      },
+    });
+    if (pendingDocumentCount > 0) {
+      throw new BadRequestException(
+        'Wait for uploaded requirements documents to finish processing before confirming the brief.',
+      );
+    }
     const missingFields = this.getVisibleMissingFieldsFromFields(
       this.mergeExtractedFields(
         this.extractProjectDefaultFields(project),
@@ -365,9 +860,11 @@ export class BriefService {
       );
     }
 
+    const quoteProjectContext = this.buildProjectQuoteContext(project);
+    const quoteBriefContext = this.buildBriefQuoteContext(brief, project);
     const projectQuote = await this.aiService.estimateProjectQuote({
-      project: this.buildProjectQuoteContext(project),
-      brief: this.buildBriefQuoteContext(brief, project),
+      project: quoteProjectContext,
+      brief: quoteBriefContext,
     });
     const requirementProfile = assessPlanningRequirementProfile(project, brief);
 
@@ -395,6 +892,12 @@ export class BriefService {
         project.quoteStatus = projectQuote.quoteStatus;
         project.quoteGeneratedAt = new Date();
         project.quoteNotes = this.buildProjectQuoteNotes(projectQuote);
+        project.quoteEvidence = this.buildProjectQuoteEvidence(
+          projectQuote,
+          quoteProjectContext,
+          quoteBriefContext,
+          project.quoteGeneratedAt,
+        );
         project.budgetAllocation = createProjectBudgetAllocation(
           projectQuote.amount,
           projectQuote.currency,
@@ -456,6 +959,7 @@ export class BriefService {
     recentMessages: Array<{ senderType: string; content: string }>,
     latestMessage: string,
     nextQuestionField: string | null,
+    replyMode?: string | null,
   ) {
     const lastAgentMessage = [...recentMessages]
       .reverse()
@@ -470,6 +974,19 @@ export class BriefService {
       missingFields.includes(nextQuestionField)
     ) {
       return this.buildAdviceReply(guidanceField);
+    }
+
+    // The requirements graph owns progression and explicitly labels its response.
+    // Accept that stateful response without requiring brittle English marker matches.
+    if (
+      replyMode &&
+      assistantReply?.trim() &&
+      !this.looksLikePrematureCompletionReply(assistantReply, missingFields) &&
+      (!lastAgentMessage ||
+        this.normalizeComparableText(lastAgentMessage.content) !==
+          this.normalizeComparableText(assistantReply))
+    ) {
+      return assistantReply;
     }
 
     // A model reply is only usable if it asks about the field the state machine
@@ -540,7 +1057,8 @@ export class BriefService {
    * both to spot a question about an already-answered field and to confirm a
    * reply actually asks about the field the state machine is waiting on.
    */
-  private static readonly QUESTION_MARKERS_BY_FIELD: Record<string, string[]> = {
+  private static readonly QUESTION_MARKERS_BY_FIELD: Record<string, string[]> =
+    {
       businessDomain: ['what kind of business', 'what domain'],
       mainGoal: ['main outcome', 'main thing', 'want this project to achieve'],
       targetUsers: ['who will use', 'who do you expect will use'],
@@ -562,8 +1080,8 @@ export class BriefService {
       clientBackground: ['your background', 'what is your background'],
       suggestedTeamSize: ['team size'],
       experienceLevel: ['junior, mid, senior', 'experience level'],
-    experienceMinYears: ['minimum years', 'years-of-experience'],
-  };
+      experienceMinYears: ['minimum years', 'years-of-experience'],
+    };
 
   private looksLikeAnsweredFieldQuestion(
     reply: string,
@@ -662,16 +1180,23 @@ export class BriefService {
         firstAgentMessage.metadata?.initialAgentMessageVersion !==
           INITIAL_AGENT_MESSAGE_VERSION
       ) {
-        firstAgentMessage.message = await this.buildInitialAgentMessage(
-          brief,
-          project,
-        );
-        firstAgentMessage.metadata = {
-          ...(firstAgentMessage.metadata ?? {}),
-          systemPrompt: true,
-          initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
-        };
-        await this.briefMessageRepo.save(firstAgentMessage);
+        const customerHasReplied = await this.briefMessageRepo.exists({
+          where: { briefId: brief.id, senderType: 'customer' },
+        });
+        // Refresh unopened chats to the new requirements experience, but never
+        // rewrite conversation history after a customer has replied.
+        if (!customerHasReplied) {
+          firstAgentMessage.message = await this.buildInitialAgentMessage(
+            brief,
+            project,
+          );
+          firstAgentMessage.metadata = {
+            ...(firstAgentMessage.metadata ?? {}),
+            systemPrompt: true,
+            initialAgentMessageVersion: INITIAL_AGENT_MESSAGE_VERSION,
+          };
+          await this.briefMessageRepo.save(firstAgentMessage);
+        }
       }
 
       return;
@@ -750,6 +1275,7 @@ export class BriefService {
         [],
         INITIAL_GREETING_MESSAGE,
         nextQuestionField,
+        aiResult.replyMode,
       );
     } catch {
       return this.buildInitialFallbackMessage(project);
@@ -790,6 +1316,15 @@ export class BriefService {
   }
 
   private assertBriefCanChange(project: Project) {
+    if (
+      project.quoteStatus === 'accepted' ||
+      Number(project.heldAmount ?? 0) > 0
+    ) {
+      throw new BadRequestException(
+        'The funded project brief is locked. Record a scoped change request and review its budget and deadline impact before changing requirements.',
+      );
+    }
+
     if (BRIEF_CHANGE_LOCKED_PROJECT_STATUSES.has(project.status)) {
       throw new BadRequestException(
         'The brief cannot be changed after the project is assigned or closed.',
@@ -798,6 +1333,15 @@ export class BriefService {
   }
 
   private assertBriefCanConfirm(project: Project) {
+    if (
+      project.quoteStatus === 'accepted' ||
+      Number(project.heldAmount ?? 0) > 0
+    ) {
+      throw new BadRequestException(
+        'The funded project brief is already confirmed. Use a scoped change request for later requirement changes.',
+      );
+    }
+
     if (BRIEF_CONFIRM_ALLOWED_LOCKED_PROJECT_STATUSES.has(project.status)) {
       return;
     }
@@ -826,6 +1370,7 @@ export class BriefService {
       ? 'Confirm the updated requirements to generate a scope-based quote.'
       : 'More scope detail is required before a reliable quote can be generated.';
     project.budgetAllocation = null;
+    project.quoteEvidence = null;
     project.platformFeeAmount = '0.00';
     project.automationStatus = briefComplete
       ? 'awaiting_quote'
@@ -951,6 +1496,66 @@ export class BriefService {
     ];
 
     return this.truncate(sections.filter(Boolean).join('\n\n'), 4000);
+  }
+
+  private buildProjectQuoteEvidence(
+    quote: ProjectQuoteResult,
+    project: Record<string, unknown>,
+    brief: Record<string, unknown>,
+    generatedAt: Date,
+  ) {
+    const scopeInputs = this.cleanJsonSection({
+      projectType: brief.projectType,
+      businessDomain: brief.businessDomain,
+      mainGoal: brief.mainGoal,
+      targetUsers: brief.targetUsers,
+      coreFeatures: brief.coreFeatures,
+      platforms: brief.platforms,
+      solutionType: brief.solutionType,
+      scopeDetails: brief.scopeDetails,
+      integrations: brief.integrations,
+      adminNeeds: brief.adminNeeds,
+      deliverables: brief.deliverables,
+      suggestedTeamSize: brief.suggestedTeamSize,
+      requirementProfile: brief.requirementProfile,
+      deadline: project.deadline,
+      isDeadlineFlexible: project.isDeadlineFlexible,
+    });
+    const scopeHash = createHash('sha256')
+      .update(JSON.stringify(scopeInputs))
+      .digest('hex');
+    const sourceSnapshots = quote.sources.map((source) => {
+      let domain: string | null = null;
+      try {
+        domain = new URL(source).hostname;
+      } catch {
+        domain = null;
+      }
+      return {
+        reference: source,
+        domain,
+        capturedAt: generatedAt.toISOString(),
+        evidenceType: domain ? 'marketplace_reference' : 'internal_reference',
+      };
+    });
+    return {
+      schemaVersion: 1,
+      estimatorVersion: 'scope-tiered-fixed-price-v2',
+      generatedAt: generatedAt.toISOString(),
+      source: quote.source,
+      currency: quote.currency,
+      amount: quote.amount,
+      recommendedMinimum: quote.recommendedMinimum,
+      budgetGap: quote.budgetGap,
+      confidence: quote.confidence,
+      complexity: quote.complexity,
+      scopeHash,
+      scopeInputs,
+      roleEstimates: quote.roleEstimates,
+      assumptions: quote.assumptions,
+      pricingSignals: quote.pricingSignals,
+      sources: sourceSnapshots,
+    };
   }
 
   private mergeExtractedFields(

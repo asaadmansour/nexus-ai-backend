@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 
 export class QueueEvaluationDto {
   @IsOptional()
@@ -7,5 +7,6 @@ export class QueueEvaluationDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   reason?: string;
 }

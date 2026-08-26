@@ -1307,6 +1307,7 @@ export class PaymentsService {
         isOutOfBudget: quoteStatus === 'out_of_budget',
       },
       budgetAllocation: project.budgetAllocation,
+      quoteEvidence: project.quoteEvidence,
       totals: {
         paidAmount,
         pendingAmount,

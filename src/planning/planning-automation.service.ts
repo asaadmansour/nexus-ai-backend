@@ -5,6 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ProjectPlansService } from './project-plans.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 @Injectable()
 export class PlanningAutomationService
@@ -14,7 +15,10 @@ export class PlanningAutomationService
   private timer: NodeJS.Timeout | null = null;
   private running = false;
 
-  constructor(private readonly plans: ProjectPlansService) {}
+  constructor(
+    private readonly plans: ProjectPlansService,
+    private readonly incidents: AutomationIncidentsService,
+  ) {}
 
   onModuleInit() {
     this.timer = setInterval(() => void this.reconcile(), 60_000);
@@ -38,13 +42,34 @@ export class PlanningAutomationService
         ...materialization.failures,
       ]) {
         this.logger.error(
-          `Could not recover planning automation for ${'planId' in failure ? failure.planId : failure.projectId}: ${failure.error}`,
+          `Could not recover planning automation for project ${failure.projectId}: ${failure.error}`,
         );
+        await this.incidents.record({
+          subsystem: 'planning',
+          operation: 'recover',
+          projectId: failure.projectId,
+          errorCode: 'recovery_failed',
+          message: failure.error,
+          context: 'planId' in failure ? { planId: failure.planId } : undefined,
+        });
       }
+      for (const projectId of [
+        ...generation.queuedProjectIds,
+        ...materialization.recoveredProjectIds,
+      ]) {
+        await this.incidents.resolveOperation('planning', 'recover', projectId);
+      }
+      await this.incidents.resolveOperation('planning', 'scan');
     } catch (error) {
-      this.logger.error(
-        `Planning automation scan failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Planning automation scan failed: ${message}`);
+      await this.incidents.record({
+        subsystem: 'planning',
+        operation: 'scan',
+        errorCode: 'scan_failed',
+        severity: 'critical',
+        message,
+      });
     } finally {
       this.running = false;
     }

@@ -1,4 +1,10 @@
-import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
 
 export class ReviewPlanDto {
   @IsIn(['approved', 'changes_requested', 'rejected'])
@@ -6,6 +12,7 @@ export class ReviewPlanDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(5000)
   adminNotes?: string;
 
   @IsOptional()

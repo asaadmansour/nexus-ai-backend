@@ -42,6 +42,8 @@ type ValidateBriefResult = {
   fastPathUsed?: boolean;
   fastPathReason?: string | null;
   extractionSource?: string;
+  messageIntent?: string | null;
+  replyMode?: string | null;
   source: 'fastapi' | 'local_mock';
 };
 
@@ -56,6 +58,8 @@ type FastApiValidateBriefResponse = {
   fastPathUsed?: boolean;
   fastPathReason?: string | null;
   extractionSource?: string;
+  messageIntent?: string | null;
+  replyMode?: string | null;
 };
 
 type FastApiGenerateAssessmentResponse = {
@@ -241,6 +245,13 @@ export type ProjectQuoteResult = {
   pricingSignals: string[];
   sources: string[];
   source: 'fastapi' | 'local_mock' | 'local_fallback';
+};
+
+export type RequirementsDocumentExtractionResult = {
+  extractedFields: Record<string, unknown>;
+  documentSummary: string;
+  warnings: string[];
+  source: 'gemini_document_extraction' | 'local_mock';
 };
 
 export type EvaluateSubmissionRubricItem = {
@@ -866,7 +877,11 @@ export class AiService {
         `${platformCount} platform target(s) included.`,
         `Estimated complexity: ${complexity}.`,
       ],
-      sources: ['Nexus deterministic project quote fallback'],
+      sources: [
+        'https://khamsat.com/programming',
+        'https://mostaql.com/projects/skill/website-development',
+        'https://www.fiverr.com/categories/programming-tech/website-development',
+      ],
       source,
     };
   }
@@ -2088,19 +2103,20 @@ export class AiService {
     const aiServiceUrl = this.configService.get<string>('AI_SERVICE_URL');
 
     if (this.isClearlyUnrelatedRequirementsQuestion(dto.briefText)) {
+      const boundaryReply = this.buildRequirementsBoundaryReply(dto);
       return {
         projectId: dto.projectId ?? null,
         briefId: dto.briefId ?? null,
         isComplete: false,
         completionPercentage: 0,
         missingFields: [],
-        suggestedReply:
-          'I’m here to help define and price your project, so I can’t help with unrelated trivia. Let’s continue with the project scope—what should the first version let its users do?',
-        assistantReply:
-          'I’m here to help define and price your project, so I can’t help with unrelated trivia. Let’s continue with the project scope—what should the first version let its users do?',
+        suggestedReply: boundaryReply,
+        assistantReply: boundaryReply,
         extractedFields: {},
         nextQuestionField: null,
         extractionSource: 'scope_guard',
+        messageIntent: 'out_of_scope',
+        replyMode: 'scope_boundary',
         source: this.isMockMode() ? 'local_mock' : 'fastapi',
       };
     }
@@ -2124,6 +2140,48 @@ export class AiService {
         'AI service is unavailable or returned an invalid response',
       );
     }
+  }
+
+  async extractRequirementsDocument(input: {
+    fileName: string;
+    mimeType: string;
+    contentBase64: string;
+    currentBrief: Record<string, unknown>;
+  }): Promise<RequirementsDocumentExtractionResult> {
+    if (this.isMockMode()) {
+      return {
+        extractedFields: {},
+        documentSummary:
+          'The document upload was accepted, but AI extraction is disabled in mock mode.',
+        warnings: ['Review and enter any missing requirements manually.'],
+        source: 'local_mock',
+      };
+    }
+    const result = await this.postToFastApi<
+      Partial<RequirementsDocumentExtractionResult>
+    >(
+      '/agents/extract-requirements-document',
+      input,
+      'requirements document extraction',
+    );
+    return {
+      extractedFields:
+        this.sanitizeExtractedFields(result.extractedFields) ?? {},
+      documentSummary:
+        this.cleanAssistantReply(result.documentSummary) ??
+        'The document was inspected for project requirements.',
+      warnings: Array.isArray(result.warnings)
+        ? result.warnings
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim().slice(0, 300))
+            .filter(Boolean)
+            .slice(0, 20)
+        : [],
+      source:
+        result.source === 'local_mock'
+          ? 'local_mock'
+          : 'gemini_document_extraction',
+    };
   }
 
   private isMockMode() {
@@ -2257,6 +2315,8 @@ export class AiService {
         fastPathUsed: result.fastPathUsed ?? false,
         fastPathReason: result.fastPathReason ?? null,
         extractionSource: result.extractionSource,
+        messageIntent: result.messageIntent ?? null,
+        replyMode: result.replyMode ?? null,
         source: 'fastapi',
       };
     } finally {
@@ -2531,35 +2591,95 @@ export class AiService {
     if (!normalized) return false;
     if (
       [
-        'project',
-        'website',
-        'web app',
-        'mobile app',
-        'software',
-        'feature',
-        'screen',
-        'page',
-        'user',
-        'design',
-        'build',
-        'price',
-        'cost',
-        'budget',
-        'deadline',
-        'integration',
-        'dashboard',
-      ].some((marker) => normalized.includes(marker))
+        /\bcapital\s+(?:of\s+)?(?:egypt|france|italy|japan|china|country)\b/,
+        /\bwho\s+(?:is|was)\s+(?:the\s+)?(?:president|king|queen|prime minister)\b/,
+        /\b(?:weather|temperature|forecast)\s+(?:in|for|today|tomorrow)\b/,
+        /\b(?:football|soccer|basketball|tennis)\s+(?:score|result|standings)\b/,
+        /\b(?:stock|crypto|bitcoin|ethereum)\s+price\b/,
+        /\b(?:tell|write)\s+(?:me\s+)?(?:a\s+)?(?:joke|poem|story|song)\b/,
+        /\b(?:recipe|horoscope|song lyrics)\b/,
+      ].some((pattern) => pattern.test(normalized))
+    ) {
+      return true;
+    }
+    if (
+      /\b(?:write|generate|produce|translate|summarize|calculate)\b.*\b(?:code|html|css|essay|email|copy|article|document|poem|story|answer)\b/.test(
+        normalized,
+      )
+    ) {
+      return true;
+    }
+    if (
+      /\b(?:idk|i don'?t know|not sure|no idea|you choose|you decide|what do (?:you|u) suggest|help me (?:choose|decide)|what do you mean|can you help|i don'?t understand|not familiar with|can you explain|could you explain|please explain)\b/.test(
+        normalized,
+      )
     ) {
       return false;
     }
+    const isQuestionOrRequest =
+      normalized.includes('?') ||
+      /^(?:what|which|why|how|who|when|where|can|could|would|should|do|does|did|is|are|will|tell|explain|describe|write|make|create|give|show|find|calculate|translate|summarize)\b/.test(
+        normalized,
+      );
+    if (!isQuestionOrRequest) return false;
+
+    const definition = normalized.match(
+      /^(?:what is|what are|who is|who was|when is|where is|explain|tell me about|describe)\b/,
+    );
+    if (definition) {
+      const subject = normalized
+        .slice(definition[0].length)
+        .split(
+          /\b(?:for|in|within)\s+(?:my|our|this|the)\s+(?:project|product|website|site|app|application|software)\b/,
+          1,
+        )[0];
+      if (
+        !/\b(?:business|industry|domain|company|goal|outcome|result|problem|purpose|users?|audience|customers?|staff|admin|features?|function|workflow|platform|website|web|mobile|ios|android|landing page|marketing site|web app|pages?|screens?|sections?|journey|integrations?|apis?|payments?|maps|sms|email|dashboard|back office|deliverables?|handover|source code|deployment|constraints?|preferences?|brand|color|language|team|freelancers?|experience|junior|mid|senior|expert|years)\b/.test(
+          subject,
+        )
+      ) {
+        return true;
+      }
+    }
+
+    return !/\b(?:project|product|website|web app|mobile app|application|software|features?|screens?|pages?|users?|design|build|develop|prices?|cost|budget|deadline|integrations?|dashboard|requirements?|scope|deliverables?|quote|timeline|ui\/ux|prototype|wireframe|apis?|deployment|hosting|source code|ios|android)\b/.test(
+      normalized,
+    );
+  }
+
+  private buildRequirementsBoundaryReply(dto: BriefDto) {
+    const current = dto.currentBrief ?? {};
+    const missing = Array.isArray(current.missingFields)
+      ? current.missingFields.filter(
+          (field): field is string => typeof field === 'string',
+        )
+      : [];
+    const pending =
+      typeof current.pendingField === 'string'
+        ? current.pendingField
+        : missing[0];
+    const prompts: Record<string, string> = {
+      mainGoal: 'What business outcome should the first version achieve?',
+      targetUsers: 'Who will use the first version, and what will they do?',
+      coreFeatures:
+        'What is the most important action the first version must support?',
+      platforms: 'Should this be a website, an installed mobile app, or both?',
+      solutionType:
+        'Is this a landing page, marketing website, web app, or mobile app?',
+      scopeDetails: 'About how many pages or screens are in the first version?',
+      integrations: 'Which outside services must it connect to, if any?',
+      adminNeeds:
+        'Does your team need a private admin area, and what would it manage?',
+      deliverables:
+        'What should be handed over: the working product, source code, deployment, and/or design files?',
+    };
+    const next = pending ? prompts[pending] : undefined;
     return [
-      /\b(?:what|which)\s+(?:is|was)\s+the\s+capital\s+of\b/,
-      /\bwho\s+(?:is|was)\s+(?:the\s+)?(?:president|king|queen|prime minister)\b/,
-      /\b(?:weather|temperature|forecast)\s+(?:in|for|today|tomorrow)\b/,
-      /\b(?:football|soccer|basketball|tennis)\s+(?:score|result|standings)\b/,
-      /\b(?:stock|crypto|bitcoin|ethereum)\s+price\b/,
-      /\b(?:tell|write)\s+(?:me\s+)?(?:a\s+)?(?:joke|poem|story|song)\b/,
-    ].some((pattern) => pattern.test(normalized));
+      'I can only help shape this project’s requirements, so I won’t answer unrelated trivia or questions here.',
+      next,
+    ]
+      .filter(Boolean)
+      .join(' ');
   }
 
   private getMockGenerateAssessmentResult(dto: GenerateAssessmentDto) {

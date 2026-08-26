@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
 export class CreateRoleAssignmentDto {
   @IsIn(['planning', 'implementation'])
@@ -17,9 +17,11 @@ export class CreateRoleAssignmentDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   decisionReason?: string;
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   notes?: string;
 }

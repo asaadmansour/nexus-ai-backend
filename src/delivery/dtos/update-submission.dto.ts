@@ -10,6 +10,7 @@ import {
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { SUBMISSION_TYPES } from './create-submission.dto';
+import { ContainsOnlySafeUrls } from 'src/common/validation/contains-only-safe-urls.decorator';
 
 export class UpdateSubmissionDto {
   @IsOptional()
@@ -31,6 +32,7 @@ export class UpdateSubmissionDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(12000)
   summary?: string;
 
   @IsOptional()
@@ -39,10 +41,11 @@ export class UpdateSubmissionDto {
 
   @IsOptional()
   @IsObject()
+  @ContainsOnlySafeUrls()
   fileUrls?: Record<string, unknown>;
 
   @IsOptional()
-  @IsUrl({ require_protocol: true })
+  @IsUrl({ require_protocol: true, protocols: ['http', 'https'] })
   @MaxLength(500)
   repoUrl?: string;
 
@@ -52,7 +55,7 @@ export class UpdateSubmissionDto {
   branchName?: string;
 
   @IsOptional()
-  @IsUrl({ require_protocol: true })
+  @IsUrl({ require_protocol: true, protocols: ['http', 'https'] })
   @MaxLength(500)
   pullRequestUrl?: string;
 

@@ -12,6 +12,7 @@ import { CreateProjectDto } from './dtos/create-project.dto';
 import { UpdateProjectDto } from './dtos/update-project.dto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { ProjectPayment } from 'src/payments/entities/project-payment.entity';
+import { MIN_DEADLINE_LEAD_DAYS } from 'src/common/decorators/is-future-date.decorator';
 
 const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_ASSIGNED,
@@ -40,6 +41,7 @@ export class ProjectsService {
   ) {}
 
   async create(customerId: string, dto: CreateProjectDto) {
+    this.assertDeadline(dto.deadline);
     const project = this.projectRepository.create({
       customerId,
       title: dto.title,
@@ -88,16 +90,23 @@ export class ProjectsService {
     dto: UpdateProjectDto,
   ) {
     const project = await this.findOne(id, userId, isAdmin);
-    const pricingChanged =
+    this.assertDeadline(dto.deadline);
+    const quoteSensitiveChanged =
       dto.budgetMin !== undefined ||
       dto.budgetMax !== undefined ||
-      dto.currency !== undefined;
-    if (pricingChanged && Number(project.heldAmount ?? 0) > 0) {
+      dto.currency !== undefined ||
+      dto.deadline !== undefined ||
+      dto.isDeadlineFlexible !== undefined;
+    if (
+      quoteSensitiveChanged &&
+      (project.quoteStatus === 'accepted' ||
+        Number(project.heldAmount ?? 0) > 0)
+    ) {
       throw new ConflictException(
-        'Project budget and currency cannot change after escrow has been funded',
+        'Project budget, currency, and delivery deadline cannot change after the quote is accepted or escrow is funded',
       );
     }
-    if (pricingChanged) {
+    if (quoteSensitiveChanged) {
       const activePayment = await this.projectPaymentRepository.exists({
         where: {
           projectId: id,
@@ -106,7 +115,7 @@ export class ProjectsService {
       });
       if (activePayment) {
         throw new ConflictException(
-          'Project budget and currency cannot change while an escrow checkout is active or funded',
+          'Project budget, currency, and delivery deadline cannot change while an escrow checkout is active or funded',
         );
       }
     }
@@ -125,14 +134,15 @@ export class ProjectsService {
     }
 
     if (dto.currency !== undefined) project.currency = dto.currency;
-    if (pricingChanged) {
+    if (quoteSensitiveChanged) {
       project.quotedAmount = null;
       project.quotedCurrency = null;
       project.quoteStatus = 'not_ready';
       project.quoteGeneratedAt = null;
       project.quoteNotes =
-        'The customer changed the budget. Reconfirm the requirements brief to generate a new price and compensation allocation.';
+        'The customer changed quote-sensitive budget or schedule details. Reconfirm the requirements brief to generate a new price and compensation allocation.';
       project.budgetAllocation = null;
+      project.quoteEvidence = null;
     }
     if (dto.deadline !== undefined)
       project.deadline = dto.deadline ? new Date(dto.deadline) : null;
@@ -158,5 +168,23 @@ export class ProjectsService {
     }
 
     await this.projectRepository.softRemove(project);
+  }
+
+  private assertDeadline(value: string | undefined) {
+    if (value === undefined) return;
+    const deadline = new Date(value);
+    const now = new Date();
+    const minimum = /^\d{4}-\d{2}-\d{2}$/.test(value)
+      ? Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth(),
+          now.getUTCDate() + MIN_DEADLINE_LEAD_DAYS,
+        )
+      : Date.now() + MIN_DEADLINE_LEAD_DAYS * 86_400_000;
+    if (Number.isNaN(deadline.getTime()) || deadline.getTime() < minimum) {
+      throw new BadRequestException(
+        `Project deadline must be at least ${MIN_DEADLINE_LEAD_DAYS} day(s) from now`,
+      );
+    }
   }
 }

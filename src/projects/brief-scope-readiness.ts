@@ -130,7 +130,7 @@ export function isRequirementsGuidanceRequest(value: unknown): boolean {
   return (
     normalized.includes('?') ||
     QUESTION_PREFIX.test(normalized) ||
-    /\b(?:what do (?:you|u) suggest|recommend|suggest|help me (?:choose|decide)|what do you mean)\b/i.test(
+    /\b(?:what do (?:you|u) suggest|recommend|suggest|help me (?:choose|decide)|what do you mean|i don'?t understand|not familiar with|can you explain|could you explain|please explain)\b/i.test(
       normalized,
     )
   );
@@ -163,7 +163,7 @@ function normalizedItems(value: unknown): string[] {
   }
   if (typeof value !== 'string') return [];
   return value
-    .split(/,|;|\n|\band\b/gi)
+    .split(/,|;|\n/gi)
     .map(normalize)
     .filter(Boolean);
 }

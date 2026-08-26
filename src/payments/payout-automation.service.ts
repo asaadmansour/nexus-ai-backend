@@ -3,6 +3,7 @@ import {
   Logger,
   OnApplicationShutdown,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Repository } from 'typeorm';
@@ -12,6 +13,7 @@ import { NotificationsService } from 'src/notifications/notifications.service';
 import { User } from 'src/users/entities/user.entity';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { StripeService } from './stripe.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 @Injectable()
 export class PayoutAutomationService
@@ -30,6 +32,8 @@ export class PayoutAutomationService
     private readonly userRepo: Repository<User>,
     private readonly stripeService: StripeService,
     private readonly notificationsService: NotificationsService,
+    @Optional()
+    private readonly incidents?: AutomationIncidentsService,
   ) {}
 
   onModuleInit() {
@@ -106,6 +110,11 @@ export class PayoutAutomationService
         };
         await this.ledgerRepo.save(entry);
         transferred += 1;
+        await this.incidents?.resolveOperation(
+          'payouts',
+          'stripe_transfer',
+          entry.projectId,
+        );
         await this.notificationsService.createNotification({
           userId: profile.userId,
           projectId: entry.projectId,
@@ -130,6 +139,15 @@ export class PayoutAutomationService
         this.logger.error(
           `Stripe transfer failed for ledger ${entry.id}: ${message}`,
         );
+        await this.incidents?.record({
+          subsystem: 'payouts',
+          operation: 'stripe_transfer',
+          projectId: entry.projectId,
+          errorCode: 'stripe_transfer_failed',
+          severity: 'critical',
+          message,
+          context: { ledgerEntryId: entry.id },
+        });
         if (previousStatus !== 'failed') {
           await this.notifyTransferFailure(entry, profile.userId, message);
         }

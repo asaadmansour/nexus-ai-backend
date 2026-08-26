@@ -1,4 +1,4 @@
-import { IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
 export class ReleasePaymentDto {
   @IsOptional()
@@ -7,5 +7,6 @@ export class ReleasePaymentDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   reason?: string;
 }

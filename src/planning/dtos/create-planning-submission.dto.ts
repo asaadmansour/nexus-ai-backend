@@ -1,6 +1,12 @@
 import { ContainsOnlySafeUrls } from 'src/common/validation/contains-only-safe-urls.decorator';
 import {
-  MaxLength, IsIn, IsObject, IsOptional, IsString, IsUUID } from 'class-validator';
+  MaxLength,
+  IsIn,
+  IsObject,
+  IsOptional,
+  IsString,
+  IsUUID,
+} from 'class-validator';
 
 export class CreatePlanningSubmissionDto {
   @IsUUID()

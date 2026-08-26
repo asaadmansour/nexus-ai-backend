@@ -5,6 +5,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import {
@@ -28,6 +29,7 @@ import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assign
 import { ProjectStatusHistory } from 'src/projects/entities/project-status-history.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { TaskCheckpoint } from 'src/projects/entities/task-checkpoint.entity';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 import {
   planningRoleAllocation,
   principalReviewerRoleAllocation,
@@ -52,30 +54,27 @@ import {
   PRINCIPAL_REVIEWER_ROLE,
   PRINCIPAL_REVIEWER_SKILLS,
 } from 'src/freelancers/principal-reviewer-qualification';
-import { rateInCurrencySql } from 'src/common/currency/currency';
+import {
+  convertAmount,
+  normalizeCurrency,
+  rateInCurrencySql,
+} from 'src/common/currency/currency';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
-// How long a freelancer has to accept an invitation. Two hours was the original
-// fixed value, which meant any invitation issued outside working hours died
-// before the freelancer ever saw it. Configurable via MATCHING_INVITATION_TTL_HOURS;
-// the default is a full day so an overnight invitation survives. See ISSUES.md #1.
-const INVITATION_TTL_HOURS = (() => {
-  const raw = Number(process.env.MATCHING_INVITATION_TTL_HOURS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 24;
-})();
+// Product rule: a freelancer has two hours to accept or decline before matching
+// automatically advances to the next candidate. Deployments may override the
+// window explicitly, but the platform default must remain two hours.
+export function resolveInvitationTtlHours(value?: string): number {
+  const raw = Number(value);
+  return Number.isFinite(raw) && raw > 0 ? raw : 2;
+}
+const INVITATION_TTL_HOURS = resolveInvitationTtlHours(
+  process.env.MATCHING_INVITATION_TTL_HOURS,
+);
 const INVITATION_TTL_MS = INVITATION_TTL_HOURS * 60 * 60 * 1000;
-// A flat window ignores how much time the project actually has. Roles are
-// invited one at a time, so on a project due in three days two unanswered
-// invitations can eat most of the schedule before anyone starts. The window is
-// therefore capped at a share of the time remaining, with a floor so it never
-// becomes unanswerably short. See ISSUES.md #25.
-const INVITATION_MIN_TTL_MS = (() => {
-  const raw = Number(process.env.MATCHING_INVITATION_MIN_TTL_HOURS);
-  return (Number.isFinite(raw) && raw > 0 ? raw : 2) * 60 * 60 * 1000;
-})();
-const INVITATION_DEADLINE_SHARE = (() => {
-  const raw = Number(process.env.MATCHING_INVITATION_DEADLINE_SHARE);
-  return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : 0.1;
+const EMPTY_RUN_RETRY_MS = (() => {
+  const raw = Number(process.env.MATCHING_EMPTY_RUN_RETRY_MINUTES);
+  return (Number.isFinite(raw) && raw > 0 ? raw : 15) * 60 * 1000;
 })();
 const INVITATION_WINDOW_LABEL =
   INVITATION_TTL_HOURS === 1
@@ -183,6 +182,33 @@ export function requiresReviewerCandidateSelection(
   return targetRoleKey !== PRINCIPAL_REVIEWER_ROLE;
 }
 
+export function completedEmptyRunIsCoolingDown(
+  status: string,
+  candidateCount: number,
+  createdAt: Date,
+  now = Date.now(),
+  retryMs = EMPTY_RUN_RETRY_MS,
+) {
+  return (
+    status === 'completed' &&
+    candidateCount === 0 &&
+    createdAt.getTime() > now - retryMs
+  );
+}
+
+export function staffingFailureIsCoolingDown(
+  automationStatus: string | null | undefined,
+  automationErrorAt: Date | null | undefined,
+  now = Date.now(),
+  retryMs = EMPTY_RUN_RETRY_MS,
+) {
+  return (
+    automationStatus === 'staffing_blocked' &&
+    automationErrorAt instanceof Date &&
+    automationErrorAt.getTime() > now - retryMs
+  );
+}
+
 @Injectable()
 export class MatchingService {
   private readonly logger = new Logger(MatchingService.name);
@@ -206,6 +232,8 @@ export class MatchingService {
     private readonly notificationsService: NotificationsService,
     private readonly repositoriesService: RepositoriesService,
     private readonly dataSource: DataSource,
+    @Optional()
+    private readonly incidents?: AutomationIncidentsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -215,7 +243,7 @@ export class MatchingService {
   // Automatically triggered when a project's brief becomes complete. No-ops if
   // matching already ran or the project is not startable, and never throws — it
   // must not disrupt the brief-completion flow that calls it.
-  async autoStartPlanningRoles(projectId: string): Promise<void> {
+  async autoStartPlanningRoles(projectId: string): Promise<boolean> {
     try {
       const reviewer = await this.dataSource
         .getRepository(ProjectRoleAssignment)
@@ -227,7 +255,7 @@ export class MatchingService {
             status: In(['accepted', 'in_progress']),
           },
         });
-      if (!reviewer) return;
+      if (!reviewer) return false;
       const existingRuns = await this.runRepo.find({
         where: {
           projectId,
@@ -235,34 +263,64 @@ export class MatchingService {
           targetRoleKey: In(PLANNING_ROLES),
           status: In(['queued', 'running', 'completed', 'reviewed']),
         },
-        select: { targetRoleKey: true },
+        select: {
+          id: true,
+          targetRoleKey: true,
+          status: true,
+          createdAt: true,
+        },
       });
+      const candidateCounts = await this.getCandidateCounts(
+        existingRuns.map((run) => run.id),
+      );
       const startedRoles = new Set(
         existingRuns
+          .filter(
+            (run) =>
+              run.status !== 'completed' ||
+              (candidateCounts.get(run.id) ?? 0) > 0 ||
+              completedEmptyRunIsCoolingDown(
+                run.status,
+                candidateCounts.get(run.id) ?? 0,
+                run.createdAt,
+              ),
+          )
           .map((run) => run.targetRoleKey)
           .filter((role): role is string => Boolean(role)),
       );
       const missingRoles = PLANNING_ROLES.filter(
         (role) => !startedRoles.has(role),
       );
-      if (!missingRoles.length) return;
+      if (!missingRoles.length) return false;
 
       const project = await this.projectRepo.findOne({
         where: { id: projectId },
       });
-      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) return;
+      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) {
+        return false;
+      }
+      if (
+        staffingFailureIsCoolingDown(
+          project.automationStatus,
+          project.automationErrorAt,
+        )
+      ) {
+        return false;
+      }
 
       await this.startPlanningRoles(projectId, { roles: missingRoles }, null);
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(
         `Auto-start matching failed for project ${projectId}: ${message}`,
       );
       await this.markStaffingBlocked(projectId, message);
+      return false;
     }
   }
 
-  async autoStartPrincipalReviewer(projectId: string): Promise<void> {
+  async autoStartPrincipalReviewer(projectId: string): Promise<boolean> {
     try {
       const existingAssignment = await this.dataSource
         .getRepository(ProjectRoleAssignment)
@@ -274,7 +332,7 @@ export class MatchingService {
             status: In(['assigned', 'accepted', 'in_progress']),
           },
         });
-      if (existingAssignment) return;
+      if (existingAssignment) return false;
       const pendingInvitation = await this.invitationRepo.findOne({
         where: {
           projectId,
@@ -283,20 +341,22 @@ export class MatchingService {
           status: In(['pending', 'accepting']),
         },
       });
-      if (pendingInvitation) return;
+      if (pendingInvitation) return false;
       const project = await this.getProject(projectId);
-      if (project.status !== ProjectStatus.BRIEF_COMPLETE) return;
+      if (!MATCH_START_ALLOWED_STATUSES.has(project.status)) return false;
       await this.startPlanningRoles(
         projectId,
         { roles: [PRINCIPAL_REVIEWER_ROLE] },
         null,
       );
+      return true;
     } catch (error) {
       const message = this.errorMessage(error);
       this.logger.error(
         `Principal-reviewer automation failed for ${projectId}: ${message}`,
       );
       await this.markStaffingBlocked(projectId, message);
+      return false;
     }
   }
 
@@ -425,14 +485,39 @@ export class MatchingService {
           result.invitationId == null),
     );
     if (staffingFailed) {
+      const failureReason = runResults
+        .filter(
+          (result) =>
+            result.status === 'failed' ||
+            Number(result.candidateCount ?? 0) === 0 ||
+            (result.targetRoleKey === PRINCIPAL_REVIEWER_ROLE &&
+              result.invitationId == null),
+        )
+        .map((result) => {
+          const roleKey =
+            typeof result.targetRoleKey === 'string'
+              ? result.targetRoleKey
+              : 'planning role';
+          return typeof result.error === 'string' && result.error
+            ? `${roleKey}: ${result.error}`
+            : `No eligible candidate was found for ${roleKey}.`;
+        })
+        .join(' ');
       await this.markStaffingBlocked(
         projectId,
-        'One or more planning roles could not produce an eligible shortlist.',
+        failureReason ||
+          'One or more planning roles could not produce an eligible shortlist.',
       );
     } else if (runResults.some((result) => result.selectionRequired === true)) {
       await this.markAwaitingReviewerSelection(
         project,
         runResults.filter((result) => result.selectionRequired === true),
+      );
+    } else {
+      await this.incidents?.resolveOperation(
+        'matching',
+        'staff_project',
+        projectId,
       );
     }
 
@@ -731,6 +816,12 @@ export class MatchingService {
       );
     } else if (runResults.length > 0) {
       await this.markAwaitingReviewerSelection(input.project, runResults);
+    } else {
+      await this.incidents?.resolveOperation(
+        'matching',
+        'staff_project',
+        input.project.id,
+      );
     }
     return runResults;
   }
@@ -881,6 +972,12 @@ export class MatchingService {
       task.sourceCandidateId = candidate?.id ?? null;
       task.assignedBy = adminUserId;
       task.assignedAt = assignedAt;
+      // Freeze the contract rate at acceptance. Payouts must never read the
+      // freelancer's mutable profile rate after work has been assigned.
+      task.hourlyRateSnapshot = profile.hourlyRate;
+      task.hourlyRateCurrencySnapshot = normalizeCurrency(
+        profile.hourlyRateCurrency,
+      );
       task.assignmentStatus = 'accepted';
       if (task.status !== 'in_progress') task.status = 'todo';
       if (dto.notes) {
@@ -1014,6 +1111,9 @@ export class MatchingService {
 
     if (unassigned === 0) {
       project.automationStatus = 'implementation_active';
+      project.automationError = null;
+      project.automationErrorCategory = null;
+      project.automationErrorAt = null;
       if (project.status === ProjectStatus.ASSIGNED) {
         await manager.save(Project, project);
         return;
@@ -1080,6 +1180,9 @@ export class MatchingService {
       taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
       status: run.status,
       summary: run.summary,
+      error: run.error,
+      failureCategory: this.matchingFailureCategory(run.error),
+      actionRequired: this.matchingFailureAction(run.error),
       candidateCount: counts.get(run.id) ?? 0,
       selectedCandidateId: selected.get(run.id) ?? null,
       invitation: invitations.get(run.id) ?? null,
@@ -1128,6 +1231,13 @@ export class MatchingService {
       taskTitle: (run.inputSnapshot?.taskTitle as string | undefined) ?? null,
       status: run.status,
       summary: run.summary,
+      error: run.error,
+      failureCategory: this.matchingFailureCategory(run.error),
+      actionRequired: this.matchingFailureAction(run.error),
+      projectAutomationStatus: run.project?.automationStatus ?? null,
+      projectAutomationError: run.project?.automationError ?? null,
+      projectAutomationErrorCategory:
+        run.project?.automationErrorCategory ?? null,
       candidateCount: counts.get(run.id) ?? 0,
       selectedCandidateId: selected.get(run.id) ?? null,
       invitation: invitations.get(run.id) ?? null,
@@ -1137,6 +1247,27 @@ export class MatchingService {
       createdAt: run.createdAt,
     }));
     return { data, total };
+  }
+
+  async adminWorkflowDiagnostics() {
+    const blocked = await this.projectRepo.find({
+      where: { automationStatus: 'staffing_blocked' },
+      order: { automationErrorAt: 'DESC', updatedAt: 'DESC' },
+      take: 100,
+    });
+    return blocked.map((project) => ({
+      projectId: project.id,
+      projectTitle: project.title,
+      projectStatus: project.status,
+      automationStatus: project.automationStatus,
+      category:
+        project.automationErrorCategory ??
+        this.matchingFailureCategory(project.automationError),
+      error: project.automationError,
+      actionRequired: this.matchingFailureAction(project.automationError),
+      occurredAt: project.automationErrorAt,
+      updatedAt: project.updatedAt,
+    }));
   }
 
   async getRun(runId: string) {
@@ -1639,6 +1770,9 @@ export class MatchingService {
           if (invitation.phase === 'governance') {
             invitation.project.principalReviewerAssignmentId = created.id;
             invitation.project.automationStatus = 'matching_planning_team';
+            invitation.project.automationError = null;
+            invitation.project.automationErrorCategory = null;
+            invitation.project.automationErrorAt = null;
             await manager.save(Project, invitation.project);
           } else {
             await this.maybeAdvanceToPlanningAssigned(
@@ -1801,8 +1935,7 @@ export class MatchingService {
             },
           });
         if (!reviewer) {
-          await this.autoStartPrincipalReviewer(project.id);
-          restarted += 1;
+          if (await this.autoStartPrincipalReviewer(project.id)) restarted += 1;
           continue;
         }
 
@@ -1884,24 +2017,11 @@ export class MatchingService {
         continue;
       }
 
-      const existingRuns = await this.runRepo.find({
-        where: {
-          projectId: assignment.projectId,
-          targetType: 'planning_role',
-          targetRoleKey: In(PLANNING_ROLES),
-          status: In(['queued', 'running', 'completed', 'reviewed']),
-        },
-        select: { targetRoleKey: true },
-      });
-      const startedRoles = new Set(
-        existingRuns
-          .map((run) => run.targetRoleKey)
-          .filter((role): role is string => Boolean(role)),
-      );
-      if (PLANNING_ROLES.every((role) => startedRoles.has(role))) continue;
-
-      await this.autoStartPlanningRoles(assignment.projectId);
-      restarted += 1;
+      // autoStartPlanningRoles is idempotent and knows that a completed run with
+      // zero candidates is not progress. Calling it here lets newly eligible
+      // freelancers unblock an old empty shortlist.
+      if (await this.autoStartPlanningRoles(assignment.projectId))
+        restarted += 1;
     }
 
     return { inspected: reviewerAssignments.length, restarted };
@@ -1959,6 +2079,8 @@ export class MatchingService {
       let principalReviewerSuspendedUserId: string | null = null;
       const removedAt = new Date();
       const priorAssignedAt = task.assignedAt;
+      const priorHourlyRateSnapshot = task.hourlyRateSnapshot;
+      const priorHourlyRateCurrencySnapshot = task.hourlyRateCurrencySnapshot;
       const profile = await manager.findOne(FreelancerProfile, {
         where: { id: removedProfileId },
       });
@@ -2010,6 +2132,8 @@ export class MatchingService {
       task.assignedFreelancerProfileId = null;
       task.assignedAt = null;
       task.assignedBy = null;
+      task.hourlyRateSnapshot = null;
+      task.hourlyRateCurrencySnapshot = null;
       task.assignmentStatus = 'unassigned';
       task.status = 'todo';
       const currentPenalty = Math.max(0, Number(task.penaltyAmount ?? 0));
@@ -2023,6 +2147,8 @@ export class MatchingService {
             assignedAt: priorAssignedAt?.toISOString() ?? null,
             endedAt: removedAt.toISOString(),
             reason,
+            hourlyRateSnapshot: priorHourlyRateSnapshot,
+            hourlyRateCurrencySnapshot: priorHourlyRateCurrencySnapshot,
             penaltyAmount: currentPenalty.toFixed(2),
             budgetBeforePenalty: currentBudget.toFixed(2),
           },
@@ -2155,6 +2281,9 @@ export class MatchingService {
         project.status = ProjectStatus.PLANNING_MATCHING;
         project.planningStatus = 'matching';
         project.automationStatus = 'awaiting_planning_team';
+        project.automationError = null;
+        project.automationErrorCategory = null;
+        project.automationErrorAt = null;
         await manager.save(Project, project);
       }
       return {
@@ -2263,25 +2392,6 @@ export class MatchingService {
             !Array.isArray(entry),
         )
       : [];
-  }
-
-  /**
-   * How long this invitation should stay open. The configured window normally
-   * applies unchanged; it is only shortened when the project deadline cannot
-   * afford it, and never below the floor. ISSUES.md #25.
-   */
-  private invitationTtlMs(project?: { deadline?: Date | null } | null): number {
-    const deadline = project?.deadline ? new Date(project.deadline) : null;
-    if (!deadline || Number.isNaN(deadline.getTime())) return INVITATION_TTL_MS;
-
-    const remainingMs = deadline.getTime() - Date.now();
-    if (remainingMs <= 0) return INVITATION_MIN_TTL_MS;
-
-    const affordable = remainingMs * INVITATION_DEADLINE_SHARE;
-    return Math.max(
-      INVITATION_MIN_TTL_MS,
-      Math.min(INVITATION_TTL_MS, affordable),
-    );
   }
 
   private async inviteNextCandidate(
@@ -2485,7 +2595,7 @@ export class MatchingService {
             scoreBreakdown: candidate.scoreBreakdown,
             rationale: candidate.rationale,
           },
-          expiresAt: new Date(Date.now() + this.invitationTtlMs(run.project)),
+          expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
           respondedAt: null,
           responseReason: null,
         }),
@@ -2527,9 +2637,17 @@ export class MatchingService {
             : phase === 'planning'
               ? 'awaiting_planning_team'
               : 'awaiting_implementation_team',
+        automationError: null,
+        automationErrorCategory: null,
+        automationErrorAt: null,
       });
       return created;
     });
+    await this.incidents?.resolveOperation(
+      'matching',
+      'staff_project',
+      run.projectId,
+    );
     await this.notificationsService
       .createNotification({
         userId: candidate.freelancerProfile.userId,
@@ -2718,7 +2836,15 @@ export class MatchingService {
   ) {
     await this.projectRepo.update(project.id, {
       automationStatus: 'awaiting_reviewer_selection',
+      automationError: null,
+      automationErrorCategory: null,
+      automationErrorAt: null,
     });
+    await this.incidents?.resolveOperation(
+      'matching',
+      'staff_project',
+      project.id,
+    );
     const reviewer = await this.dataSource
       .getRepository(ProjectRoleAssignment)
       .findOne({
@@ -2777,10 +2903,23 @@ export class MatchingService {
       const project = await this.projectRepo.findOne({
         where: { id: projectId },
       });
-      if (!project || project.automationStatus === 'staffing_blocked') return;
+      if (!project) return;
+      const wasAlreadyBlocked = project.automationStatus === 'staffing_blocked';
       this.logger.error(`Staffing blocked for ${projectId}: ${reason}`);
       project.automationStatus = 'staffing_blocked';
+      project.automationError = reason;
+      project.automationErrorCategory = this.matchingFailureCategory(reason);
+      project.automationErrorAt = new Date();
       await this.projectRepo.save(project);
+      await this.incidents?.record({
+        subsystem: 'matching',
+        operation: 'staff_project',
+        projectId,
+        errorCode: project.automationErrorCategory ?? 'staffing_blocked',
+        message: reason,
+        context: { actionRequired: this.matchingFailureAction(reason) },
+      });
+      if (wasAlreadyBlocked) return;
       await this.notifyProjectOwner(
         project,
         'Automatic staffing needs attention',
@@ -2791,6 +2930,65 @@ export class MatchingService {
         `Could not persist staffing blocker for ${projectId}: ${this.errorMessage(error)}`,
       );
     }
+  }
+
+  private matchingFailureCategory(error: string | null | undefined) {
+    if (!error) return null;
+    const value = error.toLowerCase();
+    if (
+      /prerequisite|architecture|ui\/ux|brief|plan|not ready|must be approved/.test(
+        value,
+      )
+    ) {
+      return 'missing_prerequisite';
+    }
+    if (
+      /no eligible|no suitable|no candidate|candidate remains|empty shortlist/.test(
+        value,
+      )
+    ) {
+      return 'no_eligible_freelancer';
+    }
+    if (/budget|rate|currency|allocation|compensation|escrow/.test(value)) {
+      return 'budget_rate_mismatch';
+    }
+    if (
+      /capacity|availability|unavailable|already assigned|workload/.test(value)
+    ) {
+      return 'availability_conflict';
+    }
+    if (
+      /ai service|gemini|model|provider|temporarily unavailable/.test(value)
+    ) {
+      return 'ai_service';
+    }
+    if (
+      /configuration|configured|token|credential|github|repository/.test(value)
+    ) {
+      return 'configuration';
+    }
+    return 'internal_error';
+  }
+
+  private matchingFailureAction(error: string | null | undefined) {
+    const category = this.matchingFailureCategory(error);
+    const actions: Record<string, string> = {
+      missing_prerequisite:
+        'Complete or approve the named prerequisite, then retry automation.',
+      no_eligible_freelancer:
+        'Review required skills/rate constraints or onboard another eligible freelancer; automatic retries continue.',
+      budget_rate_mismatch:
+        'Review the project allocation and freelancer rate currencies before retrying.',
+      availability_conflict:
+        'Wait for capacity or invite the next eligible candidate.',
+      ai_service:
+        'Check AI service health/model configuration, then retry the failed run.',
+      configuration:
+        'Fix the named integration or credential configuration, then retry.',
+      internal_error:
+        'Inspect the matching run details and service logs, then retry after resolving the error.',
+    };
+    return category ? actions[category] : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -3159,7 +3357,21 @@ export class MatchingService {
         'The selected freelancer must set a positive hourly rate before the system can verify task budget coverage',
       );
     }
-    const expectedCost = hourlyRate * hours;
+    const hourlyRateInTaskCurrency = convertAmount(
+      hourlyRate,
+      profile.hourlyRateCurrency,
+      task.currency,
+    );
+    if (
+      hourlyRateInTaskCurrency == null ||
+      !Number.isFinite(hourlyRateInTaskCurrency) ||
+      hourlyRateInTaskCurrency <= 0
+    ) {
+      throw new ConflictException(
+        `No exchange rate is configured from ${normalizeCurrency(profile.hourlyRateCurrency)} to ${normalizeCurrency(task.currency)}. Configure it before assigning this task.`,
+      );
+    }
+    const expectedCost = hourlyRateInTaskCurrency * hours;
     if (expectedCost <= amount + 0.005) return;
 
     const currentTotal = Number(project.quotedAmount) || amount * 2;
@@ -3222,12 +3434,11 @@ export class MatchingService {
     }
 
     const count = async (where: string, params: Record<string, unknown> = {}) =>
-      this.profileRepo
-        .createQueryBuilder('p')
-        .where(where, params)
-        .getCount();
+      this.profileRepo.createQueryBuilder('p').where(where, params).getCount();
 
-    const approved = await count("p.verificationStatus = 'approved' AND p.deletedAt IS NULL");
+    const approved = await count(
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL",
+    );
     if (!approved) {
       return `No approved freelancer exists yet, so ${roleKey} cannot be staffed. Approve at least one freelancer before matching.`;
     }

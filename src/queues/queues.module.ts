@@ -43,6 +43,7 @@ const bullImports = queuesEnabled
         { name: QUEUES.PROJECT_PLAN_GENERATION },
         { name: QUEUES.PLANNING_SUBMISSION_EVALUATION },
         { name: QUEUES.SUBMISSION_EVALUATION },
+        { name: QUEUES.REQUIREMENTS_DOCUMENT_PROCESSING },
       ),
     ]
   : [];

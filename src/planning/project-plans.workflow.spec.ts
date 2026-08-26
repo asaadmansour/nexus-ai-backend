@@ -100,9 +100,13 @@ describe('Sprint 5 task workflow', () => {
   });
 
   it('recovers approved plans that were stranded before task materialization', async () => {
-    const getMany = jest
-      .fn()
-      .mockResolvedValue([{ id: 'plan-1', approvedBy: 'reviewer-1' }]);
+    const getMany = jest.fn().mockResolvedValue([
+      {
+        id: 'plan-1',
+        projectId: 'project-1',
+        approvedBy: 'reviewer-1',
+      },
+    ]);
     const queryBuilder: Record<string, jest.Mock> = {};
     for (const method of [
       'leftJoin',
@@ -128,6 +132,11 @@ describe('Sprint 5 task workflow', () => {
     const result = await service.recoverApprovedUnmaterializedPlans();
 
     expect(materialize).toHaveBeenCalledWith('plan-1', {}, 'reviewer-1');
-    expect(result).toEqual({ inspected: 1, recovered: 1, failures: [] });
+    expect(result).toEqual({
+      inspected: 1,
+      recovered: 1,
+      recoveredProjectIds: ['project-1'],
+      failures: [],
+    });
   });
 });
