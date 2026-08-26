@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   HttpStatus,
@@ -166,6 +167,7 @@ export class BriefService {
     );
     this.assertBriefCanChange(project);
     const brief = await this.getOrCreateBrief(projectId);
+    await this.assertDocumentImportAllowed(brief.id);
     const verified = await this.documentSecurity.validateAndScan(file);
     const sha256 = createHash('sha256').update(file.buffer).digest('hex');
     const duplicate = await this.briefDocumentRepo.findOne({
@@ -183,6 +185,17 @@ export class BriefService {
         duplicate: true,
         missingFields: this.getMissingFields(brief),
       };
+    }
+    const existingImport = await this.briefDocumentRepo.count({
+      where: {
+        briefId: brief.id,
+        status: In(['queued', 'processing', 'processed']),
+      },
+    });
+    if (existingImport > 0) {
+      throw new ConflictException(
+        'A requirements document has already started this intake. Wait for it to finish, then answer only the missing questions in chat.',
+      );
     }
     await this.assertDocumentUploadRate(userId);
     const stored = await this.documentStorage.upload(
@@ -209,6 +222,17 @@ export class BriefService {
           order: { createdAt: 'DESC' },
         });
         if (concurrentDuplicate) return concurrentDuplicate;
+        const concurrentImport = await manager.count(BriefDocument, {
+          where: {
+            briefId: brief.id,
+            status: In(['queued', 'processing', 'processed']),
+          },
+        });
+        if (concurrentImport > 0) {
+          throw new ConflictException(
+            'A requirements document has already started this intake.',
+          );
+        }
 
         const created = await manager.save(
           BriefDocument,
@@ -601,6 +625,7 @@ export class BriefService {
     );
     const brief = await this.getOrCreateBrief(projectId);
     await this.ensureInitialAgentMessage(brief, project);
+    await this.assertNoPendingDocumentImport(brief.id);
     const wasComplete = brief.isComplete;
     this.assertAiChatAllowed(project, brief);
 
@@ -712,6 +737,43 @@ export class BriefService {
       };
     });
     return result;
+  }
+
+  /**
+   * Document import is an intake choice, not a chat attachment. Once the client
+   * has sent a real chat answer, allowing a later upload would mix an arbitrary
+   * document into an already-established conversation and could silently
+   * replace scope decisions.
+   */
+  private async assertDocumentImportAllowed(briefId: string) {
+    const chatStarted = await this.briefMessageRepo
+      .createQueryBuilder('message')
+      .where('message.brief_id = :briefId', { briefId })
+      .andWhere("message.sender_type = 'customer'")
+      .andWhere(
+        "(message.metadata IS NULL OR NOT (message.metadata ? 'briefDocumentId'))",
+      )
+      .getExists();
+
+    if (chatStarted) {
+      throw new ConflictException(
+        'Requirements documents can only be imported before the guided chat starts.',
+      );
+    }
+  }
+
+  private async assertNoPendingDocumentImport(briefId: string) {
+    const pendingDocuments = await this.briefDocumentRepo.count({
+      where: {
+        briefId,
+        status: In(['queued', 'processing']),
+      },
+    });
+    if (pendingDocuments > 0) {
+      throw new ConflictException(
+        'Wait for the requirements document to finish processing before continuing in chat.',
+      );
+    }
   }
 
   async updateBrief(
@@ -961,6 +1023,14 @@ export class BriefService {
     nextQuestionField: string | null,
     replyMode?: string | null,
   ) {
+    // Completion is owned by validated server state, not by the model's prose.
+    // A model can otherwise append another question after extracting the final
+    // fields, leaving the UI looking like an endless interview even though the
+    // brief is already complete.
+    if (missingFields.length === 0) {
+      return 'Thanks—the first-release scope is complete. Review the brief, then confirm it to generate your quote.';
+    }
+
     const lastAgentMessage = [...recentMessages]
       .reverse()
       .find((message) => message.senderType === 'agent');
@@ -1004,10 +1074,6 @@ export class BriefService {
           this.normalizeComparableText(assistantReply))
     ) {
       return assistantReply;
-    }
-
-    if (missingFields.length === 0) {
-      return 'Thanks, the brief has enough detail to continue.';
     }
 
     // Ask about the pending field, not simply the first missing one.

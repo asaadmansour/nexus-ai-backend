@@ -2,6 +2,9 @@ import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 
+export type ParsedStripeWebhookEvent =
+  Stripe.Event | Stripe.V2.Core.EventNotification;
+
 @Injectable()
 export class StripeService {
   private readonly stripe: Stripe;
@@ -59,6 +62,22 @@ export class StripeService {
     });
   }
 
+  retrieveAccountForThinEvent(event: Stripe.V2.Core.EventNotification) {
+    const related = (
+      event as unknown as {
+        related_object?: { id?: unknown; type?: unknown } | null;
+      }
+    ).related_object;
+    if (
+      related?.type !== 'v2.core.account' ||
+      typeof related.id !== 'string' ||
+      !related.id
+    ) {
+      return Promise.resolve(null);
+    }
+    return this.retrieveConnectedAccount(related.id);
+  }
+
   retrieveAccount(accountId: string) {
     return this.stripe.accounts.retrieve(accountId);
   }
@@ -84,7 +103,10 @@ export class StripeService {
     return this.stripe.transfers.create(params, options);
   }
 
-  constructWebhookEvent(payload: Buffer | string, signature: string) {
+  constructWebhookEvent(
+    payload: Buffer | string,
+    signature: string,
+  ): ParsedStripeWebhookEvent {
     const webhookSecret = this.configService.get<string>(
       'STRIPE_WEBHOOK_SECRET',
     );
@@ -95,6 +117,25 @@ export class StripeService {
       );
     }
 
+    const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : payload;
+    let objectType: unknown;
+    try {
+      objectType = (JSON.parse(text) as { object?: unknown })?.object;
+    } catch {
+      // Preserve Stripe's signature-first error behavior for malformed input.
+      return this.stripe.webhooks.constructEvent(
+        payload,
+        signature,
+        webhookSecret,
+      );
+    }
+    if (objectType === 'v2.core.event') {
+      return this.stripe.parseEventNotification(
+        payload,
+        signature,
+        webhookSecret,
+      );
+    }
     return this.stripe.webhooks.constructEvent(
       payload,
       signature,

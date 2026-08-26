@@ -32,7 +32,7 @@ import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
-import { StripeService } from './stripe.service';
+import { ParsedStripeWebhookEvent, StripeService } from './stripe.service';
 
 type ConnectedStripeAccount = Stripe.Account | Stripe.V2.Core.Account;
 type StripeConnectOnboardingUrls = {
@@ -961,8 +961,17 @@ export class PaymentsService {
     };
   }
 
-  private async processStripeEvent(event: Stripe.Event) {
+  private async processStripeEvent(event: ParsedStripeWebhookEvent) {
     const eventType = event.type as string;
+
+    if (event.object === 'v2.core.event') {
+      if (eventType === 'v2.core.account[requirements].updated') {
+        const account =
+          await this.stripeService.retrieveAccountForThinEvent(event);
+        if (account) await this.handleAccountUpdated(account);
+      }
+      return;
+    }
 
     switch (eventType) {
       case 'payment_intent.succeeded':
@@ -987,11 +996,6 @@ export class PaymentsService {
         break;
       case 'account.updated':
         await this.handleAccountUpdated(event.data.object as Stripe.Account);
-        break;
-      case 'v2.core.account[requirements].updated':
-        await this.handleAccountUpdated(
-          event.data.object as unknown as Stripe.V2.Core.Account,
-        );
         break;
       default:
         break;

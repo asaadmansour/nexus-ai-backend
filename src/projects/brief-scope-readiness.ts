@@ -62,7 +62,7 @@ export function isBriefScopeFieldComplete(
         (item) =>
           item.length >= 8 &&
           !item.includes('?') &&
-          /\b(?:sell|buy|book|manage|track|show|display|explain|describe|collect|inform|market|promote|reduce|automate|help|allow|enable|connect|order|reserve|schedule|learn|contact|generate|receive|share|find|compare|request|provide|present)\b/i.test(
+          /\b(?:sell|buy|book|manage|track|show|display|explain|describe|collect|inform|market|promote|reduce|automate|help|allow|enable|connect|order|reserve|schedule|learn|contact|generate|receive|share|find|compare|request|provide|present|grow|increase|improve|showcase|advertise|streamline|digitize|engage|support|serve)\b/i.test(
             item,
           ),
       );

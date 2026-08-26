@@ -23,7 +23,7 @@
     "seed:demo": "ts-node -r tsconfig-paths/register src/database/seeds/seed-demo.ts",
     "seed:uiux-top-match": "ts-node -r tsconfig-paths/register src/database/seeds/seed-uiux-top-match.ts",
     "backfill:embeddings": "ts-node -r tsconfig-paths/register src/database/seeds/backfill-embeddings.ts",
-    "stripe:listen": "set -a; . ./.env; set +a; stripe listen --api-key \"$STRIPE_SECRET_KEY\" --forward-to localhost:${PORT:-3000}/api/payments/webhooks/stripe --events checkout.session.completed,payment_intent.succeeded,payment_intent.payment_failed,setup_intent.succeeded,account.updated,v2.core.account[requirements].updated",
+    "stripe:listen": "set -a; . ./.env; set +a; stripe listen --api-key \"$STRIPE_SECRET_KEY\" --forward-to localhost:${PORT:-3000}/api/payments/webhooks/stripe --events checkout.session.completed,payment_intent.succeeded,payment_intent.payment_failed,setup_intent.succeeded,account.updated --forward-thin-to localhost:${PORT:-3000}/api/payments/webhooks/stripe --thin-events 'v2.core.account[requirements].updated'",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",

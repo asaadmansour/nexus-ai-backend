@@ -84,6 +84,59 @@ describe('AiService requirements guard', () => {
     expect(result.completionPercentage).toBe(100);
   });
 
+  it('does not discard the newer priceable scope fields returned by FastAPI', async () => {
+    const productionService = new AiService({
+      get: (key: string) =>
+        ({
+          AI_MOCK_MODE: 'false',
+          AI_SERVICE_URL: 'http://ai-service.test',
+          AI_SERVICE_TIMEOUT_MS: '1000',
+        })[key],
+    } as ConfigService);
+    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          isComplete: true,
+          completionPercentage: 100,
+          missingFields: [],
+          nextQuestion: null,
+          nextQuestionField: null,
+          assistantReply: 'The scope is complete.',
+          extractedFields: {
+            mainGoal: 'Increase bakery orders through WhatsApp',
+            targetUsers: ['local customers'],
+            coreFeatures: ['product gallery', 'WhatsApp order button'],
+            platforms: ['responsive website'],
+            solutionType: 'single landing page',
+            scopeDetails: 'one page with five sections',
+            integrations: ['WhatsApp', 'Google Maps'],
+            adminNeeds: 'no admin dashboard',
+            deliverables: ['working website', 'source code', 'live link'],
+          },
+        }),
+    } as Response);
+
+    try {
+      const result = await productionService.validateBrief({
+        projectId: 'project-1',
+        briefId: 'brief-1',
+        briefText: 'Here are all of the requirements.',
+      });
+
+      expect(result.isComplete).toBe(true);
+      expect(result.missingFields).toEqual([]);
+      expect(result.extractedFields).toMatchObject({
+        solutionType: 'single landing page',
+        scopeDetails: 'one page with five sections',
+        integrations: ['WhatsApp', 'Google Maps'],
+        adminNeeds: 'no admin dashboard',
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it('guides an uncertain client instead of accepting idk', async () => {
     const result = await service.validateBrief({
       briefText: 'idk',
