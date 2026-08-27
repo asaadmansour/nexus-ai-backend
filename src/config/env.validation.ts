@@ -44,6 +44,26 @@ export function validateEnv(config: Env): Env {
     throw new Error(`Missing environment variables: ${missingKeys.join(', ')}`);
   }
 
+  const frontendUrl = parseUrl(config.FRONTEND_URL!, 'FRONTEND_URL');
+  const googleCallbackUrl = parseUrl(
+    config.GOOGLE_CALLBACK_URL!,
+    'GOOGLE_CALLBACK_URL',
+  );
+  if (googleCallbackUrl.pathname !== '/api/auth/google/callback') {
+    throw new Error(
+      'GOOGLE_CALLBACK_URL must end with /api/auth/google/callback',
+    );
+  }
+  if (
+    config.NODE_ENV === 'production' &&
+    (frontendUrl.protocol !== 'https:' ||
+      googleCallbackUrl.protocol !== 'https:')
+  ) {
+    throw new Error(
+      'FRONTEND_URL and GOOGLE_CALLBACK_URL must use HTTPS in production',
+    );
+  }
+
   if (
     config.NODE_ENV === 'production' &&
     (config.JWT_SECRET === 'change-me' || config.JWT_SECRET!.length < 32)
@@ -82,4 +102,12 @@ export function validateEnv(config: Env): Env {
   }
 
   return config;
+}
+
+function parseUrl(value: string, key: string) {
+  try {
+    return new URL(value);
+  } catch {
+    throw new Error(`${key} must be a valid absolute URL`);
+  }
 }

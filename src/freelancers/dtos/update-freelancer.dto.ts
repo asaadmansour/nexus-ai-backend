@@ -11,16 +11,25 @@ import {
   Max,
   ArrayMaxSize,
   Matches,
+  MinLength,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
+import {
+  GITHUB_USERNAME_MAX_LENGTH,
+  GITHUB_USERNAME_MESSAGE,
+  GITHUB_USERNAME_PATTERN,
+  normalizeGithubUsername,
+} from 'src/common/validation/github-username';
 
 export class UpdateFreelancerDto {
   @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? normalizeGithubUsername(value) : value,
+  )
   @IsString()
-  @MaxLength(120)
-  @Matches(/^(?!.*--)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, {
-    message:
-      'githubUsername may contain only letters, numbers, and single hyphens, with no leading or trailing hyphen',
-  })
+  @MinLength(1)
+  @MaxLength(GITHUB_USERNAME_MAX_LENGTH)
+  @Matches(GITHUB_USERNAME_PATTERN, { message: GITHUB_USERNAME_MESSAGE })
   githubUsername?: string;
 
   @IsOptional()

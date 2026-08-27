@@ -11,6 +11,7 @@ import { RefreshToken } from './entities/refresh-token.entity';
 import { GoogleStrategy } from './strategies/google.strategy';
 import { EmailModule } from 'src/email/email.module';
 import { PhoneVerificationChallenge } from './entities/phone-verification-challenge.entity';
+import { GoogleOAuthCallbackGuard } from './guards/google-oauth-callback.guard';
 
 @Module({
   imports: [
@@ -28,6 +29,6 @@ import { PhoneVerificationChallenge } from './entities/phone-verification-challe
     EmailModule,
   ],
   controllers: [AuthController],
-  providers: [AuthService, GoogleStrategy],
+  providers: [AuthService, GoogleStrategy, GoogleOAuthCallbackGuard],
 })
 export class AuthModule {}

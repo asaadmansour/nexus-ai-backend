@@ -119,8 +119,21 @@ export class FreelancersService {
 
     const previousStatus = profile.verificationStatus ?? null;
 
-    if (dto.githubUsername !== undefined)
+    if (dto.githubUsername !== undefined) {
+      const duplicate = await this.freelancerRepository
+        .createQueryBuilder('profile')
+        .where('LOWER(profile.github_username) = LOWER(:githubUsername)', {
+          githubUsername: dto.githubUsername,
+        })
+        .andWhere('profile.id <> :profileId', { profileId: profile.id })
+        .getExists();
+      if (duplicate) {
+        throw new ConflictException(
+          'This GitHub username is already registered.',
+        );
+      }
       profile.githubUsername = dto.githubUsername;
+    }
     if (dto.headline !== undefined) profile.headline = dto.headline;
     if (dto.bio !== undefined) profile.bio = dto.bio;
     if (dto.skills !== undefined) profile.skills = dto.skills;

@@ -26,6 +26,7 @@ import type {
   AuthenticatedRequest,
   GoogleAuthenticatedRequest,
 } from 'src/common/interfaces/jwt-payload.interface';
+import { GoogleOAuthCallbackGuard } from './guards/google-oauth-callback.guard';
 
 interface AuthExchangePayload {
   accessToken: string;
@@ -138,7 +139,7 @@ export class AuthController {
   async googleAuth() {}
 
   @Get('google/callback')
-  @UseGuards(PassportAuthGuard('google'))
+  @UseGuards(GoogleOAuthCallbackGuard)
   async googleAuthRedirect(
     @Req() req: GoogleAuthenticatedRequest,
     @Res() res: Response,

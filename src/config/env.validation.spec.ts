@@ -4,11 +4,11 @@ const validConfig = {
   DATABASE_URL: 'postgresql://localhost/nexus',
   REDIS_URL: 'redis://localhost:6379',
   JWT_SECRET: 'a'.repeat(64),
-  FRONTEND_URL: 'http://localhost:3001',
+  FRONTEND_URL: 'https://nexus.example.com',
   AI_SERVICE_URL: 'http://localhost:8000',
   GOOGLE_CLIENT_ID: 'client-id',
   GOOGLE_CLIENT_SECRET: 'client-secret',
-  GOOGLE_CALLBACK_URL: 'http://localhost:3000/api/auth/google/callback',
+  GOOGLE_CALLBACK_URL: 'https://nexus.example.com/api/auth/google/callback',
   CLOUDINARY_CLOUD_NAME: 'cloud',
   CLOUDINARY_API_KEY: 'key',
   CLOUDINARY_API_SECRET: 'secret',
@@ -32,6 +32,15 @@ describe('environment validation', () => {
         STRIPE_SECRET_KEY: undefined,
       }),
     ).toThrow('GOOGLE_CLIENT_SECRET, STRIPE_SECRET_KEY');
+  });
+
+  it('rejects a Google callback URL pointing at the frontend route', () => {
+    expect(() =>
+      validateEnv({
+        ...validConfig,
+        GOOGLE_CALLBACK_URL: 'http://localhost:3000/auth-callback',
+      }),
+    ).toThrow('GOOGLE_CALLBACK_URL must end with /api/auth/google/callback');
   });
 
   it('requires isolated artifact evaluation in production', () => {

@@ -55,14 +55,42 @@ export class AuthService {
   private async ensureFreelancerProfile(
     manager: EntityManager,
     userId: string,
+    githubUsername: string,
   ) {
     const existing = await manager.findOne(FreelancerProfile, {
       where: { userId },
     });
-    if (existing) return existing;
+    if (existing) {
+      existing.githubUsername = githubUsername;
+      return manager.save(existing);
+    }
 
-    const profile = manager.create(FreelancerProfile, { userId });
+    const profile = manager.create(FreelancerProfile, {
+      userId,
+      githubUsername,
+    });
     return manager.save(profile);
+  }
+
+  private async assertGithubUsernameAvailable(
+    manager: EntityManager,
+    githubUsername: string,
+    excludeProfileId?: string,
+  ) {
+    const query = manager
+      .getRepository(FreelancerProfile)
+      .createQueryBuilder('profile')
+      .where('LOWER(profile.github_username) = LOWER(:githubUsername)', {
+        githubUsername,
+      });
+    if (excludeProfileId) {
+      query.andWhere('profile.id <> :excludeProfileId', { excludeProfileId });
+    }
+    if (await query.getExists()) {
+      throw new ConflictException(
+        'This GitHub username is already registered.',
+      );
+    }
   }
 
   private async generateTokens(
@@ -117,7 +145,7 @@ export class AuthService {
         throw new ConflictException('This phone number is already registered.');
       }
 
-      const { password, ...rest } = newUser;
+      const { password, githubUsername, ...rest } = newUser;
       const hashedPassword = await bcrypt.hash(password, this.saltOrRounds);
       const user = this.userRepository.create({ ...rest, hashedPassword });
       const savedUser = await queryRunner.manager.save(user);
@@ -125,7 +153,20 @@ export class AuthService {
 
       // Freelancers need a profile row from signup so verification/assessment load.
       if (savedUser.role === UserRole.FREELANCER) {
-        await this.ensureFreelancerProfile(queryRunner.manager, savedUser.id);
+        if (!githubUsername) {
+          throw new BadRequestException(
+            'A GitHub username is required for freelancer accounts.',
+          );
+        }
+        await this.assertGithubUsernameAvailable(
+          queryRunner.manager,
+          githubUsername,
+        );
+        await this.ensureFreelancerProfile(
+          queryRunner.manager,
+          savedUser.id,
+          githubUsername,
+        );
       }
 
       const { accessToken, refreshToken } = await this.generateTokens(
@@ -344,7 +385,17 @@ export class AuthService {
       );
       await queryRunner.commitTransaction();
 
-      const isProfileComplete = reqUser.phoneNumber !== null;
+      const freelancerProfile =
+        reqUser.role === UserRole.FREELANCER
+          ? await queryRunner.manager.findOne(FreelancerProfile, {
+              where: { userId: reqUser.id },
+            })
+          : null;
+      const isProfileComplete = Boolean(
+        reqUser.phoneNumber &&
+        (reqUser.role !== UserRole.FREELANCER ||
+          freelancerProfile?.githubUsername?.trim()),
+      );
 
       return {
         status: 'success',
@@ -368,6 +419,7 @@ export class AuthService {
       role: UserRole;
       firstName?: string;
       lastName?: string;
+      githubUsername?: string;
     },
   ) {
     const queryRunner = this.dataSource.createQueryRunner();
@@ -379,8 +431,18 @@ export class AuthService {
       });
       if (!user) throw new BadRequestException('User not found');
 
-      if (user.phoneNumber)
+      const existingFreelancerProfile = await queryRunner.manager.findOne(
+        FreelancerProfile,
+        { where: { userId: user.id } },
+      );
+      const profileAlreadyComplete = Boolean(
+        user.phoneNumber &&
+        (user.role !== UserRole.FREELANCER ||
+          existingFreelancerProfile?.githubUsername?.trim()),
+      );
+      if (profileAlreadyComplete) {
         throw new BadRequestException('Profile already complete');
+      }
 
       const existingPhone = await queryRunner.manager.findOne(User, {
         where: { phoneNumber: payload.phoneNumber },
@@ -389,9 +451,11 @@ export class AuthService {
         throw new ConflictException('This phone number is already registered.');
       }
 
-      user.phoneNumber = payload.phoneNumber;
-      user.isPhoneVerified = false;
-      user.phoneVerifiedAt = null;
+      if (user.phoneNumber !== payload.phoneNumber) {
+        user.phoneNumber = payload.phoneNumber;
+        user.isPhoneVerified = false;
+        user.phoneVerifiedAt = null;
+      }
       user.role = payload.role;
       if (payload.firstName) user.firstName = payload.firstName;
       if (payload.lastName) user.lastName = payload.lastName;
@@ -400,9 +464,20 @@ export class AuthService {
 
       let freelancerProfile: FreelancerProfile | null = null;
       if (user.role === UserRole.FREELANCER) {
+        if (!payload.githubUsername) {
+          throw new BadRequestException(
+            'A GitHub username is required for freelancer accounts.',
+          );
+        }
+        await this.assertGithubUsernameAvailable(
+          queryRunner.manager,
+          payload.githubUsername,
+          existingFreelancerProfile?.id,
+        );
         freelancerProfile = await this.ensureFreelancerProfile(
           queryRunner.manager,
           user.id,
+          payload.githubUsername,
         );
       }
 

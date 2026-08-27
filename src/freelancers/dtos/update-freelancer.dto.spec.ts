@@ -15,10 +15,15 @@ describe('UpdateFreelancerDto', () => {
     },
   );
 
-  it.each(['-octocat', 'octocat-', 'nexus--ai', 'nexus_ai', 'nexus ai'])(
-    'rejects the GitHub username %s',
-    (githubUsername) => {
-      expect(validateGithubUsername(githubUsername)).not.toHaveLength(0);
-    },
-  );
+  it.each([
+    '',
+    '-octocat',
+    'octocat-',
+    'nexus--ai',
+    'nexus_ai',
+    'nexus ai',
+    'a'.repeat(40),
+  ])('rejects the GitHub username %s', (githubUsername) => {
+    expect(validateGithubUsername(githubUsername)).not.toHaveLength(0);
+  });
 });

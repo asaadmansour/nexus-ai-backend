@@ -20,7 +20,8 @@ import type { PrincipalReviewerStatus } from '../principal-reviewer-qualificatio
   unique: true,
   where: '"stripe_account_id" IS NOT NULL',
 })
-@Index('freelancer_profiles_github_username_idx', ['githubUsername'], {
+@Index('freelancer_profiles_github_username_uidx', ['githubUsername'], {
+  unique: true,
   where: '"github_username" IS NOT NULL',
 })
 export class FreelancerProfile {
@@ -141,7 +142,7 @@ export class FreelancerProfile {
   @Column({
     name: 'github_username',
     type: 'varchar',
-    length: 120,
+    length: 39,
     nullable: true,
   })
   githubUsername: string | null;
