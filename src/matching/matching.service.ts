@@ -3520,7 +3520,7 @@ export class MatchingService {
       const invitation = await manager
         .getRepository(ProjectInvitation)
         .createQueryBuilder('invitation')
-        .setLock('pessimistic_write')
+        .setLock('pessimistic_write', undefined, ['invitation'])
         .leftJoinAndSelect('invitation.project', 'project')
         .leftJoinAndSelect('invitation.task', 'task')
         .leftJoinAndSelect('invitation.freelancerProfile', 'profile')

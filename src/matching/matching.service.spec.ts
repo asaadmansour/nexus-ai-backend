@@ -226,6 +226,79 @@ describe('MatchingService task assignment invariants', () => {
     expect(result).toEqual({ inspected: 1, restarted: 1 });
   });
 
+  it('locks only the invitation row while loading notification relations', async () => {
+    const invitation = {
+      id: 'invitation-a',
+      projectId: 'project-a',
+      taskId: null,
+      roleKey: 'principal_reviewer',
+      phase: 'governance',
+      status: 'pending',
+      notificationStatus: 'pending',
+      notificationAttempts: 0,
+      notificationError: null,
+      updatedAt: new Date('2030-01-01T00:00:00.000Z'),
+      expiresAt: new Date('2030-01-01T05:00:00.000Z'),
+      project: { title: 'Project A' },
+      task: null,
+      freelancerProfile: { userId: 'user-a' },
+    };
+    const queryBuilder: Record<string, jest.Mock> = {};
+    for (const method of ['setLock', 'leftJoinAndSelect', 'where']) {
+      queryBuilder[method] = jest.fn().mockReturnValue(queryBuilder);
+    }
+    queryBuilder.getOne = jest.fn().mockResolvedValue(invitation);
+    const manager = {
+      getRepository: jest.fn().mockReturnValue({
+        createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
+      }),
+      save: jest.fn().mockResolvedValue(invitation),
+    };
+    const ensureProjectInvitationNotification = jest
+      .fn()
+      .mockResolvedValue(undefined);
+    const update = jest.fn().mockResolvedValue(undefined);
+    const transaction = jest.fn(
+      (callback: (transactionManager: typeof manager) => Promise<unknown>) =>
+        callback(manager),
+    );
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      invitationRepo: {
+        find: jest.fn().mockResolvedValue([invitation]),
+        update,
+      },
+      dataSource: { transaction },
+      notificationsService: { ensureProjectInvitationNotification },
+      logger: { warn: jest.fn() },
+    }) as MatchingService;
+
+    await expect(
+      service.recoverUndeliveredInvitationNotifications(),
+    ).resolves.toEqual({ inspected: 1, delivered: 1 });
+
+    expect(queryBuilder.setLock).toHaveBeenCalledWith(
+      'pessimistic_write',
+      undefined,
+      ['invitation'],
+    );
+    expect(ensureProjectInvitationNotification).toHaveBeenCalledTimes(1);
+    const [updatedInvitationId, notificationUpdate] = update.mock
+      .calls[0] as unknown as [
+      string,
+      {
+        notificationStatus: string;
+        notificationSentAt: Date;
+        notificationError: null;
+      },
+    ];
+    expect(updatedInvitationId).toBe('invitation-a');
+    expect(notificationUpdate).toMatchObject({
+      notificationStatus: 'sent',
+      notificationError: null,
+    });
+    expect(notificationUpdate.notificationSentAt).toBeInstanceOf(Date);
+  });
+
   it('recovers both funded stages when a process stops after recording the Stripe hold', async () => {
     const allocation = createProjectBudgetAllocation(1000, 'EGP');
     const activateFundedProject = jest.fn().mockResolvedValue(undefined);
