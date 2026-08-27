@@ -49,6 +49,7 @@ import {
 } from './project-budget-allocation';
 import { allocateProjectTaskBudgets } from './task-budget-allocation';
 import { NotificationsService } from 'src/notifications/notifications.service';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 
 interface Requester {
   userId: string;
@@ -104,6 +105,7 @@ export class ProjectPlansService {
     private readonly matchingService: MatchingService,
     private readonly dataSource: DataSource,
     private readonly notificationsService: NotificationsService,
+    private readonly incidents: AutomationIncidentsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -343,6 +345,7 @@ export class ProjectPlansService {
         uiux.id,
       );
       if (existingPlan) {
+        await this.notifyPlanReady(existingPlan, data.requestedBy);
         const output = {
           planId: existingPlan.id,
           alreadyGenerated: true,
@@ -350,6 +353,7 @@ export class ProjectPlansService {
           uiuxSubmissionId: uiux.id,
         };
         await this.markPlanJobCompleted(data.agentJobId, output);
+        await this.resolvePlanGenerationIncident(data.projectId);
         return output;
       }
 
@@ -366,11 +370,24 @@ export class ProjectPlansService {
         milestoneCount: plan.milestoneCount,
         taskCount: plan.taskCount,
       };
+      const generatedPlan = await this.planRepo.findOne({
+        where: { id: plan.id },
+      });
+      if (generatedPlan) {
+        await this.notifyPlanReady(generatedPlan, data.requestedBy);
+      }
       await this.markPlanJobCompleted(data.agentJobId, output);
+      await this.resolvePlanGenerationIncident(data.projectId);
       return output;
     } catch (error) {
       if (this.isFinalPlanJobAttempt(attemptsMade, maxAttempts)) {
         await this.markPlanJobFailed(data.agentJobId, error, maxAttempts);
+        await this.recordPlanGenerationIncident(
+          data.projectId,
+          'generation_failed',
+          this.getErrorMessage(error),
+          { agentJobId: data.agentJobId },
+        );
       } else {
         await this.markPlanJobRetrying(
           data.agentJobId,
@@ -423,6 +440,8 @@ export class ProjectPlansService {
       taskCount: this.jsonLength(plan.tasks),
       approvedAt: plan.approvedAt,
       createdAt: plan.createdAt,
+      adminNotes:
+        requester.role === UserRole.ADMIN ? plan.adminNotes : undefined,
     }));
     return { data, total };
   }
@@ -614,6 +633,37 @@ export class ProjectPlansService {
         {},
         adminUserId,
       );
+    } else if (dto.status === 'changes_requested') {
+      try {
+        response.regeneration = await this.enqueueAutomaticGeneration(
+          plan.projectId,
+          adminUserId,
+          {
+            architectureSubmissionId:
+              plan.architectureSubmissionId ?? undefined,
+            uiuxSubmissionId: plan.uiuxSubmissionId ?? undefined,
+            notes: dto.adminNotes!.trim(),
+          },
+        );
+        await this.resolvePlanGenerationIncident(
+          plan.projectId,
+          'regenerate_plan_dispatch',
+        );
+      } catch (error) {
+        const message = this.getErrorMessage(error);
+        response.regeneration = {
+          queued: false,
+          reason: 'dispatch_failed',
+          error: message,
+        };
+        await this.recordPlanGenerationIncident(
+          plan.projectId,
+          'dispatch_failed',
+          message,
+          { planId: plan.id },
+          'regenerate_plan_dispatch',
+        );
+      }
     }
     return response;
   }
@@ -675,7 +725,7 @@ export class ProjectPlansService {
       const currentPlan = await this.planRepo.findOne({
         where: { projectId: project.id, isCurrent: true },
       });
-      if (currentPlan) continue;
+      if (currentPlan && currentPlan.status !== 'changes_requested') continue;
 
       const [architecture, uiux] = await Promise.all([
         this.submissionRepo.findOne({
@@ -706,8 +756,13 @@ export class ProjectPlansService {
             architectureSubmissionId: architecture.id,
             uiuxSubmissionId: uiux.id,
             notes:
+              currentPlan?.adminNotes?.trim() ||
               'Recovered Scrum plan generation after both planning deliverables were approved.',
           },
+        );
+        await this.resolvePlanGenerationIncident(
+          project.id,
+          'regenerate_plan_dispatch',
         );
         if (result.queued) {
           queued += 1;
@@ -1376,6 +1431,73 @@ export class ProjectPlansService {
       },
       order: { createdAt: 'DESC' },
     });
+  }
+
+  private async notifyPlanReady(
+    plan: ProjectPlan,
+    requestedBy?: string | null,
+  ) {
+    const reviewer = await this.assignmentRepo.findOne({
+      where: {
+        projectId: plan.projectId,
+        phase: 'governance',
+        roleKey: 'principal_reviewer',
+        status: In(['accepted', 'in_progress']),
+      },
+      relations: ['freelancerProfile'],
+      order: { createdAt: 'DESC' },
+    });
+    const reviewerUserId = reviewer?.freelancerProfile?.userId ?? requestedBy;
+    if (!reviewerUserId) return;
+
+    await this.notificationsService.ensureProjectPlanReviewNotification(
+      plan.id,
+      {
+        userId: reviewerUserId,
+        projectId: plan.projectId,
+        type: 'reviewer_attention',
+        title: 'A Scrum plan is ready for review',
+        body: `Scrum plan v${plan.version} is ready for your review.`,
+        actionUrl: `/reviewer/projects/${plan.projectId}`,
+        metadata: { planVersion: plan.version },
+      },
+    );
+  }
+
+  private async recordPlanGenerationIncident(
+    projectId: string,
+    errorCode: string,
+    message: string,
+    context?: Record<string, unknown>,
+    operation = 'generate_plan',
+  ) {
+    try {
+      await this.incidents.record({
+        subsystem: 'planning',
+        operation,
+        projectId,
+        errorCode,
+        message,
+        context,
+      });
+    } catch (incidentError) {
+      this.logger.error(
+        `Could not record plan-generation incident for ${projectId}: ${this.getErrorMessage(incidentError)}`,
+      );
+    }
+  }
+
+  private async resolvePlanGenerationIncident(
+    projectId: string,
+    operation = 'generate_plan',
+  ) {
+    try {
+      await this.incidents.resolveOperation('planning', operation, projectId);
+    } catch (incidentError) {
+      this.logger.warn(
+        `Could not resolve plan-generation incident for ${projectId}: ${this.getErrorMessage(incidentError)}`,
+      );
+    }
   }
 
   private async markPlanJobRunning(

@@ -93,6 +93,23 @@ export class NotificationsService {
     });
   }
 
+  async ensureProjectPlanReviewNotification(
+    planId: string,
+    input: CreateNotificationInput,
+  ) {
+    const existing = await this.notificationRepository
+      .createQueryBuilder('notification')
+      .where('notification.type = :type', { type: 'reviewer_attention' })
+      .andWhere("notification.metadata ->> 'planId' = :planId", { planId })
+      .getOne();
+    if (existing) return existing;
+    return this.createNotification({
+      ...input,
+      type: 'reviewer_attention',
+      metadata: { ...(input.metadata ?? {}), planId },
+    });
+  }
+
   stream(userId: string): Observable<MessageEvent> {
     return new Observable<MessageEvent>((subscriber) => {
       const listeners = this.subscribers.get(userId) ?? new Set();
