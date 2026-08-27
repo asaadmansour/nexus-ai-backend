@@ -1,13 +1,31 @@
 import { ConflictException } from '@nestjs/common';
 import {
   assertSubmissionApprovalEvaluation,
+  assertSubmissionCanBeReviewed,
+  hasOnlyEvaluatorVisibilityGaps,
   assertSubmissionMatchesCurrentTask,
+  assertImplementationWorkFunded,
   assertTaskAcceptsDraft,
   resolveSubmissionReviewCriteria,
   validateSubmissionCriterionReviews,
 } from './delivery.service';
 
 describe('DeliveryService task/submission invariants', () => {
+  it('keeps reserved implementation work locked until the second escrow stage activates it', () => {
+    expect(() =>
+      assertImplementationWorkFunded({
+        assignmentStatus: 'reserved',
+        assignedAt: null,
+      }),
+    ).toThrow('implementation escrow is not funded');
+    expect(() =>
+      assertImplementationWorkFunded({
+        assignmentStatus: 'accepted',
+        assignedAt: new Date(),
+      }),
+    ).not.toThrow();
+  });
+
   it('rejects edits to work whose task is already in review or closed', () => {
     for (const status of ['review', 'done', 'cancelled']) {
       expect(() => assertTaskAcceptsDraft({ status })).toThrow(
@@ -36,6 +54,21 @@ describe('DeliveryService task/submission invariants', () => {
         {},
       ),
     ).toThrow('requested changes');
+  });
+
+  it('keeps automated changes-requested submissions reviewable but preserves human revisions', () => {
+    expect(() =>
+      assertSubmissionCanBeReviewed({
+        status: 'changes_requested',
+        reviewedBy: null,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertSubmissionCanBeReviewed({
+        status: 'changes_requested',
+        reviewedBy: 'reviewer-1',
+      }),
+    ).toThrow('automatically bounced');
   });
 
   it('blocks approval when the evaluated commit is stale', () => {
@@ -78,6 +111,44 @@ describe('DeliveryService task/submission invariants', () => {
         manualReviewAcknowledged: true,
         feedback: 'I inspected the exact diff and verification evidence.',
       }),
+    ).not.toThrow();
+  });
+
+  it('allows a reviewer to resolve a legacy observability-only bounce', () => {
+    const evaluation = {
+      id: 'run',
+      status: 'completed',
+      recommendation: 'changes_requested',
+      evaluatedCommitSha: 'a'.repeat(40),
+      acceptanceCoverage: {
+        items: [
+          {
+            key: 'acceptance_1',
+            status: 'met',
+            met: true,
+          },
+          {
+            key: 'verification_observed_1',
+            status: 'unmet',
+            met: false,
+          },
+        ],
+      },
+    };
+
+    expect(hasOnlyEvaluatorVisibilityGaps(evaluation as never)).toBe(true);
+    expect(() =>
+      assertSubmissionApprovalEvaluation(
+        {
+          submissionType: 'pull_request',
+          commitSha: 'a'.repeat(40),
+        },
+        evaluation as never,
+        {
+          manualReviewAcknowledged: true,
+          feedback: 'I inspected the exact pull request and verified the work.',
+        },
+      ),
     ).not.toThrow();
   });
 

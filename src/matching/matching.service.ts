@@ -33,6 +33,8 @@ import { AutomationIncidentsService } from 'src/automation/automation-incidents.
 import {
   planningRoleAllocation,
   principalReviewerRoleAllocation,
+  implementationTeamRoleAllocation,
+  projectFundingBreakdown,
 } from 'src/planning/project-budget-allocation';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { MatchingCandidate } from './entities/matching-candidate.entity';
@@ -55,23 +57,39 @@ import {
   PRINCIPAL_REVIEWER_SKILLS,
 } from 'src/freelancers/principal-reviewer-qualification';
 import {
-  convertAmount,
   normalizeCurrency,
   rateInCurrencySql,
 } from 'src/common/currency/currency';
 
 const PLANNING_ROLES = ['architect', 'ui_ux'];
-// Product rule: a freelancer has two hours to accept or decline before matching
-// automatically advances to the next candidate. Deployments may override the
-// window explicitly, but the platform default must remain two hours.
+function staffingRoleBase(roleKey: string) {
+  return roleKey.startsWith('implementation_') ? 'implementation' : roleKey;
+}
+
+function requiredPreFundingRoles() {
+  // Exact implementation roles do not exist until architecture/UI/UX have been
+  // approved and the Scrum plan is materialized. Before planning we only run a
+  // non-binding capacity preflight; inviting generic developers here made them
+  // accept work whose tasks, deadlines, and compensation were still unknown.
+  return [...PLANNING_ROLES];
+}
+// The current staffing policy gives each candidate five hours to respond.
+// Deployments may override the window explicitly, while the principal-reviewer
+// deadline still covers at least two complete fallback attempts.
 export function resolveInvitationTtlHours(value?: string): number {
   const raw = Number(value);
-  return Number.isFinite(raw) && raw > 0 ? raw : 2;
+  return Number.isFinite(raw) && raw > 0 ? raw : 5;
 }
 const INVITATION_TTL_HOURS = resolveInvitationTtlHours(
   process.env.MATCHING_INVITATION_TTL_HOURS,
 );
 const INVITATION_TTL_MS = INVITATION_TTL_HOURS * 60 * 60 * 1000;
+const MATCHING_FALLBACK_ATTEMPTS = (() => {
+  const raw = Number(process.env.MATCHING_GUARANTEED_FALLBACK_ATTEMPTS);
+  return Number.isFinite(raw) && raw >= 2 ? Math.floor(raw) : 2;
+})();
+const PRINCIPAL_MATCHING_WINDOW_MS =
+  INVITATION_TTL_MS * MATCHING_FALLBACK_ATTEMPTS;
 const EMPTY_RUN_RETRY_MS = (() => {
   const raw = Number(process.env.MATCHING_EMPTY_RUN_RETRY_MINUTES);
   return (Number.isFinite(raw) && raw > 0 ? raw : 15) * 60 * 1000;
@@ -116,9 +134,18 @@ const PLANNING_ROLE_SKILLS: Record<string, string[]> = {
     'Ecommerce UX',
     'Responsive Design',
   ],
+  implementation: [
+    'Frontend',
+    'Backend',
+    'Full Stack',
+    'API Development',
+    'Database Design',
+    'Testing',
+  ],
 };
 const MATCH_START_ALLOWED_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.BRIEF_COMPLETE,
+  ProjectStatus.WAITING_FOR_PR,
   ProjectStatus.PLANNING_MATCHING,
 ]);
 const ASSIGNMENT_ACTIVE_STATUSES = ['assigned', 'accepted', 'in_progress'];
@@ -141,6 +168,7 @@ const IMPLEMENTATION_MATCH_ALLOWED_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.IMPLEMENTATION_READY,
   ProjectStatus.MATCHING,
   ProjectStatus.MATCHED,
+  ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
   ProjectStatus.ASSIGNED,
   ProjectStatus.ACTIVE,
   ProjectStatus.UNDER_REVIEW,
@@ -256,11 +284,18 @@ export class MatchingService {
           },
         });
       if (!reviewer) return false;
+      const project = await this.projectRepo.findOne({
+        where: { id: projectId },
+      });
+      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) {
+        return false;
+      }
+      const requiredRoles = requiredPreFundingRoles();
       const existingRuns = await this.runRepo.find({
         where: {
           projectId,
           targetType: 'planning_role',
-          targetRoleKey: In(PLANNING_ROLES),
+          targetRoleKey: In(requiredRoles),
           status: In(['queued', 'running', 'completed', 'reviewed']),
         },
         select: {
@@ -288,17 +323,10 @@ export class MatchingService {
           .map((run) => run.targetRoleKey)
           .filter((role): role is string => Boolean(role)),
       );
-      const missingRoles = PLANNING_ROLES.filter(
+      const missingRoles = requiredRoles.filter(
         (role) => !startedRoles.has(role),
       );
       if (!missingRoles.length) return false;
-
-      const project = await this.projectRepo.findOne({
-        where: { id: projectId },
-      });
-      if (!project || !MATCH_START_ALLOWED_STATUSES.has(project.status)) {
-        return false;
-      }
       if (
         staffingFailureIsCoolingDown(
           project.automationStatus,
@@ -342,6 +370,46 @@ export class MatchingService {
         },
       });
       if (pendingInvitation) return false;
+      const latestRun = await this.runRepo.findOne({
+        where: {
+          projectId,
+          targetType: 'planning_role',
+          targetRoleKey: PRINCIPAL_REVIEWER_ROLE,
+        },
+        order: { createdAt: 'DESC' },
+      });
+      if (latestRun && ['queued', 'running'].includes(latestRun.status)) {
+        return false;
+      }
+      if (latestRun?.status === 'completed') {
+        const [count, fallbackCount] = await Promise.all([
+          this.candidateRepo.count({
+            where: { matchingRunId: latestRun.id },
+          }),
+          this.candidateRepo.count({
+            where: {
+              matchingRunId: latestRun.id,
+              status: In(['recommended', 'shortlisted', 'selected']),
+            },
+          }),
+        ]);
+        // A process can stop after committing the ranked candidates but before
+        // persisting the invitation. Recover that exact run instead of treating
+        // its candidate rows as proof that staffing already progressed.
+        if (fallbackCount > 0) {
+          const invitation = await this.inviteNextCandidate(latestRun.id);
+          if (invitation) return true;
+        }
+        if (
+          completedEmptyRunIsCoolingDown(
+            latestRun.status,
+            count,
+            latestRun.createdAt,
+          )
+        ) {
+          return false;
+        }
+      }
       const project = await this.getProject(projectId);
       if (!MATCH_START_ALLOWED_STATUSES.has(project.status)) return false;
       await this.startPlanningRoles(
@@ -355,9 +423,452 @@ export class MatchingService {
       this.logger.error(
         `Principal-reviewer automation failed for ${projectId}: ${message}`,
       );
-      await this.markStaffingBlocked(projectId, message);
+      if (error instanceof ConflictException) {
+        await this.markWaitingForPrincipalReviewer(projectId, message);
+      } else {
+        await this.markStaffingBlocked(projectId, message);
+      }
       return false;
     }
+  }
+
+  async recoverProjectsAwaitingPrincipalReviewer() {
+    const projects = await this.projectRepo.find({
+      where: [
+        {
+          status: ProjectStatus.BRIEF_COMPLETE,
+          automationStatus: 'awaiting_principal_reviewer',
+        },
+        { status: ProjectStatus.WAITING_FOR_PR },
+      ],
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let restarted = 0;
+    for (const project of projects) {
+      if (await this.autoStartPrincipalReviewer(project.id)) restarted += 1;
+    }
+    return { inspected: projects.length, restarted };
+  }
+
+  async assertProjectReadyForFunding(projectId: string) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+    });
+    if (!project) throw new NotFoundException('Project not found');
+    const capacityExpiresAt = Date.parse(
+      typeof project.implementationCapacitySnapshot?.expiresAt === 'string'
+        ? project.implementationCapacitySnapshot.expiresAt
+        : '',
+    );
+    if (
+      !Number.isFinite(capacityExpiresAt) ||
+      capacityExpiresAt <= Date.now()
+    ) {
+      const refreshedCapacity =
+        await this.estimateImplementationCapacity(project);
+      project.implementationCapacitySnapshot = refreshedCapacity;
+      if (refreshedCapacity.status === 'unavailable') {
+        project.automationStatus = 'capacity_preflight_failed';
+        project.automationError = refreshedCapacity.blockingReasons.join(' ');
+        project.automationErrorCategory = 'implementation_capacity';
+        project.automationErrorAt = new Date();
+      } else {
+        project.automationStatus = 'ready_for_funding';
+        project.automationError = null;
+        project.automationErrorCategory = null;
+        project.automationErrorAt = null;
+      }
+      await this.projectRepo
+        .createQueryBuilder()
+        .update(Project)
+        .set({
+          implementationCapacitySnapshot: () =>
+            'CAST(:implementationCapacitySnapshot AS jsonb)',
+          automationStatus: project.automationStatus,
+          automationError: project.automationError,
+          automationErrorCategory: project.automationErrorCategory,
+          automationErrorAt: project.automationErrorAt,
+        })
+        .where('id = :projectId', { projectId: project.id })
+        .setParameter(
+          'implementationCapacitySnapshot',
+          JSON.stringify(project.implementationCapacitySnapshot),
+        )
+        .execute();
+    }
+    const [reviewer, planningRoles, pendingInvitations] = await Promise.all([
+      this.dataSource.getRepository(ProjectRoleAssignment).findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['accepted', 'in_progress']),
+        },
+      }),
+      this.dataSource.getRepository(ProjectRoleAssignment).find({
+        where: {
+          projectId,
+          phase: In(['planning', 'staffing']),
+          status: In(['accepted', 'in_progress']),
+        },
+      }),
+      this.invitationRepo.count({
+        where: { projectId, status: In(['pending', 'accepting']) },
+      }),
+    ]);
+    const roles = new Set(
+      planningRoles.map((assignment) => assignment.roleKey),
+    );
+    const missing = requiredPreFundingRoles().filter(
+      (role) => !roles.has(role),
+    );
+    const capacityStatus =
+      typeof project.implementationCapacitySnapshot?.status === 'string'
+        ? project.implementationCapacitySnapshot.status
+        : null;
+    if (
+      project.status !== ProjectStatus.READY_FOR_FUNDING ||
+      !reviewer ||
+      missing.length > 0 ||
+      pendingInvitations > 0 ||
+      !['viable', 'at_risk'].includes(capacityStatus ?? '')
+    ) {
+      const details = [
+        !reviewer ? 'principal reviewer not accepted' : null,
+        missing.length ? `missing accepted roles: ${missing.join(', ')}` : null,
+        pendingInvitations
+          ? `${pendingInvitations} invitation(s) still pending`
+          : null,
+        !['viable', 'at_risk'].includes(capacityStatus ?? '')
+          ? 'implementation capacity preflight has not found enough available freelancers'
+          : null,
+      ].filter(Boolean);
+      throw new ConflictException(
+        `Planning funding is locked until the reviewer and planning team have accepted and implementation capacity is plausible${details.length ? ` (${details.join('; ')})` : ''}.`,
+      );
+    }
+    return project;
+  }
+
+  async activateFundedProject(projectId: string) {
+    const project = await this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      const funding = projectFundingBreakdown(project.budgetAllocation);
+      const held = Number(project.heldAmount);
+      const planningAmount = Number(funding?.planningAmount);
+      if (
+        !funding ||
+        !Number.isFinite(planningAmount) ||
+        planningAmount <= 0 ||
+        held + 0.005 < planningAmount
+      ) {
+        throw new ConflictException(
+          'The planning package is not held in escrow yet',
+        );
+      }
+      if (project.status === ProjectStatus.PLANNING_ASSIGNED) {
+        if (!project.planningFundedAt) {
+          project.planningFundedAt = new Date();
+          await manager.save(Project, project);
+        }
+        return project;
+      }
+      if (project.status !== ProjectStatus.READY_FOR_FUNDING) {
+        throw new ConflictException(
+          'The accepted team is no longer ready to start',
+        );
+      }
+      await this.transitionProject(manager, project, null, {
+        status: ProjectStatus.PLANNING_ASSIGNED,
+        planningStatus: 'assigned',
+        reason:
+          'Planning escrow funded after the reviewer, architect, and UI/UX designer accepted.',
+        setAssignedAt: true,
+      });
+      project.planningFundedAt = project.planningFundedAt ?? new Date();
+      project.automationStatus = 'planning_team_active';
+      await manager.save(Project, project);
+      return project;
+    });
+    await this.repositoriesService
+      .provisionForAssignedTeam(projectId)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Automatic repository access failed after planning funding for project ${projectId}: ${this.errorMessage(error)}`,
+        ),
+      );
+    return project;
+  }
+
+  async activateImplementation(projectId: string) {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      if (
+        this.isProjectFullyFunded(project) &&
+        [ProjectStatus.ASSIGNED, ProjectStatus.ACTIVE].includes(project.status)
+      ) {
+        if (!project.implementationFundedAt) {
+          project.implementationFundedAt = new Date();
+          await manager.save(Project, project);
+        }
+        return { project, activatedTaskIds: [] as string[] };
+      }
+      if (project.status !== ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING) {
+        throw new ConflictException(
+          'Implementation funding unlocks only after every Scrum task has an accepted freelancer',
+        );
+      }
+      if (!this.isProjectFullyFunded(project)) {
+        throw new ConflictException(
+          'The complete implementation balance is not held in escrow yet',
+        );
+      }
+
+      const tasks = await manager.find(ProjectTask, {
+        where: {
+          projectId,
+          status: Not('cancelled'),
+        },
+        order: { orderIndex: 'ASC' },
+      });
+      if (
+        !tasks.length ||
+        tasks.some((task) => !task.assignedFreelancerProfileId)
+      ) {
+        throw new ConflictException(
+          'Every implementation task must keep an accepted freelancer until funding completes',
+        );
+      }
+
+      const now = new Date();
+      const datedTasks = tasks.filter((task) => task.startsAt && task.dueAt);
+      const earliestStart = datedTasks.reduce<Date | null>(
+        (earliest, task) =>
+          !earliest || task.startsAt! < earliest ? task.startsAt! : earliest,
+        null,
+      );
+      const scheduleShiftMs = earliestStart
+        ? Math.max(0, now.getTime() - earliestStart.getTime())
+        : 0;
+      const activatedTaskIds: string[] = [];
+      for (const task of tasks) {
+        if (task.assignmentStatus !== 'reserved') continue;
+        const priorStart = task.startsAt;
+        const priorDue = task.dueAt;
+        if (scheduleShiftMs > 0) {
+          if (priorStart) {
+            task.startsAt = new Date(priorStart.getTime() + scheduleShiftMs);
+          }
+          if (priorDue) {
+            task.dueAt = new Date(priorDue.getTime() + scheduleShiftMs);
+          }
+        }
+        task.assignedAt = now;
+        task.assignmentStatus = 'accepted';
+        task.metadata = {
+          ...(task.metadata ?? {}),
+          fundingActivatedAt: now.toISOString(),
+          workStartsAfterImplementationFunding: false,
+          scheduleFundingShiftMs: scheduleShiftMs,
+          reservedAt: task.metadata?.reservedAt ?? null,
+        };
+        activatedTaskIds.push(task.id);
+      }
+      if (activatedTaskIds.length) {
+        await manager.save(ProjectTask, tasks);
+      }
+      if (scheduleShiftMs > 0 && activatedTaskIds.length) {
+        const checkpoints = await manager.find(TaskCheckpoint, {
+          where: {
+            taskId: In(activatedTaskIds),
+            status: In(['pending', 'deferred']),
+          },
+        });
+        for (const checkpoint of checkpoints) {
+          checkpoint.dueAt = new Date(
+            checkpoint.dueAt.getTime() + scheduleShiftMs,
+          );
+          checkpoint.status = 'pending';
+          checkpoint.assessedAt = null;
+        }
+        if (checkpoints.length) await manager.save(TaskCheckpoint, checkpoints);
+      }
+
+      await this.transitionProject(manager, project, null, {
+        status: ProjectStatus.ASSIGNED,
+        reason:
+          'Implementation escrow funded; reserved assignments and deadline counters activated together.',
+        setAssignedAt: true,
+      });
+      project.implementationFundedAt = now;
+      project.automationStatus = 'implementation_active';
+      project.automationError = null;
+      project.automationErrorCategory = null;
+      project.automationErrorAt = null;
+      await manager.save(Project, project);
+      return { project, activatedTaskIds };
+    });
+
+    await this.repositoriesService
+      .provisionForAssignedTeam(projectId)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Automatic repository access failed after implementation funding for project ${projectId}: ${this.errorMessage(error)}`,
+        ),
+      );
+    if (result.activatedTaskIds.length) {
+      const assignees = await this.taskRepo.find({
+        where: { id: In(result.activatedTaskIds) },
+        relations: ['assignedFreelancerProfile'],
+      });
+      const notified = new Set<string>();
+      for (const task of assignees) {
+        const userId = task.assignedFreelancerProfile?.userId;
+        if (!userId || notified.has(userId)) continue;
+        notified.add(userId);
+        await this.notificationsService.createNotification({
+          userId,
+          projectId,
+          type: 'implementation_funded',
+          title: 'Implementation work is funded',
+          body: 'The customer funded implementation escrow. Your accepted task schedule and deadline counters are now active.',
+          actionUrl: `/freelancer/projects/${projectId}`,
+        });
+      }
+    }
+    return result.project;
+  }
+
+  async reconcileProjectFundingReadiness(projectId: string) {
+    const transitioned = await this.dataSource.transaction(async (manager) =>
+      this.maybeAdvanceToPlanningAssigned(manager, projectId, null),
+    );
+    if (!transitioned) {
+      await this.publishImplementationCapacityBlockIfNeeded(projectId);
+      return false;
+    }
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+    });
+    if (!project) return true;
+    await this.notifyProjectOwner(
+      project,
+      'Your project team is ready',
+      'Your principal reviewer, architect, and UI/UX designer have accepted. An implementation-capacity preflight also passed. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+    );
+    await this.projectRepo.update(
+      { id: project.id, automationStatus: 'ready_for_funding' },
+      { automationStatus: 'ready_for_funding_notified' },
+    );
+    return true;
+  }
+
+  async recoverReadyForFundingNotifications() {
+    const projects = await this.projectRepo.find({
+      where: {
+        status: ProjectStatus.READY_FOR_FUNDING,
+        automationStatus: 'ready_for_funding',
+      },
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let notified = 0;
+    for (const project of projects) {
+      await this.notifyProjectOwner(
+        project,
+        'Your project team is ready',
+        'Your principal reviewer, architect, and UI/UX designer have accepted. An implementation-capacity preflight also passed. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+      );
+      await this.projectRepo.update(
+        { id: project.id, automationStatus: 'ready_for_funding' },
+        { automationStatus: 'ready_for_funding_notified' },
+      );
+      notified += 1;
+    }
+    return { inspected: projects.length, notified };
+  }
+
+  /**
+   * Stripe capture and workflow activation are deliberately separate: the
+   * payment hold is committed first, then the team is activated. If the
+   * process stops between those operations, this reconciler finishes the
+   * correct stage without charging again or requiring an admin retry.
+   */
+  async recoverFundedStageActivations() {
+    const projects = await this.projectRepo.find({
+      where: {
+        status: In([
+          ProjectStatus.READY_FOR_FUNDING,
+          ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
+        ]),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let planningActivated = 0;
+    let implementationActivated = 0;
+    for (const project of projects) {
+      try {
+        if (project.status === ProjectStatus.READY_FOR_FUNDING) {
+          const planningAmount = Number(
+            projectFundingBreakdown(project.budgetAllocation)?.planningAmount,
+          );
+          if (
+            Number.isFinite(planningAmount) &&
+            Number(project.heldAmount) + 0.005 >= planningAmount
+          ) {
+            await this.activateFundedProject(project.id);
+            planningActivated += 1;
+          }
+          continue;
+        }
+        if (this.isProjectFullyFunded(project)) {
+          await this.activateImplementation(project.id);
+          implementationActivated += 1;
+        }
+      } catch (error) {
+        this.logger.error(
+          `Funded-stage activation recovery failed for ${project.id}: ${this.errorMessage(error)}`,
+        );
+        await this.incidents?.record({
+          subsystem: 'matching',
+          operation: 'activate_funded_stage',
+          projectId: project.id,
+          errorCode: 'activation_failed',
+          severity: 'critical',
+          message: this.errorMessage(error),
+          trace: error instanceof Error ? error.stack : undefined,
+          context: {
+            projectStatus: project.status,
+            heldAmount: project.heldAmount,
+            quotedAmount: project.quotedAmount,
+            recommendedChecks: [
+              'Verify the Stripe hold and project held amount agree.',
+              'Verify accepted assignments still exist for the current funding stage.',
+              'Retry activation after correcting the blocking invariant.',
+            ],
+          },
+        });
+      }
+    }
+    return {
+      inspected: projects.length,
+      planningActivated,
+      implementationActivated,
+    };
   }
 
   async startPlanningRoles(
@@ -371,11 +882,20 @@ export class MatchingService {
         'Planning matching can only start after the brief is complete',
       );
     }
-    this.assertProjectFullyFunded(project);
+    this.assertProjectReadyForStaffing(project);
 
     const roles = dto.roles?.length
       ? Array.from(new Set(dto.roles))
       : [...PLANNING_ROLES];
+    const unsupported = roles.filter(
+      (role) =>
+        role !== PRINCIPAL_REVIEWER_ROLE && !PLANNING_ROLES.includes(role),
+    );
+    if (unsupported.length) {
+      throw new BadRequestException(
+        `Implementation freelancers are matched from approved Scrum tasks, not generic pre-planning roles: ${unsupported.join(', ')}`,
+      );
+    }
     if (roles.some(requiresReviewerCandidateSelection)) {
       await this.assertPrincipalReviewerAssigned(projectId);
     }
@@ -398,8 +918,25 @@ export class MatchingService {
     // Create the runs and flip the project up front, in a short transaction, so
     // the (potentially slow) AI calls do not hold a DB transaction open.
     const runs = await this.dataSource.transaction(async (manager) => {
+      const lockedProject = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOne();
+      if (!lockedProject) throw new NotFoundException('Project not found');
+      if (!MATCH_START_ALLOWED_STATUSES.has(lockedProject.status)) return [];
       const created: MatchingRun[] = [];
       for (const role of roles) {
+        const alreadyRunning = await manager.exists(MatchingRun, {
+          where: {
+            projectId,
+            targetType: 'planning_role',
+            targetRoleKey: role,
+            status: In(['queued', 'running']),
+          },
+        });
+        if (alreadyRunning) continue;
         created.push(
           await manager.save(
             MatchingRun,
@@ -419,12 +956,14 @@ export class MatchingService {
           ),
         );
       }
-      await this.transitionProject(manager, project, adminUserId, {
-        status: ProjectStatus.PLANNING_MATCHING,
-        planningStatus: 'matching',
-        reason: 'Started planning-role matching.',
-        setPlanningStartedAt: true,
-      });
+      if (created.length) {
+        await this.transitionProject(manager, lockedProject, adminUserId, {
+          status: ProjectStatus.PLANNING_MATCHING,
+          planningStatus: 'matching',
+          reason: 'Started planning-role matching.',
+          setPlanningStartedAt: true,
+        });
+      }
       return created;
     });
 
@@ -437,7 +976,7 @@ export class MatchingService {
         // Rank against role-specific skills (admin override, else per-role default).
         const roleSkills = dto.filters?.skills?.length
           ? dto.filters.skills
-          : (PLANNING_ROLE_SKILLS[run.targetRoleKey!] ?? []);
+          : (PLANNING_ROLE_SKILLS[staffingRoleBase(run.targetRoleKey!)] ?? []);
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
           targetType: 'planning_role',
@@ -503,11 +1042,26 @@ export class MatchingService {
             : `No eligible candidate was found for ${roleKey}.`;
         })
         .join(' ');
-      await this.markStaffingBlocked(
-        projectId,
-        failureReason ||
-          'One or more planning roles could not produce an eligible shortlist.',
-      );
+      if (
+        runResults.some(
+          (result) =>
+            result.targetRoleKey === PRINCIPAL_REVIEWER_ROLE &&
+            (result.status === 'failed' ||
+              Number(result.candidateCount ?? 0) === 0 ||
+              result.invitationId == null),
+        )
+      ) {
+        await this.markWaitingForPrincipalReviewer(
+          projectId,
+          failureReason || 'No principal reviewer currently has capacity.',
+        );
+      } else {
+        await this.markStaffingBlocked(
+          projectId,
+          failureReason ||
+            'One or more planning roles could not produce an eligible shortlist.',
+        );
+      }
     } else if (runResults.some((result) => result.selectionRequired === true)) {
       await this.markAwaitingReviewerSelection(
         project,
@@ -638,7 +1192,7 @@ export class MatchingService {
         'Implementation matching can only start once the project plan is materialized',
       );
     }
-    this.assertProjectFullyFunded(project);
+    this.assertPlanningFunded(project);
     await this.assertPrincipalReviewerAssigned(projectId);
 
     await this.recoverStaleImplementationRuns(projectId);
@@ -657,10 +1211,7 @@ export class MatchingService {
     const runs = await this.dataSource.transaction(async (manager) => {
       const created: MatchingRun[] = [];
       for (const task of tasks) {
-        const taskMaxRate = this.effectiveRateCap(
-          explicitMaxRate,
-          this.affordableTaskRate(task),
-        );
+        const taskMaxRate = explicitMaxRate;
         created.push(
           await manager.save(
             MatchingRun,
@@ -762,7 +1313,7 @@ export class MatchingService {
         const candidates = await this.buildTaskCandidatePool(
           task,
           input.filters,
-          this.effectiveRateCap(input.maxRate, this.affordableTaskRate(task)),
+          input.maxRate,
         );
         const ai = await this.aiService.matchFreelancers({
           matchingRunId: run.id,
@@ -842,6 +1393,23 @@ export class MatchingService {
     }
 
     const result = await this.dataSource.transaction(async (manager) => {
+      const taskReference = await manager.findOne(ProjectTask, {
+        where: { id: taskId },
+        select: { id: true, projectId: true },
+      });
+      if (!taskReference) throw new NotFoundException('Task not found');
+      // Match invitation creation's project -> task lock order. It also makes
+      // the final "all tasks assigned" count deterministic when several task
+      // invitations are accepted at the same time.
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', {
+          projectId: taskReference.projectId,
+        })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
       const task = await manager
         .getRepository(ProjectTask)
         .createQueryBuilder('task')
@@ -908,10 +1476,6 @@ export class MatchingService {
         );
       }
 
-      const project = await manager.findOne(Project, {
-        where: { id: task.projectId },
-      });
-      if (!project) throw new NotFoundException('Project not found');
       const principalReviewerConflict = await manager.exists(
         ProjectRoleAssignment,
         {
@@ -929,7 +1493,7 @@ export class MatchingService {
           'A project principal reviewer cannot implement or review their own task work',
         );
       }
-      this.assertTaskCompensationCoverage(task, profile, project);
+      this.assertTaskCompensationCoverage(task);
 
       let sourceRun: MatchingRun | null = candidate?.matchingRun ?? null;
       if (!candidate && dto.sourceMatchingRunId) {
@@ -960,13 +1524,12 @@ export class MatchingService {
         }
       }
 
-      const assignedAt = new Date();
-      const scheduleOverrun = await this.rebaseTaskSchedule(
-        manager,
-        task,
-        project,
-        assignedAt,
-      );
+      const reservedAt = new Date();
+      const implementationFunded = this.isProjectFullyFunded(project);
+      const assignedAt = implementationFunded ? reservedAt : null;
+      const scheduleOverrun = implementationFunded
+        ? await this.rebaseTaskSchedule(manager, task, project, reservedAt)
+        : false;
       task.assignedFreelancerProfileId = freelancerProfileId;
       task.sourceMatchingRunId = sourceRun?.id ?? null;
       task.sourceCandidateId = candidate?.id ?? null;
@@ -978,14 +1541,22 @@ export class MatchingService {
       task.hourlyRateCurrencySnapshot = normalizeCurrency(
         profile.hourlyRateCurrency,
       );
-      task.assignmentStatus = 'accepted';
+      task.assignmentStatus = implementationFunded ? 'accepted' : 'reserved';
       if (task.status !== 'in_progress') task.status = 'todo';
-      if (dto.notes) {
-        task.metadata = {
-          ...(task.metadata ?? {}),
-          assignmentNotes: dto.notes,
-        };
-      }
+      task.metadata = {
+        ...(task.metadata ?? {}),
+        ...(!implementationFunded
+          ? {
+              reservedAt: reservedAt.toISOString(),
+              workStartsAfterImplementationFunding: true,
+            }
+          : {}),
+        ...(dto.notes
+          ? {
+              assignmentNotes: dto.notes,
+            }
+          : {}),
+      };
       await manager.save(ProjectTask, task);
 
       if (candidate) {
@@ -1005,13 +1576,19 @@ export class MatchingService {
         }
       }
 
-      await this.advanceImplementationStatus(
+      const implementationFundingReady = await this.advanceImplementationStatus(
         manager,
         task.projectId,
         adminUserId,
       );
 
-      return { task, notifyUserId: profile.userId ?? null, scheduleOverrun };
+      return {
+        task,
+        notifyUserId: profile.userId ?? null,
+        scheduleOverrun,
+        implementationFunded,
+        implementationFundingReady,
+      };
     });
 
     if (result.notifyUserId) {
@@ -1020,10 +1597,29 @@ export class MatchingService {
         projectId: result.task.projectId,
         taskId: result.task.id,
         type: 'task_assignment',
-        title: 'New task assignment',
-        body: `You were assigned the task "${result.task.title}". Its countdown starts from the accepted schedule.`,
+        title: result.implementationFunded
+          ? 'New task assignment'
+          : 'Task reservation accepted',
+        body: result.implementationFunded
+          ? `You were assigned the task "${result.task.title}". Its countdown starts from the accepted schedule.`
+          : `Your place on "${result.task.title}" is reserved. Work and deadline countdowns start only after the customer funds the implementation escrow.`,
         actionUrl: `/freelancer/projects/${result.task.projectId}/tasks/${result.task.id}`,
       });
+    }
+    if (result.implementationFundingReady) {
+      const readyProject = await this.projectRepo.findOne({
+        where: { id: result.task.projectId },
+      });
+      if (readyProject) {
+        const implementationAmount = projectFundingBreakdown(
+          readyProject.budgetAllocation,
+        )?.implementationAmount;
+        await this.notifyProjectOwner(
+          readyProject,
+          'Your implementation team is ready',
+          `Every Scrum task now has an accepted freelancer. Fund the implementation escrow${implementationAmount ? ` (${implementationAmount} ${readyProject.quotedCurrency ?? readyProject.currency})` : ''} to start work and all deadline counters together.`,
+        );
+      }
     }
     if (result.scheduleOverrun) {
       const reviewer = await this.dataSource
@@ -1067,13 +1663,15 @@ export class MatchingService {
         });
       }
     }
-    await this.repositoriesService
-      .provisionForAssignedTeam(result.task.projectId)
-      .catch((error: unknown) =>
-        this.logger.error(
-          `Automatic repository access failed for task ${result.task.id}: ${this.errorMessage(error)}`,
-        ),
-      );
+    if (result.implementationFunded) {
+      await this.repositoriesService
+        .provisionForAssignedTeam(result.task.projectId)
+        .catch((error: unknown) =>
+          this.logger.error(
+            `Automatic repository access failed for task ${result.task.id}: ${this.errorMessage(error)}`,
+          ),
+        );
+    }
 
     const { task } = result;
     return {
@@ -1098,8 +1696,9 @@ export class MatchingService {
   ) {
     const project = await manager.findOne(Project, {
       where: { id: projectId },
+      lock: { mode: 'pessimistic_write' },
     });
-    if (!project) return;
+    if (!project) return false;
 
     const unassigned = await manager.count(ProjectTask, {
       where: {
@@ -1110,20 +1709,30 @@ export class MatchingService {
     });
 
     if (unassigned === 0) {
-      project.automationStatus = 'implementation_active';
+      const fullyFunded = this.isProjectFullyFunded(project);
+      project.automationStatus = fullyFunded
+        ? 'implementation_active'
+        : 'implementation_team_ready_for_funding';
       project.automationError = null;
       project.automationErrorCategory = null;
       project.automationErrorAt = null;
-      if (project.status === ProjectStatus.ASSIGNED) {
+      if (
+        fullyFunded &&
+        [ProjectStatus.ASSIGNED, ProjectStatus.ACTIVE].includes(project.status)
+      ) {
         await manager.save(Project, project);
-        return;
+        return false;
       }
       await this.transitionProject(manager, project, adminUserId, {
-        status: ProjectStatus.ASSIGNED,
-        reason: 'All implementation tasks have assigned freelancers.',
-        setAssignedAt: true,
+        status: fullyFunded
+          ? ProjectStatus.ASSIGNED
+          : ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
+        reason: fullyFunded
+          ? 'All implementation tasks have assigned freelancers.'
+          : 'Every implementation task has a reserved freelancer; implementation funding is now enabled.',
+        setAssignedAt: fullyFunded,
       });
-      return;
+      return !fullyFunded;
     }
 
     if (project.status === ProjectStatus.MATCHING) {
@@ -1132,6 +1741,7 @@ export class MatchingService {
         reason: 'Implementation task assignment started.',
       });
     }
+    return false;
   }
 
   // ---------------------------------------------------------------------------
@@ -1473,6 +2083,7 @@ export class MatchingService {
         body: `You were assigned as ${run.targetRoleKey} for a project.`,
       });
     }
+    await this.publishImplementationCapacityBlockIfNeeded(run.projectId);
 
     return {
       runId: run.id,
@@ -1607,37 +2218,46 @@ export class MatchingService {
     }
 
     if (decision === 'declined') {
-      const declined = await this.invitationRepo
-        .createQueryBuilder()
-        .update(ProjectInvitation)
-        .set({
-          status: 'declined',
-          respondedAt: new Date(),
-          responseReason: reason?.trim() || null,
-        })
-        .where('id = :id', { id: invitation.id })
-        .andWhere("status = 'pending'")
-        .andWhere('expires_at > NOW()')
-        .execute();
-      if (!declined.affected) {
+      const declined = await this.dataSource.transaction(async (manager) => {
+        const locked = await manager
+          .getRepository(ProjectInvitation)
+          .createQueryBuilder('invitation')
+          .setLock('pessimistic_write')
+          .where('invitation.id = :id', { id: invitation.id })
+          .getOne();
+        if (
+          !locked ||
+          locked.status !== 'pending' ||
+          locked.expiresAt <= new Date()
+        ) {
+          return false;
+        }
+        locked.status = 'declined';
+        locked.respondedAt = new Date();
+        locked.responseReason = reason?.trim() || null;
+        await manager.save(ProjectInvitation, locked);
+        if (locked.candidateId) {
+          await manager.update(MatchingCandidate, locked.candidateId, {
+            status: 'rejected',
+            rejectionReason:
+              reason?.trim() || 'Freelancer declined the invitation',
+          });
+        }
+        if (locked.taskId) {
+          await manager.update(ProjectTask, locked.taskId, {
+            assignmentStatus: 'unassigned',
+          });
+        }
+        invitation.status = locked.status;
+        invitation.respondedAt = locked.respondedAt;
+        invitation.responseReason = locked.responseReason;
+        return true;
+      });
+      if (!declined) {
         await this.expireInvitation(invitation);
         throw new ConflictException(
           'This invitation is no longer pending and matching has continued',
         );
-      }
-      invitation.status = 'declined';
-      invitation.respondedAt = new Date();
-      invitation.responseReason = reason?.trim() || null;
-      if (invitation.candidate) {
-        invitation.candidate.status = 'rejected';
-        invitation.candidate.rejectionReason =
-          reason?.trim() || 'Freelancer declined the invitation';
-        await this.candidateRepo.save(invitation.candidate);
-      }
-      if (invitation.taskId) {
-        await this.taskRepo.update(invitation.taskId, {
-          assignmentStatus: 'unassigned',
-        });
       }
       await this.notifyProjectOwner(
         invitation.project,
@@ -1645,7 +2265,12 @@ export class MatchingService {
         `${profile.user?.firstName ?? 'A freelancer'} declined the ${invitation.roleKey} invitation. The next match is being invited automatically.`,
         userId,
       );
-      await this.inviteNextCandidate(invitation.matchingRunId!);
+      await this.inviteNextCandidate(invitation.matchingRunId!).catch(
+        (error: unknown) =>
+          this.logger.error(
+            `Automatic fallback invitation failed for ${invitation.id}: ${this.errorMessage(error)}; reconciliation will retry it`,
+          ),
+      );
       return { id: invitation.id, status: invitation.status };
     }
 
@@ -1732,6 +2357,18 @@ export class MatchingService {
     } else {
       try {
         assignment = await this.dataSource.transaction(async (manager) => {
+          // Keep the same lock order as invitation creation: project, then
+          // invitation, then freelancer profile. This prevents a concurrent
+          // fallback/recovery worker from deadlocking acceptance or publishing
+          // a second invitation after the final role has already accepted.
+          const lockedProject = await manager
+            .getRepository(Project)
+            .createQueryBuilder('project')
+            .setLock('pessimistic_write')
+            .where('project.id = :projectId', {
+              projectId: invitation.projectId,
+            })
+            .getOneOrFail();
           const locked = await manager
             .getRepository(ProjectInvitation)
             .createQueryBuilder('invitation')
@@ -1752,7 +2389,11 @@ export class MatchingService {
             adminUserId: null,
             notes: reason?.trim() || 'Automatically matched and accepted.',
             phase:
-              invitation.phase === 'governance' ? 'governance' : 'planning',
+              invitation.phase === 'governance'
+                ? 'governance'
+                : invitation.phase === 'staffing'
+                  ? 'staffing'
+                  : 'planning',
             accepted: true,
           });
           locked.status = 'accepted';
@@ -1768,12 +2409,15 @@ export class MatchingService {
           await manager.save(MatchingRun, invitation.matchingRun!);
 
           if (invitation.phase === 'governance') {
-            invitation.project.principalReviewerAssignmentId = created.id;
-            invitation.project.automationStatus = 'matching_planning_team';
-            invitation.project.automationError = null;
-            invitation.project.automationErrorCategory = null;
-            invitation.project.automationErrorAt = null;
-            await manager.save(Project, invitation.project);
+            lockedProject.principalReviewerAssignmentId = created.id;
+            lockedProject.staffingDeadline = new Date(
+              Date.now() + PRINCIPAL_MATCHING_WINDOW_MS,
+            );
+            lockedProject.automationStatus = 'matching_planning_team';
+            lockedProject.automationError = null;
+            lockedProject.automationErrorCategory = null;
+            lockedProject.automationErrorAt = null;
+            await manager.save(Project, lockedProject);
           } else {
             await this.maybeAdvanceToPlanningAssigned(
               manager,
@@ -1805,18 +2449,13 @@ export class MatchingService {
       `${profile.user?.firstName ?? 'The freelancer'} accepted the ${invitation.roleKey} assignment.`,
       userId,
     );
+    await this.publishImplementationCapacityBlockIfNeeded(invitation.projectId);
     if (invitation.phase === 'governance') {
       await this.autoStartPlanningRoles(invitation.projectId);
     }
-    if (invitation.phase !== 'implementation') {
-      await this.repositoriesService
-        .provisionForAssignedTeam(invitation.projectId)
-        .catch((error: unknown) =>
-          this.logger.error(
-            `Automatic repository access failed for ${invitation.phase} assignment ${assignment?.id ?? invitation.id}: ${this.errorMessage(error)}`,
-          ),
-        );
-    }
+    // Planning invitations reserve the team; repository access is granted only
+    // after the customer funds the planning package. Implementation access is
+    // likewise delayed until the second escrow stage activates all task clocks.
     return {
       id: invitation.id,
       status: 'accepted',
@@ -1890,13 +2529,6 @@ export class MatchingService {
           `The ${invitation.roleKey} assignment was recovered after an interrupted acceptance request.`,
           invitation.freelancerProfile?.userId,
         );
-        await this.repositoriesService
-          .provisionForAssignedTeam(invitation.projectId)
-          .catch((error: unknown) =>
-            this.logger.error(
-              `Repository recovery failed for invitation ${invitation.id}: ${this.errorMessage(error)}`,
-            ),
-          );
       } else if (state === 'expired') {
         expired += 1;
         await this.expireInvitation(invitation);
@@ -1905,6 +2537,32 @@ export class MatchingService {
       }
     }
     return { inspected: accepting.length, accepted, reset, expired };
+  }
+
+  async recoverRunsMissingFallbackInvitations() {
+    const runs = await this.runRepo.find({
+      where: [
+        {
+          targetRoleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['completed', 'reviewed']),
+        },
+        { status: 'reviewed' },
+      ],
+      order: { updatedAt: 'ASC' },
+      take: 100,
+    });
+    let recovered = 0;
+    for (const run of runs) {
+      try {
+        const invitation = await this.inviteNextCandidate(run.id);
+        if (invitation) recovered += 1;
+      } catch (error) {
+        this.logger.error(
+          `Could not recover fallback invitation for run ${run.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: runs.length, recovered };
   }
 
   async recoverBlockedStaffing() {
@@ -1945,14 +2603,14 @@ export class MatchingService {
             .find({
               where: {
                 projectId: project.id,
-                phase: 'planning',
+                phase: In(['planning', 'staffing']),
                 status: In(ASSIGNMENT_ACTIVE_STATUSES),
               },
             });
           const assignedRoles = new Set(
             planningAssignments.map((assignment) => assignment.roleKey),
           );
-          const missingRoles = PLANNING_ROLES.filter(
+          const missingRoles = requiredPreFundingRoles().filter(
             (role) => !assignedRoles.has(role),
           );
           if (missingRoles.length) {
@@ -1962,6 +2620,10 @@ export class MatchingService {
               null,
             );
             restarted += missingRoles.length;
+            continue;
+          }
+          if (await this.reconcileProjectFundingReadiness(project.id)) {
+            restarted += 1;
             continue;
           }
         }
@@ -2238,18 +2900,20 @@ export class MatchingService {
     reason: string,
     actorUserId: string | null,
   ) {
+    const phase =
+      staffingRoleBase(roleKey) === 'implementation' ? 'staffing' : 'planning';
     const result = await this.dataSource.transaction(async (manager) => {
       const assignment = await manager
         .getRepository(ProjectRoleAssignment)
         .createQueryBuilder('assignment')
         .setLock('pessimistic_write')
         .where('assignment.projectId = :projectId', { projectId })
-        .andWhere('assignment.phase = :phase', { phase: 'planning' })
+        .andWhere('assignment.phase = :phase', { phase })
         .andWhere('assignment.roleKey = :roleKey', { roleKey })
         .andWhere('assignment.endedAt IS NULL')
         .getOne();
       if (!assignment?.freelancerProfileId) {
-        throw new ConflictException('Planning role has no active assignee');
+        throw new ConflictException('Staffing role has no active assignee');
       }
       const removedProfileId = assignment.freelancerProfileId;
       assignment.status = 'removed';
@@ -2265,7 +2929,10 @@ export class MatchingService {
         profile.riskFlags = [
           ...(profile.riskFlags ?? []),
           {
-            type: 'planning_role_rejection',
+            type:
+              phase === 'staffing'
+                ? 'prefunding_implementation_rejection'
+                : 'planning_role_rejection',
             projectId,
             roleKey,
             reason,
@@ -2398,13 +3065,33 @@ export class MatchingService {
     runId: string,
     preferredCandidateId?: string,
     selectedBy?: string,
-  ) {
+  ): Promise<ProjectInvitation | null> {
     const run = await this.runRepo.findOne({
       where: { id: runId },
       relations: ['project', 'targetTask'],
     });
     if (!run || !['completed', 'reviewed'].includes(run.status)) return null;
     const roleKey = run.targetRoleKey ?? 'implementation';
+    if (run.targetTaskId) {
+      const taskAlreadyAssigned = await this.taskRepo.exists({
+        where: {
+          id: run.targetTaskId,
+          assignedFreelancerProfileId: Not(IsNull()),
+        },
+      });
+      if (taskAlreadyAssigned) return null;
+    } else {
+      const roleAlreadyAssigned = await this.dataSource
+        .getRepository(ProjectRoleAssignment)
+        .exists({
+          where: {
+            projectId: run.projectId,
+            roleKey,
+            status: In(ASSIGNMENT_ACTIVE_STATUSES),
+          },
+        });
+      if (roleAlreadyAssigned) return null;
+    }
     const existing = await this.invitationRepo.findOne({
       where: {
         projectId: run.projectId,
@@ -2464,6 +3151,7 @@ export class MatchingService {
               projectId: run.projectId,
               freelancerProfileId: In(candidateIds),
               status: In(ASSIGNMENT_ACTIVE_STATUSES),
+              ...(run.targetTaskId ? { phase: Not('staffing') } : {}),
             },
           })
         : Promise.resolve([]);
@@ -2526,7 +3214,6 @@ export class MatchingService {
     let candidate: MatchingCandidate | null = null;
     for (const option of candidates) {
       if (!option.freelancerProfile?.isAvailable) continue;
-      if (!option.freelancerProfile.githubUsername?.trim()) continue;
       if (
         !option.freelancerProfileId ||
         unavailableProfileIds.has(option.freelancerProfileId)
@@ -2576,99 +3263,316 @@ export class MatchingService {
       ? 'implementation'
       : run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE
         ? 'governance'
-        : 'planning';
-    const invitation = await this.dataSource.transaction(async (manager) => {
-      const created = await manager.save(
-        ProjectInvitation,
-        manager.create(ProjectInvitation, {
-          projectId: run.projectId,
-          taskId: run.targetTaskId,
-          freelancerProfileId: candidate.freelancerProfileId!,
-          matchingRunId: run.id,
-          candidateId: candidate.id,
-          phase,
-          roleKey,
-          status: 'pending',
-          rankSnapshot: candidate.rank,
-          scoreSnapshot: {
-            score: Number(candidate.score),
-            scoreBreakdown: candidate.scoreBreakdown,
-            rationale: candidate.rationale,
+        : staffingRoleBase(run.targetRoleKey ?? '') === 'implementation'
+          ? 'staffing'
+          : 'planning';
+    let invitation: ProjectInvitation;
+    try {
+      invitation = await this.dataSource.transaction(async (manager) => {
+        const lockedProject = await manager
+          .getRepository(Project)
+          .createQueryBuilder('project')
+          .setLock('pessimistic_write')
+          .where('project.id = :projectId', { projectId: run.projectId })
+          .getOneOrFail();
+        const targetInvitation = await manager.findOne(ProjectInvitation, {
+          where: {
+            projectId: run.projectId,
+            taskId: run.targetTaskId ?? IsNull(),
+            phase,
+            roleKey,
+            status: In(['pending', 'accepting']),
           },
-          expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
-          respondedAt: null,
-          responseReason: null,
-        }),
-      );
-      candidate.status = 'invited';
-      if (selectedBy) {
-        await manager
-          .getRepository(MatchingCandidate)
-          .createQueryBuilder()
-          .update(MatchingCandidate)
-          .set({
-            status: 'skipped',
-            rejectionReason:
-              'The principal reviewer selected a lower-ranked candidate',
-          })
-          .where('matching_run_id = :runId', { runId: run.id })
-          .andWhere('rank < :selectedRank', { selectedRank: candidate.rank })
-          .andWhere('status IN (:...statuses)', {
-            statuses: ['recommended', 'shortlisted'],
-          })
-          .execute();
-        candidate.selectedBy = selectedBy;
-        candidate.selectedAt = new Date();
-        run.reviewedBy = selectedBy;
-        run.reviewedAt = new Date();
-        run.status = 'reviewed';
-        await manager.save(MatchingRun, run);
-      }
-      await manager.save(MatchingCandidate, candidate);
-      if (run.targetTaskId) {
-        await manager.update(ProjectTask, run.targetTaskId, {
-          assignmentStatus: 'invitation_pending',
         });
-      }
-      await manager.update(Project, run.projectId, {
-        automationStatus:
+        if (targetInvitation) {
+          if (
+            preferredCandidateId &&
+            targetInvitation.candidateId !== preferredCandidateId
+          ) {
+            throw new ConflictException(
+              'Another candidate already has an active invitation for this role',
+            );
+          }
+          return targetInvitation;
+        }
+        if (run.targetTaskId) {
+          const lockedTask = await manager
+            .getRepository(ProjectTask)
+            .createQueryBuilder('task')
+            .setLock('pessimistic_write')
+            .where('task.id = :taskId', { taskId: run.targetTaskId })
+            .getOne();
+          if (!lockedTask || lockedTask.assignedFreelancerProfileId) {
+            throw new ConflictException(
+              'Target assignment changed concurrently',
+            );
+          }
+        } else {
+          const activeRole = await manager.exists(ProjectRoleAssignment, {
+            where: {
+              projectId: run.projectId,
+              phase,
+              roleKey,
+              status: In(ASSIGNMENT_ACTIVE_STATUSES),
+            },
+          });
+          if (activeRole) {
+            throw new ConflictException(
+              'Target assignment changed concurrently',
+            );
+          }
+        }
+        const lockedProfile = await manager
+          .getRepository(FreelancerProfile)
+          .createQueryBuilder('profile')
+          .setLock('pessimistic_write')
+          .where('profile.id = :profileId', {
+            profileId: candidate.freelancerProfileId,
+          })
+          .getOne();
+        if (!lockedProfile?.isAvailable) {
+          throw new ConflictException(
+            'Candidate reservation changed concurrently',
+          );
+        }
+        const activeInvitation = await manager.exists(ProjectInvitation, {
+          where: {
+            freelancerProfileId: lockedProfile.id,
+            status: In(['pending', 'accepting']),
+          },
+        });
+        if (activeInvitation) {
+          throw new ConflictException(
+            'Candidate reservation changed concurrently',
+          );
+        }
+        if (run.targetRoleKey === PRINCIPAL_REVIEWER_ROLE) {
+          const [activeProjects, reservedProjects] = await Promise.all([
+            manager.count(ProjectRoleAssignment, {
+              where: {
+                freelancerProfileId: lockedProfile.id,
+                phase: 'governance',
+                roleKey: PRINCIPAL_REVIEWER_ROLE,
+                status: In(ASSIGNMENT_ACTIVE_STATUSES),
+              },
+            }),
+            manager.count(ProjectInvitation, {
+              where: {
+                freelancerProfileId: lockedProfile.id,
+                phase: 'governance',
+                roleKey: PRINCIPAL_REVIEWER_ROLE,
+                status: In(['pending', 'accepting']),
+              },
+            }),
+          ]);
+          const capacity = Math.min(
+            PRINCIPAL_REVIEWER_MAX_PROJECTS,
+            Math.max(
+              1,
+              lockedProfile.principalReviewerMaxProjects ??
+                PRINCIPAL_REVIEWER_MAX_PROJECTS,
+            ),
+          );
+          if (activeProjects + reservedProjects >= capacity) {
+            throw new ConflictException(
+              'Candidate reservation changed concurrently',
+            );
+          }
+        }
+        const created = await manager.save(
+          ProjectInvitation,
+          manager.create(ProjectInvitation, {
+            projectId: run.projectId,
+            taskId: run.targetTaskId,
+            freelancerProfileId: candidate.freelancerProfileId!,
+            matchingRunId: run.id,
+            candidateId: candidate.id,
+            phase,
+            roleKey,
+            status: 'pending',
+            rankSnapshot: candidate.rank,
+            scoreSnapshot: {
+              score: Number(candidate.score),
+              scoreBreakdown: candidate.scoreBreakdown,
+              rationale: candidate.rationale,
+            },
+            expiresAt: new Date(Date.now() + INVITATION_TTL_MS),
+            respondedAt: null,
+            responseReason: null,
+            notificationStatus: 'pending',
+            notificationAttempts: 0,
+            notificationError: null,
+            notificationSentAt: null,
+          }),
+        );
+        candidate.status = 'invited';
+        if (selectedBy) {
+          await manager
+            .getRepository(MatchingCandidate)
+            .createQueryBuilder()
+            .update(MatchingCandidate)
+            .set({
+              status: 'skipped',
+              rejectionReason:
+                'The principal reviewer selected a lower-ranked candidate',
+            })
+            .where('matching_run_id = :runId', { runId: run.id })
+            .andWhere('rank < :selectedRank', { selectedRank: candidate.rank })
+            .andWhere('status IN (:...statuses)', {
+              statuses: ['recommended', 'shortlisted'],
+            })
+            .execute();
+          candidate.selectedBy = selectedBy;
+          candidate.selectedAt = new Date();
+          run.reviewedBy = selectedBy;
+          run.reviewedAt = new Date();
+          run.status = 'reviewed';
+          await manager.save(MatchingRun, run);
+        }
+        await manager.save(MatchingCandidate, candidate);
+        if (run.targetTaskId) {
+          await manager.update(ProjectTask, run.targetTaskId, {
+            assignmentStatus: 'invitation_pending',
+          });
+        }
+        if (
+          phase === 'governance' &&
+          lockedProject.status === ProjectStatus.WAITING_FOR_PR
+        ) {
+          await this.transitionProject(manager, lockedProject, null, {
+            status: ProjectStatus.PLANNING_MATCHING,
+            planningStatus: 'matching',
+            reason: 'Reserved a principal reviewer candidate.',
+          });
+        }
+        lockedProject.automationStatus =
           phase === 'governance'
             ? 'awaiting_principal_reviewer'
             : phase === 'planning'
               ? 'awaiting_planning_team'
-              : 'awaiting_implementation_team',
-        automationError: null,
-        automationErrorCategory: null,
-        automationErrorAt: null,
+              : 'awaiting_implementation_team';
+        lockedProject.automationError = null;
+        lockedProject.automationErrorCategory = null;
+        lockedProject.automationErrorAt = null;
+        await manager.save(Project, lockedProject);
+        return created;
       });
-      return created;
-    });
+    } catch (error) {
+      if (
+        error instanceof ConflictException &&
+        error.message === 'Target assignment changed concurrently' &&
+        !preferredCandidateId
+      ) {
+        return null;
+      }
+      if (
+        error instanceof ConflictException &&
+        error.message === 'Candidate reservation changed concurrently' &&
+        !preferredCandidateId
+      ) {
+        await this.candidateRepo.update(
+          {
+            id: candidate.id,
+            status: In(['recommended', 'shortlisted', 'selected']),
+          },
+          {
+            status: 'skipped',
+            rejectionReason: 'Candidate was reserved by another project first',
+          },
+        );
+        return this.inviteNextCandidate(runId);
+      }
+      throw error;
+    }
     await this.incidents?.resolveOperation(
       'matching',
       'staff_project',
       run.projectId,
     );
-    await this.notificationsService
-      .createNotification({
-        userId: candidate.freelancerProfile.userId,
-        projectId: run.projectId,
-        taskId: run.targetTaskId,
-        type: 'project_invitation',
-        title: 'Project invitation',
-        body: `You are invited to ${run.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(invitation.roleKey)}${run.targetTask?.title ? ` for “${run.targetTask.title}”` : ''}. Please accept or decline within ${INVITATION_WINDOW_LABEL}.`,
-        actionUrl: '/invitations',
-        metadata: {
-          invitationId: invitation.id,
-          expiresAt: invitation.expiresAt.toISOString(),
-          phase,
-        },
-      })
-      .catch((error: unknown) =>
-        this.logger.warn(
-          `Invitation ${invitation.id} persisted but its notification failed: ${this.safeErrorMessage(error)}`,
-        ),
-      );
+    await this.deliverInvitationNotification(invitation.id);
     return invitation;
+  }
+
+  async recoverUndeliveredInvitationNotifications() {
+    const rows = await this.invitationRepo.find({
+      where: {
+        status: 'pending',
+        notificationStatus: In(['pending', 'failed', 'sending']),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 50,
+    });
+    let delivered = 0;
+    for (const row of rows) {
+      if (
+        row.notificationStatus === 'sending' &&
+        row.updatedAt.getTime() > Date.now() - 2 * 60_000
+      ) {
+        continue;
+      }
+      if (await this.deliverInvitationNotification(row.id)) delivered += 1;
+    }
+    return { inspected: rows.length, delivered };
+  }
+
+  private async deliverInvitationNotification(invitationId: string) {
+    const claimed = await this.dataSource.transaction(async (manager) => {
+      const invitation = await manager
+        .getRepository(ProjectInvitation)
+        .createQueryBuilder('invitation')
+        .setLock('pessimistic_write')
+        .leftJoinAndSelect('invitation.project', 'project')
+        .leftJoinAndSelect('invitation.task', 'task')
+        .leftJoinAndSelect('invitation.freelancerProfile', 'profile')
+        .where('invitation.id = :invitationId', { invitationId })
+        .getOne();
+      if (!invitation || invitation.status !== 'pending') return null;
+      if (invitation.notificationStatus === 'sent') return null;
+      if (
+        invitation.notificationStatus === 'sending' &&
+        invitation.updatedAt.getTime() > Date.now() - 2 * 60_000
+      ) {
+        return null;
+      }
+      invitation.notificationStatus = 'sending';
+      invitation.notificationAttempts += 1;
+      invitation.notificationError = null;
+      return manager.save(ProjectInvitation, invitation);
+    });
+    if (!claimed?.freelancerProfile?.userId) return false;
+    try {
+      await this.notificationsService.ensureProjectInvitationNotification(
+        claimed.id,
+        {
+          userId: claimed.freelancerProfile.userId,
+          projectId: claimed.projectId,
+          taskId: claimed.taskId,
+          title: 'Project invitation',
+          body: `You are invited to ${claimed.project?.title ?? 'a Nexus AI project'} as ${this.businessRoleLabel(claimed.roleKey)}${claimed.task?.title ? ` for “${claimed.task.title}”` : ''}. Please accept or decline within ${INVITATION_WINDOW_LABEL}.`,
+          actionUrl: '/invitations',
+          metadata: {
+            expiresAt: claimed.expiresAt.toISOString(),
+            phase: claimed.phase,
+          },
+        },
+      );
+      await this.invitationRepo.update(claimed.id, {
+        notificationStatus: 'sent',
+        notificationSentAt: new Date(),
+        notificationError: null,
+      });
+      return true;
+    } catch (error) {
+      const message = this.safeErrorMessage(error);
+      await this.invitationRepo.update(claimed.id, {
+        notificationStatus: 'failed',
+        notificationError: message,
+      });
+      this.logger.warn(
+        `Invitation ${claimed.id} persisted but its notification failed: ${message}`,
+      );
+      return false;
+    }
   }
 
   private async expireInvitation(invitation: ProjectInvitation) {
@@ -2932,6 +3836,73 @@ export class MatchingService {
     }
   }
 
+  private async markWaitingForPrincipalReviewer(
+    projectId: string,
+    reason: string,
+  ) {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOne();
+      if (!project) return null;
+      const reviewer = await manager.findOne(ProjectRoleAssignment, {
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(ASSIGNMENT_ACTIVE_STATUSES),
+        },
+      });
+      const invitation = await manager.findOne(ProjectInvitation, {
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: PRINCIPAL_REVIEWER_ROLE,
+          status: In(['pending', 'accepting']),
+        },
+      });
+      // A losing concurrent matching attempt must not overwrite a successful
+      // reservation/acceptance with WAITING_FOR_PR.
+      if (reviewer || invitation) return null;
+      const firstTransition = project.status !== ProjectStatus.WAITING_FOR_PR;
+      if (firstTransition) {
+        await this.transitionProject(manager, project, null, {
+          status: ProjectStatus.WAITING_FOR_PR,
+          planningStatus: 'waiting_for_pr',
+          reason: 'No principal reviewer currently has available capacity.',
+        });
+      } else {
+        project.planningStatus = 'waiting_for_pr';
+      }
+      project.automationStatus = 'waiting_for_pr';
+      project.automationError = reason;
+      project.automationErrorCategory = 'no_pr_capacity';
+      project.automationErrorAt = new Date();
+      await manager.save(Project, project);
+      return { project, firstTransition };
+    });
+    if (!result) return;
+    await this.incidents?.record({
+      subsystem: 'matching',
+      operation: 'staff_project',
+      projectId,
+      errorCode: 'no_pr_capacity',
+      severity: 'warning',
+      message: reason,
+      context: { automaticallyRetrying: true },
+    });
+    if (result.firstTransition) {
+      await this.notifyProjectOwner(
+        result.project,
+        'Waiting for a principal reviewer',
+        'Your request is saved. Every qualified principal reviewer is currently at capacity, so no payment is required. We will continue automatically and notify you as soon as a reviewer accepts.',
+      );
+    }
+  }
+
   private matchingFailureCategory(error: string | null | undefined) {
     if (!error) return null;
     const value = error.toLowerCase();
@@ -3006,7 +3977,7 @@ export class MatchingService {
       fullstack: 'full-stack developer',
       qa: 'quality engineer',
     };
-    return labels[roleKey] ?? roleKey.replaceAll('_', ' ');
+    return labels[staffingRoleBase(roleKey)] ?? roleKey.replaceAll('_', ' ');
   }
 
   private async createPlanningAssignment(
@@ -3016,13 +3987,20 @@ export class MatchingService {
       candidate: MatchingCandidate;
       adminUserId: string | null;
       notes: string | null;
-      phase?: 'governance' | 'planning';
+      phase?: 'governance' | 'planning' | 'staffing';
       accepted?: boolean;
     },
   ): Promise<ProjectRoleAssignment> {
     const { run, candidate, adminUserId, notes } = input;
     const phase = input.phase ?? 'planning';
     const roleKey = run.targetRoleKey!;
+    const project = await manager
+      .getRepository(Project)
+      .createQueryBuilder('project')
+      .setLock('pessimistic_write')
+      .where('project.id = :projectId', { projectId: run.projectId })
+      .getOne();
+    if (!project) throw new NotFoundException('Project not found');
     const profile = await manager
       .getRepository(FreelancerProfile)
       .createQueryBuilder('profile')
@@ -3041,10 +4019,6 @@ export class MatchingService {
       );
     }
 
-    const project = await manager.findOne(Project, {
-      where: { id: run.projectId },
-    });
-    if (!project) throw new NotFoundException('Project not found');
     const conflictingRole = await manager.findOne(ProjectRoleAssignment, {
       where: {
         projectId: run.projectId,
@@ -3098,7 +4072,9 @@ export class MatchingService {
     const compensation =
       phase === 'governance'
         ? this.principalReviewerCompensation(project, profile)
-        : this.assertPlanningCompensationCoverage(project, roleKey, profile);
+        : phase === 'staffing'
+          ? this.assertImplementationTeamCompensationCoverage(project)
+          : this.assertPlanningCompensationCoverage(project, roleKey);
 
     const existing = await manager.findOne(ProjectRoleAssignment, {
       where: {
@@ -3148,30 +4124,218 @@ export class MatchingService {
     projectId: string,
     adminUserId: string | null,
   ) {
+    const project = await manager
+      .getRepository(Project)
+      .createQueryBuilder('project')
+      .setLock('pessimistic_write')
+      .where('project.id = :projectId', { projectId })
+      .getOne();
+    if (!project) return false;
+    if (!MATCH_START_ALLOWED_STATUSES.has(project.status)) return false;
     const activeRoles = await manager
       .createQueryBuilder(ProjectRoleAssignment, 'a')
       .select('DISTINCT a.role_key', 'roleKey')
       .where('a.project_id = :projectId', { projectId })
-      .andWhere('a.phase = :phase', { phase: 'planning' })
+      .andWhere('a.phase IN (:...phases)', { phases: ['planning', 'staffing'] })
       .andWhere('a.status IN (:...statuses)', {
-        statuses: ASSIGNMENT_ACTIVE_STATUSES,
+        statuses: ['accepted', 'in_progress'],
       })
       .getRawMany<{ roleKey: string }>();
 
     const roleSet = new Set(activeRoles.map((row) => row.roleKey));
-    if (!PLANNING_ROLES.every((role) => roleSet.has(role))) return;
-
-    const project = await manager.findOne(Project, {
-      where: { id: projectId },
+    const requiredRoles = requiredPreFundingRoles();
+    if (!requiredRoles.every((role) => roleSet.has(role))) return false;
+    const reviewer = await manager.findOne(ProjectRoleAssignment, {
+      where: {
+        projectId,
+        phase: 'governance',
+        roleKey: PRINCIPAL_REVIEWER_ROLE,
+        status: In(['accepted', 'in_progress']),
+      },
     });
-    if (!project || project.status === ProjectStatus.PLANNING_ASSIGNED) return;
+    if (!reviewer) return false;
+    const pendingInvitation = await manager.exists(ProjectInvitation, {
+      where: { projectId, status: In(['pending', 'accepting']) },
+    });
+    if (pendingInvitation) return false;
+    if (project.status === ProjectStatus.READY_FOR_FUNDING) return false;
+
+    const capacity = await this.estimateImplementationCapacity(project);
+    project.implementationCapacitySnapshot = capacity;
+    if (capacity.status === 'unavailable') {
+      project.automationStatus = 'capacity_preflight_failed';
+      project.automationError = capacity.blockingReasons.join(' ');
+      project.automationErrorCategory = 'implementation_capacity';
+      project.automationErrorAt = new Date();
+      await manager.save(Project, project);
+      return false;
+    }
 
     await this.transitionProject(manager, project, adminUserId, {
-      status: ProjectStatus.PLANNING_ASSIGNED,
-      planningStatus: 'assigned',
-      reason: 'Both planning roles assigned.',
+      status: ProjectStatus.READY_FOR_FUNDING,
+      planningStatus: 'team_confirmed',
+      reason:
+        'The planning team accepted and estimated implementation capacity passed; planning funding is now enabled.',
       setAssignedAt: true,
     });
+    project.automationStatus = 'ready_for_funding';
+    project.automationError = null;
+    project.automationErrorCategory = null;
+    project.automationErrorAt = null;
+    await manager.save(Project, project);
+    return true;
+  }
+
+  private async estimateImplementationCapacity(project: Project) {
+    const allocation = implementationTeamRoleAllocation(
+      project.budgetAllocation,
+    );
+    const requiredPeople = Math.min(
+      5,
+      Math.max(1, Math.round(allocation?.people ?? 1)),
+    );
+    const minimumAvailability = this.minimumPlanningAvailability(
+      project,
+      'implementation_1',
+    );
+    const maxRate = Number(allocation?.maxHourlyRate);
+    const currency = project.quotedCurrency ?? project.currency;
+    const qb = this.buildProfileQuery({
+      minAvailabilityHours: minimumAvailability,
+    })
+      .andWhere('p.hourlyRate IS NOT NULL')
+      .andWhere(
+        `NOT EXISTS (
+          SELECT 1 FROM project_role_assignments capacity_assignment
+          WHERE capacity_assignment.freelancer_profile_id = p.id
+            AND capacity_assignment.project_id = :capacityProjectId
+            AND capacity_assignment.status IN ('assigned', 'accepted', 'in_progress')
+        )`,
+        { capacityProjectId: project.id },
+      )
+      .andWhere(
+        `NOT EXISTS (
+          SELECT 1 FROM project_tasks capacity_task
+          WHERE capacity_task.assigned_freelancer_profile_id = p.id
+            AND capacity_task.project_id = :capacityProjectId
+            AND capacity_task.status NOT IN ('done', 'cancelled')
+        )`,
+        { capacityProjectId: project.id },
+      )
+      .andWhere(
+        `NOT EXISTS (
+          SELECT 1 FROM project_invitations capacity_invitation
+          WHERE capacity_invitation.freelancer_profile_id = p.id
+            AND capacity_invitation.status IN ('pending', 'accepting')
+        )`,
+      )
+      .orderBy('p.id', 'ASC');
+
+    if (Number.isFinite(maxRate) && maxRate > 0) {
+      const converted = rateInCurrencySql(
+        'p.hourlyRate',
+        'p.hourlyRateCurrency',
+        currency,
+        'capacityFx',
+      );
+      qb.andWhere(`${converted.sql} IS NOT NULL`);
+      qb.andWhere(`${converted.sql} <= :capacityMaxRate`, {
+        capacityMaxRate: maxRate,
+        ...converted.params,
+      });
+    }
+
+    const profiles = await qb.getMany();
+    const workload = await this.getActiveWorkload(
+      profiles.map((profile) => profile.id),
+    );
+    const workable = profiles.filter((profile) => {
+      const activeTasks = workload.get(profile.id)?.tasks ?? 0;
+      const declaredHours = Math.max(0, profile.availabilityHoursPerWeek ?? 0);
+      const conservativeTaskCapacity = Math.max(
+        1,
+        Math.floor(declaredHours / 10),
+      );
+      return activeTasks < conservativeTaskCapacity;
+    });
+    const immediate = workable.filter(
+      (profile) => (workload.get(profile.id)?.tasks ?? 0) === 0,
+    );
+    const brief = await this.briefRepo.findOne({
+      where: { projectId: project.id },
+    });
+    const requiredSkills = (brief?.requiredSkills ?? '')
+      .split(/[,;\n]/)
+      .map((skill) => skill.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    const coveredSkills = requiredSkills.filter((required) => {
+      const normalized = required.toLowerCase();
+      return workable.some((profile) =>
+        (profile.skills ?? []).some((skill) => {
+          const candidate = skill.toLowerCase();
+          return (
+            candidate.includes(normalized) || normalized.includes(candidate)
+          );
+        }),
+      );
+    });
+    const blockingReasons: string[] = [];
+    if (workable.length < requiredPeople) {
+      blockingReasons.push(
+        `The estimate needs ${requiredPeople} implementation freelancer(s), but only ${workable.length} currently satisfy approval, availability, workload, and budget checks.`,
+      );
+    }
+    const skillsIncomplete =
+      requiredSkills.length > 0 && coveredSkills.length < requiredSkills.length;
+    const status =
+      workable.length < requiredPeople
+        ? 'unavailable'
+        : workable.length < requiredPeople * 2 || skillsIncomplete
+          ? 'at_risk'
+          : 'viable';
+    if (skillsIncomplete) {
+      blockingReasons.push(
+        `The current pool covers ${coveredSkills.length} of ${requiredSkills.length} estimated skill area(s); exact task matching may need more candidates.`,
+      );
+    }
+
+    return {
+      version: 1,
+      status,
+      checkedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      currency,
+      requiredPeople,
+      minimumAvailabilityHoursPerWeek: minimumAvailability,
+      maximumCompatibleHourlyRate:
+        Number.isFinite(maxRate) && maxRate > 0 ? maxRate : null,
+      eligibleCandidates: profiles.length,
+      workableCandidates: workable.length,
+      immediatelyAvailableCandidates: immediate.length,
+      requiredSkills,
+      coveredSkills,
+      blockingReasons,
+      disclaimer:
+        'This is a non-binding capacity preflight. Exact invitations are sent only after the approved Scrum plan creates concrete tasks.',
+    };
+  }
+
+  private async publishImplementationCapacityBlockIfNeeded(projectId: string) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+    });
+    if (
+      project?.automationStatus !== 'capacity_preflight_failed' ||
+      project.implementationCapacitySnapshot?.status !== 'unavailable'
+    ) {
+      return;
+    }
+    await this.markStaffingBlocked(
+      projectId,
+      project.automationError ??
+        'Estimated implementation capacity is currently unavailable.',
+    );
   }
 
   private async transitionProject(
@@ -3212,29 +4376,13 @@ export class MatchingService {
     }
   }
 
-  private affordablePlanningRate(
-    project: Project,
-    roleKey: string,
-  ): number | null {
-    const allocation =
-      roleKey === PRINCIPAL_REVIEWER_ROLE
-        ? principalReviewerRoleAllocation(project.budgetAllocation)
-        : planningRoleAllocation(project.budgetAllocation, roleKey);
-    const rate = Number(allocation?.maxHourlyRate);
-    if (Number.isFinite(rate) && rate > 0) return rate;
-    if (roleKey === PRINCIPAL_REVIEWER_ROLE) {
-      const legacyReviewerBudget = Number(project.quotedAmount) * 0.1;
-      const legacyRate = legacyReviewerBudget / 12;
-      return Number.isFinite(legacyRate) && legacyRate > 0 ? legacyRate : null;
-    }
-    return null;
-  }
-
   private minimumPlanningAvailability(project: Project, roleKey: string) {
     const allocation =
       roleKey === PRINCIPAL_REVIEWER_ROLE
         ? principalReviewerRoleAllocation(project.budgetAllocation)
-        : planningRoleAllocation(project.budgetAllocation, roleKey);
+        : staffingRoleBase(roleKey) === 'implementation'
+          ? implementationTeamRoleAllocation(project.budgetAllocation)
+          : planningRoleAllocation(project.budgetAllocation, roleKey);
     if (!allocation?.estimatedHours) return 1;
     const remainingWeeks = project.deadline
       ? Math.max(
@@ -3245,18 +4393,49 @@ export class MatchingService {
     return Math.max(1, Math.ceil(allocation.estimatedHours / remainingWeeks));
   }
 
-  private assertProjectFullyFunded(project: Project) {
+  private isProjectFullyFunded(project: Project) {
     const quote = Number(project.quotedAmount);
     const held = Number(project.heldAmount);
-    if (!Number.isFinite(quote) || quote <= 0 || !project.budgetAllocation) {
+    return Boolean(
+      Number.isFinite(quote) &&
+      quote > 0 &&
+      project.budgetAllocation &&
+      Number.isFinite(held) &&
+      held + 0.005 >= quote,
+    );
+  }
+
+  private assertPlanningFunded(project: Project) {
+    const funding = projectFundingBreakdown(project.budgetAllocation);
+    const held = Number(project.heldAmount);
+    const planningAmount = Number(funding?.planningAmount);
+    if (!funding || !Number.isFinite(planningAmount) || planningAmount <= 0) {
       throw new ConflictException(
         'Project compensation is not allocated yet. Confirm the brief and generate a valid quote before matching.',
       );
     }
-    if (!Number.isFinite(held) || held + 0.005 < quote) {
-      const remaining = Math.max(quote - (Number.isFinite(held) ? held : 0), 0);
+    if (!Number.isFinite(held) || held + 0.005 < planningAmount) {
+      const remaining = Math.max(
+        planningAmount - (Number.isFinite(held) ? held : 0),
+        0,
+      );
       throw new ConflictException(
-        `Matching requires fully funded escrow. Fund the remaining ${remaining.toFixed(2)} ${project.quotedCurrency ?? project.currency} before assigning freelancers.`,
+        `Exact implementation matching requires the paid planning package. Fund the remaining ${remaining.toFixed(2)} ${project.quotedCurrency ?? project.currency} planning balance first.`,
+      );
+    }
+  }
+
+  private assertProjectReadyForStaffing(project: Project) {
+    const quote = Number(project.quotedAmount);
+    if (
+      !Number.isFinite(quote) ||
+      quote <= 0 ||
+      !project.budgetAllocation ||
+      project.quoteStatus === 'not_ready' ||
+      project.quoteStatus === 'out_of_budget'
+    ) {
+      throw new ConflictException(
+        'Confirm a feasible fixed project quote before team matching starts.',
       );
     }
   }
@@ -3264,7 +4443,6 @@ export class MatchingService {
   private assertPlanningCompensationCoverage(
     project: Project,
     roleKey: string,
-    profile: FreelancerProfile,
   ) {
     const allocation = planningRoleAllocation(
       project.budgetAllocation,
@@ -3275,22 +4453,32 @@ export class MatchingService {
         `No compensation allocation exists for the ${roleKey} role`,
       );
     }
-    const hourlyRate = Number(profile.hourlyRate);
-    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
+    const amount = Number(allocation.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
       throw new ConflictException(
-        'The selected freelancer must set a positive hourly rate before the system can verify budget coverage',
+        `The ${roleKey} fixed-package offer is invalid`,
+      );
+    }
+    return {
+      amount: allocation.amount,
+      currency: project.quotedCurrency ?? project.currency,
+      estimatedHours: allocation.estimatedHours,
+    };
+  }
+
+  private assertImplementationTeamCompensationCoverage(project: Project) {
+    const allocation = implementationTeamRoleAllocation(
+      project.budgetAllocation,
+    );
+    if (!allocation) {
+      throw new ConflictException(
+        'No implementation-team package allocation exists for this project',
       );
     }
     const amount = Number(allocation.amount);
-    const expectedCost = hourlyRate * allocation.estimatedHours;
-    if (expectedCost > amount + 0.005) {
-      const currentTotal = Number(project.quotedAmount) || 0;
-      const requiredTotal =
-        amount > 0
-          ? Math.ceil(((expectedCost * currentTotal) / amount) * 100) / 100
-          : expectedCost;
+    if (!Number.isFinite(amount) || amount <= 0) {
       throw new ConflictException(
-        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the role allocation of ${allocation.amount}. Increase the project total to at least ${requiredTotal.toFixed(2)} (an increase of ${(requiredTotal - currentTotal).toFixed(2)}) or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
+        'The implementation fixed-package offer is invalid',
       );
     }
     return {
@@ -3321,11 +4509,6 @@ export class MatchingService {
         'The principal reviewer must have an approved reviewer-specific hourly rate',
       );
     }
-    if (rate * estimatedHours > amount + 0.005) {
-      throw new ConflictException(
-        `The principal reviewer exceeds the allocated governance budget of ${amount.toFixed(2)} ${project.quotedCurrency ?? project.currency}`,
-      );
-    }
     return {
       amount: amount.toFixed(2),
       currency: project.quotedCurrency ?? project.currency,
@@ -3333,11 +4516,7 @@ export class MatchingService {
     };
   }
 
-  private assertTaskCompensationCoverage(
-    task: ProjectTask,
-    profile: FreelancerProfile,
-    project: Project,
-  ) {
+  private assertTaskCompensationCoverage(task: ProjectTask) {
     const amount = Number(task.budgetAmount);
     const hours = Number(task.estimatedHours);
     if (
@@ -3351,35 +4530,9 @@ export class MatchingService {
         'Task compensation and estimated hours must be allocated before assignment',
       );
     }
-    const hourlyRate = Number(profile.hourlyRate);
-    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
-      throw new ConflictException(
-        'The selected freelancer must set a positive hourly rate before the system can verify task budget coverage',
-      );
-    }
-    const hourlyRateInTaskCurrency = convertAmount(
-      hourlyRate,
-      profile.hourlyRateCurrency,
-      task.currency,
-    );
-    if (
-      hourlyRateInTaskCurrency == null ||
-      !Number.isFinite(hourlyRateInTaskCurrency) ||
-      hourlyRateInTaskCurrency <= 0
-    ) {
-      throw new ConflictException(
-        `No exchange rate is configured from ${normalizeCurrency(profile.hourlyRateCurrency)} to ${normalizeCurrency(task.currency)}. Configure it before assigning this task.`,
-      );
-    }
-    const expectedCost = hourlyRateInTaskCurrency * hours;
-    if (expectedCost <= amount + 0.005) return;
-
-    const currentTotal = Number(project.quotedAmount) || amount * 2;
-    const requiredTotal =
-      Math.ceil(((expectedCost * currentTotal) / amount) * 100) / 100;
-    throw new ConflictException(
-      `The selected freelancer is expected to cost ${expectedCost.toFixed(2)} ${task.currency}, above this task's ${amount.toFixed(2)} allocation. Increase the project total to about ${requiredTotal.toFixed(2)} ${task.currency} (an increase of ${(requiredTotal - currentTotal).toFixed(2)}) or choose a freelancer within ${this.affordableTaskRate(task)?.toFixed(2)}/hour.`,
-    );
+    // The freelancer is accepting a fixed task package. Their assessed hourly
+    // rate remains a ranking/rate-fit signal, but multiplying it by estimated
+    // hours must not silently rewrite or reject the agreed package offer.
   }
 
   // Approved, available freelancers, narrowed by the admin's explicit filters.
@@ -3390,8 +4543,7 @@ export class MatchingService {
       .leftJoinAndSelect('p.user', 'u')
       .where('p.verificationStatus = :approved', { approved: 'approved' })
       .andWhere('p.deletedAt IS NULL')
-      .andWhere('p.isAvailable = true')
-      .andWhere("NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL");
+      .andWhere('p.isAvailable = true');
 
     if (filters?.minAvailabilityHours != null) {
       qb.andWhere('COALESCE(p.availabilityHoursPerWeek, 0) >= :minAvail', {
@@ -3421,17 +4573,10 @@ export class MatchingService {
     project: Project,
     maxRate: number | null,
     minimumAvailability: number,
-    survivedSqlFilters: number,
-    requiredRoleSkills: string[],
   ): Promise<string> {
     const currency = project.quotedCurrency ?? project.currency ?? '';
     const rateLabel =
       maxRate != null ? `${maxRate.toFixed(2)} ${currency}/hour`.trim() : null;
-
-    // The SQL filters passed but the in-memory skills filter rejected everyone.
-    if (survivedSqlFilters > 0) {
-      return `No ${roleKey} freelancer matches the required role skills (${requiredRoleSkills.join(', ')}). ${survivedSqlFilters} otherwise-eligible profile(s) were rejected on skills alone.`;
-    }
 
     const count = async (where: string, params: Record<string, unknown> = {}) =>
       this.profileRepo.createQueryBuilder('p').where(where, params).getCount();
@@ -3450,19 +4595,12 @@ export class MatchingService {
       return `All ${approved} approved freelancer(s) are marked unavailable, so ${roleKey} cannot be staffed.`;
     }
 
-    const withGithub = await count(
-      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL",
-    );
-    if (!withGithub) {
-      return `None of the ${available} available approved freelancer(s) has a GitHub username, which matching requires. Add one to their profile before matching ${roleKey}.`;
-    }
-
     const withHours = await count(
-      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL AND COALESCE(p.availabilityHoursPerWeek, 0) >= :hours",
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND COALESCE(p.availabilityHoursPerWeek, 0) >= :hours",
       { hours: minimumAvailability },
     );
     if (!withHours) {
-      return `None of the ${withGithub} eligible freelancer(s) has the ${minimumAvailability} availability hours/week this ${roleKey} role needs.`;
+      return `None of the ${available} eligible freelancer(s) has the ${minimumAvailability} availability hours/week this ${roleKey} role needs.`;
     }
 
     if (roleKey === PRINCIPAL_REVIEWER_ROLE) {
@@ -3476,10 +4614,28 @@ export class MatchingService {
     }
 
     if (rateLabel) {
-      const withinRate = await count(
-        "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL AND COALESCE(p.availabilityHoursPerWeek, 0) >= :hours AND p.hourlyRate IS NOT NULL AND p.hourlyRate <= :rate",
-        { hours: minimumAvailability, rate: maxRate },
+      const converted = rateInCurrencySql(
+        'p.hourlyRate',
+        'p.hourlyRateCurrency',
+        project.quotedCurrency ?? project.currency,
+        'candidateDiagnosisFx',
       );
+      const withinRate = await this.profileRepo
+        .createQueryBuilder('p')
+        .where(
+          "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true",
+        )
+        .andWhere(
+          'COALESCE(p.availabilityHoursPerWeek, 0) >= :diagnosisHours',
+          { diagnosisHours: minimumAvailability },
+        )
+        .andWhere('p.hourlyRate IS NOT NULL')
+        .andWhere(`${converted.sql} IS NOT NULL`)
+        .andWhere(`${converted.sql} <= :diagnosisRate`, {
+          diagnosisRate: maxRate,
+          ...converted.params,
+        })
+        .getCount();
       if (!withinRate) {
         return `None of the ${withHours} eligible freelancer(s) charges within the allocated maximum of ${rateLabel}. Increase the budget or lower the rate expectation for ${roleKey}.`;
       }
@@ -3497,7 +4653,6 @@ export class MatchingService {
     task: ProjectTask,
     project: Project,
     maxRate: number | null,
-    skills: string[],
   ): Promise<string> {
     const currency = project.quotedCurrency ?? project.currency ?? '';
     const rateLabel =
@@ -3507,11 +4662,11 @@ export class MatchingService {
       this.profileRepo.createQueryBuilder('p').where(where, params).getCount();
 
     const base =
-      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true AND NULLIF(BTRIM(p.githubUsername), '') IS NOT NULL";
+      "p.verificationStatus = 'approved' AND p.deletedAt IS NULL AND p.isAvailable = true";
 
     const eligible = await count(base);
     if (!eligible) {
-      return `No approved, available freelancer with a GitHub username exists, so "${task.title}" cannot be staffed.`;
+      return `No approved, available freelancer exists, so "${task.title}" cannot be staffed.`;
     }
 
     const free = await count(
@@ -3526,21 +4681,23 @@ export class MatchingService {
       return `All ${eligible} eligible freelancer(s) already hold a role on this project, so nobody is free for "${task.title}". Add another approved freelancer.`;
     }
 
-    if (skills.length) {
-      const withSkills = await count(
-        `${base} AND EXISTS (SELECT 1 FROM unnest(p.skills) sk WHERE lower(sk) = ANY(:taskSkills))`,
-        { taskSkills: skills.map((skill) => skill.toLowerCase()) },
-      );
-      if (!withSkills) {
-        return `No freelancer has any of the skills "${task.title}" requires (${skills.join(', ')}). ${eligible} eligible profile(s) were checked.`;
-      }
-    }
-
     if (rateLabel) {
-      const affordable = await count(
-        `${base} AND p.hourlyRate IS NOT NULL AND p.hourlyRate <= :rate`,
-        { rate: maxRate },
+      const converted = rateInCurrencySql(
+        'p.hourlyRate',
+        'p.hourlyRateCurrency',
+        project.quotedCurrency ?? project.currency,
+        'taskDiagnosisFx',
       );
+      const affordable = await this.profileRepo
+        .createQueryBuilder('p')
+        .where(base)
+        .andWhere('p.hourlyRate IS NOT NULL')
+        .andWhere(`${converted.sql} IS NOT NULL`)
+        .andWhere(`${converted.sql} <= :diagnosisRate`, {
+          diagnosisRate: maxRate,
+          ...converted.params,
+        })
+        .getCount();
       if (!affordable) {
         return `No eligible freelancer charges within the ${rateLabel}/hour allocated to "${task.title}". Increase the task budget.`;
       }
@@ -3558,12 +4715,9 @@ export class MatchingService {
     const filters = dto.filters;
     const qb = this.buildProfileQuery(filters);
 
-    // Budget-aware rate cap: only match freelancers the budget can afford. An
-    // explicit admin maxHourlyRate wins; otherwise derive one from the budget.
-    const maxRate = this.effectiveRateCap(
-      filters?.maxHourlyRate ?? null,
-      this.affordablePlanningRate(project, roleKey),
-    );
+    // Rate is a ranking signal for fixed-package work. Only an explicit admin
+    // override is a hard cap; the package is not reconstructed as hours × rate.
+    const maxRate = filters?.maxHourlyRate ?? null;
     const cappedQb = qb.clone();
     cappedQb.andWhere(
       `NOT EXISTS (
@@ -3647,20 +4801,23 @@ export class MatchingService {
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
     const fetchedProfiles = await cappedQb.take(poolCap).getMany();
     const requiredRoleSkills = PLANNING_ROLE_SKILLS[roleKey] ?? [];
-    const profiles = requiredRoleSkills.length
-      ? fetchedProfiles.filter((profile) => {
-          const skills = (profile.skills ?? []).map((skill) =>
-            skill.toLowerCase(),
+    // Skills are a ranking signal, not a hard gate. This preserves exact
+    // matches at the top while still allowing strong adjacent-skill and lower
+    // acceptable candidates to act as invitation fallbacks.
+    const profiles = [...fetchedProfiles].sort((left, right) => {
+      const overlap = (profile: FreelancerProfile) => {
+        const skills = (profile.skills ?? []).map((skill) =>
+          skill.toLowerCase(),
+        );
+        return requiredRoleSkills.filter((required) => {
+          const normalized = required.toLowerCase();
+          return skills.some(
+            (skill) => skill.includes(normalized) || normalized.includes(skill),
           );
-          return requiredRoleSkills.some((required) => {
-            const normalized = required.toLowerCase();
-            return skills.some(
-              (skill) =>
-                skill.includes(normalized) || normalized.includes(skill),
-            );
-          });
-        })
-      : fetchedProfiles;
+        }).length;
+      };
+      return overlap(right) - overlap(left);
+    });
 
     if (!profiles.length) {
       // The old message named skills, rate and availability whatever the real
@@ -3673,8 +4830,6 @@ export class MatchingService {
           project,
           maxRate,
           minimumAvailability,
-          fetchedProfiles.length,
-          requiredRoleSkills,
         ),
       );
     }
@@ -3698,9 +4853,9 @@ export class MatchingService {
     };
   }
 
-  // Same idea as the planning pool, but narrowed to one implementation task:
-  // rate is capped by what the implementation budget affords per hour, and the
-  // pool is prefiltered in SQL on the task's required skills.
+  // Same idea as the planning pool, but narrowed to one implementation task.
+  // The fixed task allocation supplies a compatibility rate cap; skills remain
+  // ranking evidence so strong adjacent candidates can serve as fallbacks.
   private async buildTaskCandidatePool(
     task: ProjectTask,
     filters: PlanningMatchingFiltersDto | undefined,
@@ -3711,9 +4866,6 @@ export class MatchingService {
     });
     if (!project) throw new NotFoundException('Project not found');
     const qb = this.buildProfileQuery(filters);
-    const skills = filters?.skills?.length
-      ? filters.skills
-      : (task.requiredSkills ?? []);
 
     const narrowedQb = qb.clone();
     narrowedQb.andWhere(
@@ -3748,12 +4900,8 @@ export class MatchingService {
         ...taskConverted.params,
       });
     }
-    if (skills.length) {
-      narrowedQb.andWhere(
-        `EXISTS (SELECT 1 FROM unnest(p.skills) sk WHERE lower(sk) = ANY(:taskSkills))`,
-        { taskSkills: skills.map((skill) => skill.toLowerCase()) },
-      );
-    }
+    // Do not hard-filter by exact skills. The reranker scores exact, strong and
+    // acceptable related-skill candidates and keeps the latter as fallbacks.
 
     const poolCap = filters?.limit ? Math.min(filters.limit * 4, 100) : 60;
     const profiles = await narrowedQb.take(poolCap).getMany();
@@ -3761,7 +4909,7 @@ export class MatchingService {
       // Name the filter that actually emptied the pool. This path kept the old
       // blame-everything message after #19 fixed the planning path.
       throw new ConflictException(
-        await this.explainEmptyTaskPool(task, project, maxRate, skills),
+        await this.explainEmptyTaskPool(task, project, maxRate),
       );
     }
 
@@ -3931,24 +5079,6 @@ export class MatchingService {
         `Recovered ${result.affected} stale implementation matching run(s) for project ${projectId}`,
       );
     }
-  }
-
-  private affordableTaskRate(task: ProjectTask): number | null {
-    const amount = Number(task.budgetAmount);
-    const hours = Number(task.estimatedHours);
-    if (!Number.isFinite(amount) || amount <= 0 || !hours || hours <= 0) {
-      return null;
-    }
-    return Math.floor((amount / hours) * 100) / 100;
-  }
-
-  private effectiveRateCap(
-    requested: number | null | undefined,
-    allocated: number | null | undefined,
-  ) {
-    if (requested == null) return allocated ?? null;
-    if (allocated == null) return requested;
-    return Math.min(requested, allocated);
   }
 
   private briefText(brief: Brief | null) {

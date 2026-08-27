@@ -258,7 +258,7 @@ export type EvaluateSubmissionRubricItem = {
   key?: string;
   criterion: string;
   category?: string;
-  status: 'met' | 'not_applicable' | 'unmet';
+  status: 'met' | 'not_applicable' | 'unmet' | 'unverified';
   met: boolean;
   evidence: string;
 };
@@ -707,67 +707,13 @@ export class AiService {
     source: ProjectQuoteResult['source'],
   ): ProjectQuoteResult {
     const fallback = this.getFallbackProjectQuoteResult(dto, source);
-    const { max } = this.getQuoteBudgetRange(dto.project);
-    const requiredRoles = [
-      'principal_reviewer',
-      'architect',
-      'ui_ux',
-      'implementation',
-    ];
-    const roleEstimateMap = new Map(
-      fallback.roleEstimates.map((role) => [role.roleKey, role]),
-    );
-    if (Array.isArray(result.roleEstimates)) {
-      for (const value of result.roleEstimates) {
-        const role = this.asRecord(value);
-        const roleKey = this.optionalString(role.roleKey);
-        const peopleValue = this.toNumber(role.people);
-        const hoursEachValue = this.toNumber(role.hoursEach);
-        const hourlyRate = this.toNumber(role.hourlyRate);
-        if (
-          !roleKey ||
-          !requiredRoles.includes(roleKey) ||
-          !peopleValue ||
-          peopleValue <= 0 ||
-          !hoursEachValue ||
-          hoursEachValue <= 0 ||
-          !hourlyRate ||
-          hourlyRate <= 0
-        ) {
-          continue;
-        }
-        const people = Math.max(1, Math.round(peopleValue));
-        const hoursEach = Math.max(1, Math.round(hoursEachValue));
-        roleEstimateMap.set(roleKey, {
-          roleKey,
-          people,
-          hoursEach,
-          hourlyRate: this.roundMoney(hourlyRate),
-          subtotal: this.roundMoney(people * hoursEach * hourlyRate),
-        });
-      }
-    }
-    const roleEstimates = requiredRoles.map((roleKey) =>
-      roleEstimateMap.get(roleKey)!,
-    );
-    const laborMinimum = this.roundMoney(
-      roleEstimates.reduce((sum, role) => sum + role.subtotal, 0) / 0.9,
-    );
-    const recommendedMinimum = this.roundMoney(
-      Math.max(laborMinimum, fallback.recommendedMinimum),
-    );
-    const amount = recommendedMinimum;
-    const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
-
+    // Financial values are deliberately owned by the deterministic fixed-price
+    // package calculator below. LLM-proposed hours and rates made identical
+    // scopes look formulaic, and occasional employment/agency-rate anchoring
+    // produced wildly inflated totals. The model may enrich the explanation and
+    // evidence, but it cannot move the customer-facing price.
     return {
-      amount,
-      recommendedMinimum,
-      budgetGap,
-      roleEstimates,
-      currency:
-        this.optionalString(result.currency)?.toUpperCase().slice(0, 3) ??
-        fallback.currency,
-      quoteStatus: budgetGap > 0 ? 'out_of_budget' : 'pending_customer',
+      ...fallback,
       confidence: this.clampQuoteConfidence(
         this.toNumber(result.confidence) ?? fallback.confidence,
       ),
@@ -800,6 +746,31 @@ export class AiService {
     const featureCount = this.countQuoteItems(brief.coreFeatures);
     const platformCount = Math.max(1, this.countQuoteItems(brief.platforms));
     const deliverableCount = this.countQuoteItems(brief.deliverables);
+    const scopeValues: unknown[] = [
+      brief.solutionType,
+      brief.scopeDetails,
+      brief.integrations,
+      brief.adminNeeds,
+      brief.coreFeatures,
+      brief.platforms,
+    ];
+    const scopeText = scopeValues
+      .flatMap((value): unknown[] =>
+        Array.isArray(value) ? (value as unknown[]) : [value],
+      )
+      .map((value) => this.quoteScopeText(value).toLowerCase())
+      .join(' ');
+    const pageCount = this.quoteScopeCount(scopeText);
+    const nativeApp =
+      /\b(?:mobile app|native app|ios|android|flutter|react native)\b/i.test(
+        scopeText,
+      );
+    const hasAdmin =
+      !this.quoteExplicitNone(brief.adminNeeds) &&
+      /\b(?:admin|dashboard|back[ -]?office|cms|manage)\b/i.test(scopeText);
+    const integrationCount = this.quoteExplicitNone(brief.integrations)
+      ? 0
+      : this.countQuoteItems(brief.integrations);
     const teamSize =
       this.toNumber(brief.suggestedTeamSize) ??
       (planningComplexity === 'trivial' ? 1 : 2);
@@ -819,45 +790,116 @@ export class AiService {
         : complexityScore >= 0.45
           ? 'medium'
           : 'low';
-    const complexityKey =
-      planningComplexity === 'trivial'
-        ? 'trivial'
-        : complexity === 'high'
-          ? 'complex'
+    const minimalWebsite =
+      /\b(?:landing page|single[ -]?page|static website)\b/i.test(scopeText) &&
+      !nativeApp &&
+      !hasAdmin &&
+      integrationCount === 0;
+    const smallWebsite =
+      !nativeApp &&
+      !hasAdmin &&
+      integrationCount <= 1 &&
+      featureCount <= 6 &&
+      (pageCount === 0 || pageCount <= 8) &&
+      /\b(?:website|portfolio|marketing|landing)\b/i.test(scopeText);
+    const scopeTier = minimalWebsite
+      ? 'trivial'
+      : planningComplexity === 'complex' || complexity === 'high'
+        ? 'complex'
+        : smallWebsite
+          ? 'small'
           : 'standard';
-    const workers = Math.max(1, Math.min(8, Math.round(teamSize)));
-    const hours = {
-      trivial: { reviewer: 2, architect: 2, uiux: 2, implementation: 8 },
-      standard: { reviewer: 12, architect: 16, uiux: 18, implementation: 160 },
-      complex: { reviewer: 28, architect: 36, uiux: 40, implementation: 480 },
-    }[complexityKey];
-    const rates = {
-      reviewer: this.marketRate('MARKET_RATE_PRINCIPAL_REVIEWER', 650),
-      architect: this.marketRate('MARKET_RATE_ARCHITECT', 550),
-      uiux: this.marketRate('MARKET_RATE_UI_UX', 450),
-      implementation: this.marketRate('MARKET_RATE_DEVELOPER', 400),
-    };
+    const workers = Math.max(
+      1,
+      Math.min(
+        scopeTier === 'complex' ? 5 : scopeTier === 'standard' ? 3 : 1,
+        Math.round(teamSize),
+      ),
+    );
+    const effort = {
+      trivial: { reviewer: 1, architect: 1, uiux: 2, implementation: 8 },
+      small: { reviewer: 2, architect: 3, uiux: 6, implementation: 32 },
+      standard: { reviewer: 6, architect: 10, uiux: 12, implementation: 96 },
+      complex: { reviewer: 14, architect: 24, uiux: 28, implementation: 260 },
+    }[scopeTier];
+    const usdBase = {
+      trivial: 85,
+      small: 240,
+      standard: 650,
+      complex: 1_600,
+    }[scopeTier];
+    const usdVariable =
+      Math.max(featureCount - 1, 0) *
+        { trivial: 4, small: 10, standard: 28, complex: 55 }[scopeTier] +
+      Math.max(pageCount - (scopeTier === 'trivial' ? 1 : 3), 0) *
+        { trivial: 3, small: 12, standard: 24, complex: 38 }[scopeTier] +
+      integrationCount *
+        { trivial: 0, small: 25, standard: 65, complex: 110 }[scopeTier] +
+      (hasAdmin
+        ? { trivial: 0, small: 50, standard: 130, complex: 220 }[scopeTier]
+        : 0) +
+      (nativeApp ? (scopeTier === 'complex' ? 350 : 190) : 0) +
+      Math.max(platformCount - 1, 0) * (scopeTier === 'complex' ? 220 : 90);
+    const deadlineMultiplier = 1 + Math.min(deadlinePressure, 0.12);
+    const currency =
+      this.optionalString(project.currency)?.toUpperCase().slice(0, 3) ?? 'EGP';
+    const recommendedMinimum = this.roundMoney(
+      (usdBase + usdVariable) *
+        deadlineMultiplier *
+        this.quoteCurrencyPerUsd(currency),
+    );
+    const shares = {
+      trivial: {
+        reviewer: 0.12,
+        architect: 0.1,
+        uiux: 0.13,
+        implementation: 0.55,
+      },
+      small: {
+        reviewer: 0.1,
+        architect: 0.12,
+        uiux: 0.18,
+        implementation: 0.5,
+      },
+      standard: {
+        reviewer: 0.1,
+        architect: 0.15,
+        uiux: 0.15,
+        implementation: 0.5,
+      },
+      complex: {
+        reviewer: 0.12,
+        architect: 0.18,
+        uiux: 0.16,
+        implementation: 0.44,
+      },
+    }[scopeTier];
     const roleEstimates = [
-      this.quoteRoleEstimate(
+      this.quoteFixedRoleEstimate(
         'principal_reviewer',
         1,
-        hours.reviewer,
-        rates.reviewer,
+        effort.reviewer,
+        recommendedMinimum * shares.reviewer,
       ),
-      this.quoteRoleEstimate('architect', 1, hours.architect, rates.architect),
-      this.quoteRoleEstimate('ui_ux', 1, hours.uiux, rates.uiux),
-      this.quoteRoleEstimate(
+      this.quoteFixedRoleEstimate(
+        'architect',
+        1,
+        effort.architect,
+        recommendedMinimum * shares.architect,
+      ),
+      this.quoteFixedRoleEstimate(
+        'ui_ux',
+        1,
+        effort.uiux,
+        recommendedMinimum * shares.uiux,
+      ),
+      this.quoteFixedRoleEstimate(
         'implementation',
         workers,
-        Math.ceil(hours.implementation / workers),
-        rates.implementation,
+        Math.ceil(effort.implementation / workers),
+        recommendedMinimum * shares.implementation,
       ),
     ];
-    const laborTotal = roleEstimates.reduce(
-      (sum, role) => sum + role.subtotal,
-      0,
-    );
-    const recommendedMinimum = this.roundMoney(laborTotal / 0.9);
     const amount = recommendedMinimum;
     const budgetGap = this.roundMoney(Math.max(recommendedMinimum - max, 0));
 
@@ -866,23 +908,22 @@ export class AiService {
       recommendedMinimum,
       budgetGap,
       roleEstimates,
-      currency:
-        this.optionalString(project.currency)?.toUpperCase().slice(0, 3) ??
-        'EGP',
+      currency,
       quoteStatus: budgetGap > 0 ? 'out_of_budget' : 'pending_customer',
       confidence: source === 'fastapi' ? 0.75 : 0.58,
       complexity,
       rationale:
-        'Final price estimated from role hours and assessed market-rate assumptions before comparing it with the customer budget.',
+        'Fixed-scope freelance package estimate based on the confirmed product scope; internal effort assumptions only divide the package among the delivery roles.',
       assumptions: [
         'The first release follows the confirmed brief without major scope expansion.',
         'Architecture and UI/UX planning are included at a depth proportional to the confirmed scope.',
-        'Escrow funding starts the matching and planning workflow.',
+        'The customer funds a paid planning package only after the reviewer, planning team, and implementation-capacity preflight are ready; the implementation balance is charged later, after exact task staffing.',
       ],
       pricingSignals: [
         `${featureCount || 'Several'} core feature area(s) captured in the brief.`,
         `${platformCount} platform target(s) included.`,
-        `Estimated complexity: ${complexity}.`,
+        `Scope package: ${scopeTier}; estimated complexity: ${complexity}.`,
+        'The customer budget was not used to calculate the package price.',
       ],
       sources: [
         'https://khamsat.com/programming',
@@ -900,26 +941,84 @@ export class AiService {
     return { min, max };
   }
 
-  private marketRate(name: string, fallback: number) {
-    const configured = Number(process.env[name]);
-    return Number.isFinite(configured) && configured > 0
-      ? configured
-      : fallback;
-  }
-
-  private quoteRoleEstimate(
+  private quoteFixedRoleEstimate(
     roleKey: string,
     people: number,
     hoursEach: number,
-    hourlyRate: number,
+    packageAmount: number,
   ) {
+    const subtotal = this.roundMoney(packageAmount);
     return {
       roleKey,
       people,
       hoursEach,
-      hourlyRate,
-      subtotal: this.roundMoney(people * hoursEach * hourlyRate),
+      // Kept only as an internal compatibility snapshot for allocation and
+      // payout coverage. It is derived from the fixed package share and is not
+      // an input to the customer quote.
+      hourlyRate: this.roundMoney(subtotal / (people * hoursEach)),
+      subtotal,
     };
+  }
+
+  private quoteCurrencyPerUsd(currency: string) {
+    if (currency === 'USD') return 1;
+    const configured = new Map<string, number>();
+    for (const entry of (process.env.CURRENCY_RATES_PER_USD ?? '').split(',')) {
+      const [code, rawRate] = entry.split(':');
+      const rate = Number(rawRate);
+      if (code?.trim() && Number.isFinite(rate) && rate > 0) {
+        configured.set(code.trim().toUpperCase(), rate);
+      }
+    }
+    return (
+      configured.get(currency) ??
+      ({ EGP: 48.5, EUR: 0.92, GBP: 0.79 } as Record<string, number>)[
+        currency
+      ] ??
+      1
+    );
+  }
+
+  private quoteExplicitNone(value: unknown) {
+    const text = Array.isArray(value)
+      ? (value as unknown[])
+          .map((entry) => this.quoteScopeText(entry))
+          .join(' ')
+      : this.quoteScopeText(value);
+    return (
+      /^(?:\s*|none|no|not needed|n\/a)$/i.test(text.trim()) ||
+      /\bno integrations?\b/i.test(text) ||
+      /\bno admin(?: dashboard| area)?\b/i.test(text)
+    );
+  }
+
+  private quoteScopeText(value: unknown) {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    return '';
+  }
+
+  private quoteScopeCount(text: string) {
+    const numeric = text.match(/\b(\d+)\s+(?:pages?|screens?|sections?)\b/i);
+    if (numeric) return Number(numeric[1]);
+    const words: Record<string, number> = {
+      one: 1,
+      two: 2,
+      three: 3,
+      four: 4,
+      five: 5,
+      six: 6,
+      seven: 7,
+      eight: 8,
+      nine: 9,
+      ten: 10,
+    };
+    const written = text.match(
+      /\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:pages?|screens?|sections?)\b/i,
+    );
+    return written ? words[written[1].toLowerCase()] : 0;
   }
 
   private roundMoney(value: number) {
@@ -1528,13 +1627,17 @@ export class AiService {
     source: EvaluateSubmissionResult['source'],
   ): EvaluateSubmissionResult {
     const rubric = this.normalizeEvaluationRubric(result.rubric);
+    const unverified = rubric.filter((item) => item.status === 'unverified');
+    const blocking = rubric.filter(
+      (item) => !item.met && item.status !== 'unverified',
+    );
     const passed =
-      result.passed === true &&
       rubric.length > 0 &&
-      rubric.every((item) => item.met);
+      blocking.length === 0 &&
+      (result.passed === true || unverified.length > 0);
     const revisionRequested =
-      result.revisionRequested === true ||
-      (!passed && rubric.some((item) => !item.met));
+      blocking.length > 0 ||
+      (result.revisionRequested === true && unverified.length === 0);
 
     return {
       passed,
@@ -1542,13 +1645,14 @@ export class AiService {
         ? this.clampScore(this.toNumber(result.score) ?? 0)
         : Math.min(69, this.clampScore(this.toNumber(result.score) ?? 0)),
       revisionRequested,
-      revisionNotes:
-        this.optionalString(result.revisionNotes) ??
-        (revisionRequested
-          ? 'Revision requested. See rubric for unmet criteria.'
-          : ''),
+      revisionNotes: revisionRequested
+        ? (this.optionalString(result.revisionNotes) ??
+          'Revision requested. See rubric for unmet criteria.')
+        : '',
       requiresHumanReview:
-        result.requiresHumanReview === true || rubric.length === 0,
+        result.requiresHumanReview === true ||
+        rubric.length === 0 ||
+        unverified.length > 0,
       rubric,
       findings: this.toStringArray(result.findings),
       risks: this.toStringArray(result.risks),
@@ -1564,9 +1668,11 @@ export class AiService {
       const status: EvaluateSubmissionRubricItem['status'] =
         returnedStatus === 'not_applicable'
           ? 'not_applicable'
-          : returnedStatus === 'met' || item.met === true
-            ? 'met'
-            : 'unmet';
+          : returnedStatus === 'unverified'
+            ? 'unverified'
+            : returnedStatus === 'met' || item.met === true
+              ? 'met'
+              : 'unmet';
       return {
         key: this.optionalString(item.key) ?? undefined,
         criterion:
@@ -1575,7 +1681,7 @@ export class AiService {
         status,
         // Keep the compatibility boolean true for a justified N/A row so old
         // consumers do not turn it into a revision.
-        met: status !== 'unmet',
+        met: status === 'met' || status === 'not_applicable',
         evidence: this.optionalString(item.evidence) ?? '',
       };
     });

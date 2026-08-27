@@ -19,6 +19,7 @@ const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_IN_PROGRESS,
   ProjectStatus.PLANNING_REVIEW,
   ProjectStatus.IMPLEMENTATION_READY,
+  ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
   ProjectStatus.MATCHED,
   ProjectStatus.SPEC_IN_PROGRESS,
   ProjectStatus.SPEC_UNDER_REVIEW,

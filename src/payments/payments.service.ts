@@ -12,6 +12,7 @@ import { DataSource, In, Not, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import Stripe from 'stripe';
 import { UserRole } from 'src/common/enums/user-role.enum';
+import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
@@ -22,10 +23,6 @@ import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assign
 import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
-import {
-  planningRoleAllocation,
-  principalReviewerRoleAllocation,
-} from 'src/planning/project-budget-allocation';
 import { CreateEscrowIntentDto } from './dtos/create-escrow-intent.dto';
 import { ReleasePaymentDto } from './dtos/release-payment.dto';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
@@ -33,6 +30,7 @@ import { ProjectPayment } from './entities/project-payment.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { StripeWebhookEvent } from './entities/stripe-webhook-event.entity';
 import { ParsedStripeWebhookEvent, StripeService } from './stripe.service';
+import { projectFundingBreakdown } from 'src/planning/project-budget-allocation';
 
 type ConnectedStripeAccount = Stripe.Account | Stripe.V2.Core.Account;
 type StripeConnectOnboardingUrls = {
@@ -555,7 +553,7 @@ export class PaymentsService {
     const stripeCustomerId = await this.ensureStripeCustomer(user);
     const currency = this.normalizedCurrency(dto.currency || project.currency);
     const amount = allowedAmount.toFixed(2);
-    const payment = this.paymentsRepository.create({
+    const savedPayment = await this.reserveEscrowPayment({
       projectId,
       milestoneId: dto.milestoneId ?? null,
       customerId: userId,
@@ -567,23 +565,34 @@ export class PaymentsService {
         source: 'stripe_payment_intent',
       },
     });
-
-    const savedPayment = await this.paymentsRepository.save(payment);
-    const paymentIntent = await this.stripeService.createPaymentIntent({
-      amount: this.toMinorUnits(allowedAmount, currency),
-      currency: currency.toLowerCase(),
-      customer: stripeCustomerId,
-      automatic_payment_methods: {
-        enabled: true,
-      },
-      metadata: {
-        projectPaymentId: savedPayment.id,
-        projectId,
-        customerId: userId,
-        milestoneId: dto.milestoneId ?? '',
-        purpose: dto.purpose,
-      },
-    });
+    let paymentIntent: Stripe.PaymentIntent;
+    try {
+      paymentIntent = await this.stripeService.createPaymentIntent({
+        amount: this.toMinorUnits(allowedAmount, currency),
+        currency: currency.toLowerCase(),
+        customer: stripeCustomerId,
+        automatic_payment_methods: {
+          enabled: true,
+        },
+        metadata: {
+          projectPaymentId: savedPayment.id,
+          projectId,
+          customerId: userId,
+          milestoneId: dto.milestoneId ?? '',
+          purpose: dto.purpose,
+        },
+      });
+    } catch (error) {
+      await this.paymentsRepository.update(savedPayment.id, {
+        status: 'failed',
+        failedAt: new Date(),
+        metadata: {
+          ...(savedPayment.metadata ?? {}),
+          setupError: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
 
     await this.paymentsRepository.update(savedPayment.id, {
       stripePaymentIntentId: paymentIntent.id,
@@ -628,7 +637,7 @@ export class PaymentsService {
     const stripeCustomerId = await this.ensureStripeCustomer(user);
     const frontendUrl = this.requiredFrontendUrl();
 
-    const payment = this.paymentsRepository.create({
+    const savedPayment = await this.reserveEscrowPayment({
       projectId,
       milestoneId: dto.milestoneId ?? null,
       customerId: userId,
@@ -642,27 +651,35 @@ export class PaymentsService {
         quotedAmount: project.quotedAmount,
       },
     });
-    const savedPayment = await this.paymentsRepository.save(payment);
-
-    const session = await this.stripeService.createCheckoutSession({
-      mode: 'payment',
-      customer: stripeCustomerId,
-      success_url: `${frontendUrl}/projects/${projectId}/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/projects/${projectId}/payments?payment=cancelled`,
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: currency.toLowerCase(),
-            unit_amount: this.toMinorUnits(amount, currency),
-            product_data: {
-              name: `Escrow funding for ${project.title}`,
-              description: this.checkoutDescription(project, dto.purpose),
+    let session: Stripe.Checkout.Session;
+    try {
+      session = await this.stripeService.createCheckoutSession({
+        mode: 'payment',
+        customer: stripeCustomerId,
+        success_url: `${frontendUrl}/projects/${projectId}/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${frontendUrl}/projects/${projectId}/payments?payment=cancelled`,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: currency.toLowerCase(),
+              unit_amount: this.toMinorUnits(amount, currency),
+              product_data: {
+                name: `Escrow funding for ${project.title}`,
+                description: this.checkoutDescription(project, dto.purpose),
+              },
             },
           },
+        ],
+        payment_intent_data: {
+          metadata: {
+            projectPaymentId: savedPayment.id,
+            projectId,
+            customerId: userId,
+            milestoneId: dto.milestoneId ?? '',
+            purpose: dto.purpose,
+          },
         },
-      ],
-      payment_intent_data: {
         metadata: {
           projectPaymentId: savedPayment.id,
           projectId,
@@ -670,15 +687,18 @@ export class PaymentsService {
           milestoneId: dto.milestoneId ?? '',
           purpose: dto.purpose,
         },
-      },
-      metadata: {
-        projectPaymentId: savedPayment.id,
-        projectId,
-        customerId: userId,
-        milestoneId: dto.milestoneId ?? '',
-        purpose: dto.purpose,
-      },
-    });
+      });
+    } catch (error) {
+      await this.paymentsRepository.update(savedPayment.id, {
+        status: 'failed',
+        failedAt: new Date(),
+        metadata: {
+          ...(savedPayment.metadata ?? {}),
+          setupError: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
 
     await this.paymentsRepository.update(savedPayment.id, {
       stripeCheckoutSessionId: session.id,
@@ -1095,106 +1115,179 @@ export class PaymentsService {
     payment: ProjectPayment,
     metadata: Record<string, unknown>,
   ) {
-    await this.dataSource.transaction(async (manager) => {
-      const paymentRepo = manager.getRepository(ProjectPayment);
-      const lockedPayment = await paymentRepo
-        .createQueryBuilder('payment')
-        .setLock('pessimistic_write')
-        .where('payment.id = :paymentId', { paymentId: payment.id })
-        .getOne();
-      if (!lockedPayment) return;
+    const refundPaymentIntentId = await this.dataSource.transaction(
+      async (manager) => {
+        // Use the same project -> payment lock order as checkout reservation.
+        // The reverse order could deadlock a Stripe webhook against a customer
+        // opening another checkout for the same project.
+        const project = await manager
+          .getRepository(Project)
+          .createQueryBuilder('project')
+          .setLock('pessimistic_write')
+          .where('project.id = :projectId', { projectId: payment.projectId })
+          .getOne();
+        if (!project) throw new NotFoundException('Payment project not found');
+        const paymentRepo = manager.getRepository(ProjectPayment);
+        const lockedPayment = await paymentRepo
+          .createQueryBuilder('payment')
+          .setLock('pessimistic_write')
+          .where('payment.id = :paymentId', { paymentId: payment.id })
+          .getOne();
+        if (!lockedPayment) return;
 
-      lockedPayment.status = 'succeeded';
-      lockedPayment.paidAt = lockedPayment.paidAt ?? new Date();
-      lockedPayment.failedAt = null;
-      lockedPayment.stripeCheckoutSessionId =
-        payment.stripeCheckoutSessionId ??
-        lockedPayment.stripeCheckoutSessionId;
-      lockedPayment.stripePaymentIntentId =
-        payment.stripePaymentIntentId ?? lockedPayment.stripePaymentIntentId;
-      lockedPayment.metadata = {
-        ...(lockedPayment.metadata ?? {}),
-        ...metadata,
-      };
-      await paymentRepo.save(lockedPayment);
-
-      const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
-      const existingHold = await ledgerRepo.findOne({
-        where: {
-          paymentId: payment.id,
-          entryType: 'hold',
-          status: 'posted',
-        },
-      });
-      if (existingHold) return;
-
-      const project = await manager
-        .getRepository(Project)
-        .createQueryBuilder('project')
-        .setLock('pessimistic_write')
-        .where('project.id = :projectId', { projectId: payment.projectId })
-        .getOne();
-      if (!project) throw new NotFoundException('Payment project not found');
-
-      await ledgerRepo.save(
-        ledgerRepo.create({
-          projectId: payment.projectId,
-          paymentId: payment.id,
-          milestoneId: payment.milestoneId,
-          entryType: 'hold',
-          amount: payment.amount,
-          currency: payment.currency,
-          status: 'posted',
-          reason: 'Stripe payment intent succeeded',
-          postedAt: new Date(),
-        }),
-      );
-      project.heldAmount = this.fromCents(
-        this.toCents(project.heldAmount) + this.toCents(payment.amount),
-      );
-      project.quoteStatus = 'accepted';
-
-      const platformFee = Number(project.platformFeeAmount ?? 0);
-      if (platformFee > 0 && payment.purpose === 'full_project_deposit') {
-        const existingFee = await ledgerRepo.findOne({
+        lockedPayment.stripeCheckoutSessionId =
+          payment.stripeCheckoutSessionId ??
+          lockedPayment.stripeCheckoutSessionId;
+        lockedPayment.stripePaymentIntentId =
+          payment.stripePaymentIntentId ?? lockedPayment.stripePaymentIntentId;
+        const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
+        const existingHold = await ledgerRepo.findOne({
           where: {
-            projectId: payment.projectId,
-            entryType: 'platform_fee',
+            paymentId: payment.id,
+            entryType: 'hold',
             status: 'posted',
           },
         });
-        if (!existingFee) {
-          await ledgerRepo.save(
-            ledgerRepo.create({
-              projectId: payment.projectId,
-              paymentId: payment.id,
-              milestoneId: null,
-              entryType: 'platform_fee',
-              amount: platformFee.toFixed(2),
-              currency: payment.currency,
-              status: 'posted',
-              reason: 'Nexus AI platform fee',
-              postedAt: new Date(),
-              metadata: {
-                source: 'budget_allocation',
-                testMode:
-                  !process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_'),
-              },
-            }),
-          );
-          project.releasedAmount = this.fromCents(
-            this.toCents(project.releasedAmount) + this.toCents(platformFee),
-          );
-        }
-      }
-      await manager.getRepository(Project).save(project);
-    });
+        if (existingHold) return null;
 
-    if (payment.purpose === 'full_project_deposit') {
-      // Funding starts the autonomous staffing chain. A principal reviewer is
-      // invited first; accepting that invitation triggers architect/UIUX
-      // matching, which in turn unlocks planning and implementation staffing.
-      await this.matchingService.autoStartPrincipalReviewer(payment.projectId);
+        const normalFunding = !['change_request', 'refund_adjustment'].includes(
+          lockedPayment.purpose,
+        );
+        const expectedStatus =
+          lockedPayment.purpose === 'planning_deposit' ||
+          lockedPayment.purpose === 'full_project_deposit'
+            ? ProjectStatus.READY_FOR_FUNDING
+            : lockedPayment.purpose === 'implementation_deposit'
+              ? ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING
+              : null;
+        if (
+          normalFunding &&
+          (!expectedStatus || project.status !== expectedStatus)
+        ) {
+          const paymentIntentId = lockedPayment.stripePaymentIntentId;
+          if (!paymentIntentId) {
+            throw new ConflictException(
+              'Captured payment cannot be refunded because its Stripe payment intent is missing',
+            );
+          }
+          lockedPayment.status = 'failed';
+          lockedPayment.paidAt = lockedPayment.paidAt ?? new Date();
+          lockedPayment.failedAt = new Date();
+          lockedPayment.metadata = {
+            ...(lockedPayment.metadata ?? {}),
+            ...metadata,
+            automaticRefundRequired: true,
+            automaticRefundReason:
+              'Project funding stage was no longer ready when Stripe confirmed payment',
+          };
+          await paymentRepo.save(lockedPayment);
+          return paymentIntentId;
+        }
+
+        lockedPayment.status = 'succeeded';
+        lockedPayment.paidAt = lockedPayment.paidAt ?? new Date();
+        lockedPayment.failedAt = null;
+        lockedPayment.metadata = {
+          ...(lockedPayment.metadata ?? {}),
+          ...metadata,
+        };
+        await paymentRepo.save(lockedPayment);
+
+        await ledgerRepo.save(
+          ledgerRepo.create({
+            projectId: payment.projectId,
+            paymentId: payment.id,
+            milestoneId: payment.milestoneId,
+            entryType: 'hold',
+            amount: payment.amount,
+            currency: payment.currency,
+            status: 'posted',
+            reason: 'Stripe payment intent succeeded',
+            postedAt: new Date(),
+          }),
+        );
+        project.heldAmount = this.fromCents(
+          this.toCents(project.heldAmount) + this.toCents(payment.amount),
+        );
+        project.quoteStatus = 'accepted';
+
+        const platformFee = Number(project.platformFeeAmount ?? 0);
+        if (
+          platformFee > 0 &&
+          ['planning_deposit', 'full_project_deposit'].includes(
+            lockedPayment.purpose,
+          )
+        ) {
+          const existingFee = await ledgerRepo.findOne({
+            where: {
+              projectId: payment.projectId,
+              entryType: 'platform_fee',
+              status: 'posted',
+            },
+          });
+          if (!existingFee) {
+            await ledgerRepo.save(
+              ledgerRepo.create({
+                projectId: payment.projectId,
+                paymentId: payment.id,
+                milestoneId: null,
+                entryType: 'platform_fee',
+                amount: platformFee.toFixed(2),
+                currency: payment.currency,
+                status: 'posted',
+                reason: 'Nexus AI platform fee',
+                postedAt: new Date(),
+                metadata: {
+                  source: 'budget_allocation',
+                  testMode:
+                    !process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_'),
+                },
+              }),
+            );
+            project.releasedAmount = this.fromCents(
+              this.toCents(project.releasedAmount) + this.toCents(platformFee),
+            );
+          }
+        }
+        await manager.getRepository(Project).save(project);
+        return null;
+      },
+    );
+
+    if (refundPaymentIntentId) {
+      const refund = await this.stripeService.createRefund(
+        {
+          payment_intent: refundPaymentIntentId,
+          metadata: {
+            projectPaymentId: payment.id,
+            projectId: payment.projectId,
+            reason: 'team_readiness_withdrawn',
+          },
+        },
+        { idempotencyKey: `team-readiness-refund:${payment.id}` },
+      );
+      await this.paymentsRepository.update(payment.id, {
+        status: 'refunded',
+        metadata: {
+          ...(payment.metadata ?? {}),
+          ...metadata,
+          automaticRefundRequired: false,
+          automaticRefundId: refund.id,
+          automaticRefundStatus: refund.status ?? 'unknown',
+          automaticRefundReason:
+            'Project funding stage was no longer ready when Stripe confirmed payment',
+        },
+      });
+      return;
+    }
+
+    if (
+      payment.purpose === 'planning_deposit' ||
+      payment.purpose === 'full_project_deposit'
+    ) {
+      await this.matchingService.activateFundedProject(payment.projectId);
+    } else if (payment.purpose === 'implementation_deposit') {
+      await this.matchingService.activateImplementation(payment.projectId);
     }
   }
 
@@ -1284,10 +1377,34 @@ export class PaymentsService {
     const remainingAmount =
       finalAmount !== null ? Math.max(finalAmount - paidAmount, 0) : null;
     const quoteStatus = project.quoteStatus ?? 'not_ready';
+    const funding = projectFundingBreakdown(project.budgetAllocation);
+    const planningAmount = funding ? Number(funding.planningAmount) : null;
+    const implementationAmount = funding
+      ? Number(funding.implementationAmount)
+      : null;
+    const planningRemainingAmount =
+      planningAmount == null ? null : Math.max(planningAmount - paidAmount, 0);
+    const implementationRemainingAmount =
+      finalAmount == null ? null : Math.max(finalAmount - paidAmount, 0);
+    const fundingStage =
+      project.status === ProjectStatus.READY_FOR_FUNDING
+        ? 'planning'
+        : project.status === ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING
+          ? 'implementation'
+          : project.implementationFundedAt
+            ? 'funded'
+            : project.planningFundedAt
+              ? 'planning_active'
+              : 'matching';
+    const stageAmount =
+      fundingStage === 'planning'
+        ? planningRemainingAmount
+        : fundingStage === 'implementation'
+          ? implementationRemainingAmount
+          : null;
     const canPay =
-      finalAmount !== null &&
-      remainingAmount !== null &&
-      remainingAmount > 0 &&
+      stageAmount !== null &&
+      stageAmount > 0 &&
       quoteStatus !== 'not_ready' &&
       quoteStatus !== 'out_of_budget';
 
@@ -1312,6 +1429,17 @@ export class PaymentsService {
       },
       budgetAllocation: project.budgetAllocation,
       quoteEvidence: project.quoteEvidence,
+      funding: {
+        stage: fundingStage,
+        planningAmount,
+        planningRemainingAmount,
+        implementationAmount,
+        implementationRemainingAmount,
+        planningIncludes: funding?.planningIncludes ?? null,
+        capacitySnapshot: project.implementationCapacitySnapshot,
+        planningFundedAt: project.planningFundedAt,
+        implementationFundedAt: project.implementationFundedAt,
+      },
       totals: {
         paidAmount,
         pendingAmount,
@@ -1326,13 +1454,23 @@ export class PaymentsService {
           quoteStatus,
           finalAmount,
           remainingAmount,
+          fundingStage,
         ),
-        suggestedPaymentAmount: remainingAmount,
-        suggestedPaymentPurpose: 'full_project_deposit',
+        suggestedPaymentAmount: canPay ? stageAmount : null,
+        suggestedPaymentPurpose:
+          fundingStage === 'planning'
+            ? 'planning_deposit'
+            : fundingStage === 'implementation'
+              ? 'implementation_deposit'
+              : null,
         payButtonLabel:
           remainingAmount !== null && remainingAmount <= 0
             ? 'Escrow funded'
-            : 'Fund project escrow',
+            : fundingStage === 'planning'
+              ? 'Fund planning package'
+              : fundingStage === 'implementation'
+                ? 'Fund implementation'
+                : 'Funding locked',
       },
       milestones: milestones.map((milestone) => {
         const milestonePayments = payments.filter(
@@ -1380,6 +1518,14 @@ export class PaymentsService {
         'The final project price is not ready yet. Confirm the requirements brief first.',
       );
     }
+    const quoteCurrency = this.normalizedCurrency(
+      project.quotedCurrency ?? project.currency,
+    );
+    if (this.normalizedCurrency(dto.currency) !== quoteCurrency) {
+      throw new BadRequestException(
+        `Escrow must be funded in the quoted currency ${quoteCurrency}`,
+      );
+    }
 
     const existingPayments = await this.paymentsRepository.find({
       where: { projectId: project.id },
@@ -1402,16 +1548,50 @@ export class PaymentsService {
       throw new ConflictException('This project is already fully funded');
     }
 
-    if (dto.purpose === 'full_project_deposit') {
-      if (Math.abs(amount - remainingAmount) > 0.005) {
+    const exceptional = ['change_request', 'refund_adjustment'].includes(
+      dto.purpose,
+    );
+    if (!exceptional) {
+      const funding = projectFundingBreakdown(project.budgetAllocation);
+      if (!funding) {
         throw new BadRequestException(
-          `Full-project funding must cover the exact remaining ${remainingAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}. Use a milestone payment for a smaller amount.`,
+          'The staged planning and implementation allocation is unavailable',
         );
       }
-      await this.assertPlanningBudgetFeasible(project);
-    }
-
-    if (amount > remainingAmount) {
+      let requiredAmount: number;
+      if (dto.purpose === 'planning_deposit') {
+        await this.matchingService.assertProjectReadyForFunding(project.id);
+        requiredAmount = Math.max(
+          Number(funding.planningAmount) - paidAmount - reservedAmount,
+          0,
+        );
+      } else if (dto.purpose === 'implementation_deposit') {
+        if (project.status !== ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING) {
+          throw new ConflictException(
+            'Implementation funding unlocks after every materialized Scrum task has an accepted freelancer',
+          );
+        }
+        requiredAmount = remainingAmount;
+      } else if (dto.purpose === 'full_project_deposit') {
+        throw new BadRequestException(
+          'Whole-project prepayment is disabled. Fund the paid planning package first; the implementation balance unlocks only after exact task staffing.',
+        );
+      } else {
+        throw new BadRequestException(
+          'Use the funding action shown for the current project stage',
+        );
+      }
+      if (requiredAmount <= 0) {
+        throw new ConflictException(
+          `The ${dto.purpose === 'planning_deposit' ? 'planning' : 'implementation'} stage is already funded`,
+        );
+      }
+      if (Math.abs(amount - requiredAmount) > 0.005) {
+        throw new BadRequestException(
+          `${dto.purpose === 'planning_deposit' ? 'Planning' : 'Implementation'} funding must cover the exact stage amount of ${requiredAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}.`,
+        );
+      }
+    } else if (amount > remainingAmount) {
       throw new BadRequestException(
         `Payment amount cannot exceed the remaining escrow amount of ${remainingAmount.toFixed(2)} ${project.quotedCurrency ?? project.currency}`,
       );
@@ -1420,152 +1600,111 @@ export class PaymentsService {
     return amount;
   }
 
-  private async assertPlanningBudgetFeasible(project: Project) {
-    const principal = principalReviewerRoleAllocation(project.budgetAllocation);
-    const architect = planningRoleAllocation(
-      project.budgetAllocation,
-      'architect',
-    );
-    const uiux = planningRoleAllocation(project.budgetAllocation, 'ui_ux');
-    if (!principal || !architect || !uiux) {
-      throw new ConflictException(
-        'The project price has no valid reviewer/planning compensation allocation. Reconfirm the brief before funding escrow.',
+  private async reserveEscrowPayment(input: {
+    projectId: string;
+    milestoneId: string | null;
+    customerId: string;
+    amount: string;
+    currency: string;
+    status: string;
+    purpose: string;
+    metadata: Record<string, unknown>;
+  }) {
+    return this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId: input.projectId })
+        .getOneOrFail();
+      const exceptional = ['change_request', 'refund_adjustment'].includes(
+        input.purpose,
       );
-    }
-
-    const profiles = await this.freelancerProfilesRepository
-      .createQueryBuilder('profile')
-      .select([
-        'profile.id',
-        'profile.hourlyRate',
-        'profile.skills',
-        'profile.yearsExperience',
-        'profile.performanceScore',
-        'profile.availabilityHoursPerWeek',
-      ])
-      .where('profile.verificationStatus = :approved', {
-        approved: 'approved',
-      })
-      .andWhere('profile.isAvailable = true')
-      .andWhere('profile.deletedAt IS NULL')
-      .andWhere('profile.hourlyRate IS NOT NULL')
-      .andWhere('profile.hourlyRate > 0')
-      .orderBy('profile.hourlyRate', 'ASC')
-      .getMany();
-    const specs = [
-      {
-        role: 'principal reviewer',
-        allocation: principal,
-        skills: [
-          'architecture',
-          'system design',
-          'technical leadership',
-          'solution architect',
-          'code review',
-        ],
-        senior: true,
-      },
-      {
-        role: 'architect',
-        allocation: architect,
-        skills: [
-          'architecture',
-          'system design',
-          'api design',
-          'database design',
-          'backend',
-        ],
-        senior: false,
-      },
-      {
-        role: 'UI/UX designer',
-        allocation: uiux,
-        skills: [
-          'ui/ux',
-          'ui ux',
-          'figma',
-          'wireframing',
-          'prototyping',
-          'user flows',
-          'design systems',
-        ],
-        senior: false,
-      },
-    ];
-    const eligibleByRole = specs.map((spec) => {
-      const minimumAvailability = Math.max(
-        1,
-        Math.ceil(spec.allocation.estimatedHours / 4),
-      );
-      const roleFit = profiles.filter((profile) => {
-        const skills = (profile.skills ?? []).map((skill) =>
-          skill.toLowerCase(),
-        );
-        const hasRoleSkill = spec.skills.some((required) =>
-          skills.some(
-            (skill) => skill.includes(required) || required.includes(skill),
-          ),
-        );
-        return (
-          hasRoleSkill &&
-          (profile.availabilityHoursPerWeek ?? 0) >= minimumAvailability &&
-          (!spec.senior ||
-            ((profile.yearsExperience ?? 0) >= 5 &&
-              Number(profile.performanceScore ?? 100) >= 80))
-        );
+      if (!exceptional) {
+        const expectedStatus =
+          input.purpose === 'planning_deposit'
+            ? ProjectStatus.READY_FOR_FUNDING
+            : input.purpose === 'implementation_deposit'
+              ? ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING
+              : null;
+        if (!expectedStatus || project.status !== expectedStatus) {
+          throw new ConflictException(
+            'The project funding stage changed while checkout was opening. Refresh and use the current funding action.',
+          );
+        }
+      }
+      const cutoff = new Date(Date.now() - 30 * 60_000);
+      await manager
+        .getRepository(ProjectPayment)
+        .createQueryBuilder()
+        .update(ProjectPayment)
+        .set({ status: 'cancelled' })
+        .where('project_id = :projectId', { projectId: input.projectId })
+        .andWhere("status = 'requires_payment'")
+        .andWhere('created_at <= :cutoff', { cutoff })
+        .execute();
+      const active = await manager.findOne(ProjectPayment, {
+        where: {
+          projectId: input.projectId,
+          status: In(['requires_payment', 'processing']),
+        },
+        order: { createdAt: 'DESC' },
       });
-      if (!roleFit.length) {
+      if (active) {
         throw new ConflictException(
-          `No approved, available ${spec.role} currently meets the role-fit and experience requirements. Add an eligible freelancer before accepting payment.`,
+          'A payment checkout is already active for this project. Complete or cancel it before starting another.',
         );
       }
-      const maxRate = Number(spec.allocation.maxHourlyRate);
-      return {
-        ...spec,
-        roleFit,
-        affordable: roleFit.filter(
-          (profile) => Number(profile.hourlyRate) <= maxRate,
-        ),
-      };
-    });
-
-    const canAssignDistinctRoles = (
-      index: number,
-      used: Set<string>,
-    ): boolean => {
-      if (index >= eligibleByRole.length) return true;
-      return eligibleByRole[index].affordable.some((profile) => {
-        if (used.has(profile.id)) return false;
-        used.add(profile.id);
-        const matched = canAssignDistinctRoles(index + 1, used);
-        used.delete(profile.id);
-        return matched;
-      });
-    };
-    if (canAssignDistinctRoles(0, new Set())) return;
-
-    const currentTotal = Number(project.quotedAmount) || 0;
-    const requiredTotal = Math.max(
-      ...eligibleByRole.map((spec) => {
-        const cheapestRate = Math.min(
-          ...spec.roleFit.map((profile) => Number(profile.hourlyRate)),
+      const quoteAmount = Number(project.quotedAmount);
+      if (!Number.isFinite(quoteAmount) || quoteAmount <= 0) {
+        throw new BadRequestException(
+          'The final project price is not ready yet',
         );
-        const expectedCost = cheapestRate * spec.allocation.estimatedHours;
-        const allocatedAmount = Number(spec.allocation.amount);
-        return allocatedAmount > 0
-          ? (expectedCost * currentTotal) / allocatedAmount
-          : expectedCost;
-      }),
-    );
-    throw new ConflictException(
-      `The current allocation cannot fund distinct principal reviewer, architecture, and UI/UX matches. Increase the project total to about ${requiredTotal.toFixed(2)} ${project.quotedCurrency ?? project.currency} (an increase of ${Math.max(requiredTotal - currentTotal, 0).toFixed(2)}) or approve lower-rate role-fit freelancers before funding escrow.`,
-    );
+      }
+      const succeeded = await manager.find(ProjectPayment, {
+        where: { projectId: input.projectId, status: 'succeeded' },
+        select: { amount: true },
+      });
+      const remaining = Math.max(
+        quoteAmount -
+          succeeded.reduce((sum, payment) => sum + Number(payment.amount), 0),
+        0,
+      );
+      const requested = Number(input.amount);
+      if (remaining <= 0 || requested > remaining + 0.005) {
+        throw new ConflictException(
+          'The project escrow amount changed while checkout was opening. Refresh the payment summary and try again.',
+        );
+      }
+      if (!exceptional) {
+        const funding = projectFundingBreakdown(project.budgetAllocation);
+        const paid = quoteAmount - remaining;
+        const expected =
+          input.purpose === 'planning_deposit'
+            ? Math.max(Number(funding?.planningAmount ?? 0) - paid, 0)
+            : remaining;
+        if (
+          !funding ||
+          expected <= 0 ||
+          Math.abs(requested - expected) > 0.005
+        ) {
+          throw new ConflictException(
+            `The stage amount changed while checkout was opening. Refresh the payment summary and try again.`,
+          );
+        }
+      }
+      return manager.save(
+        ProjectPayment,
+        manager.create(ProjectPayment, input),
+      );
+    });
   }
 
   private paymentBlockedReason(
     quoteStatus: string,
     finalAmount: number | null,
     remainingAmount: number | null,
+    fundingStage: string,
   ) {
     if (quoteStatus === 'out_of_budget') {
       return 'The final estimate is above the project budget. Revise the budget range before funding escrow.';
@@ -1576,7 +1715,13 @@ export class PaymentsService {
     if (remainingAmount !== null && remainingAmount <= 0) {
       return 'Escrow is fully funded.';
     }
-    return null;
+    if (fundingStage === 'planning') return null;
+    if (fundingStage === 'implementation') return null;
+    if (fundingStage === 'planning_active') {
+      return 'Planning is funded. The implementation balance unlocks only after the approved Scrum plan is materialized and every exact task has an accepted freelancer.';
+    }
+    if (fundingStage === 'funded') return 'Escrow is fully funded.';
+    return 'No payment is required while the principal reviewer and planning team are accepting invitations and implementation capacity is being checked.';
   }
 
   private groupByProject<T extends { projectId: string }>(rows: T[]) {

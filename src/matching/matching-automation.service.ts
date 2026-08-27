@@ -34,9 +34,14 @@ export class MatchingAutomationService
     if (this.running) return;
     this.running = true;
     try {
+      await this.matchingService.recoverProjectsAwaitingPrincipalReviewer();
       await this.matchingService.recoverAcceptingInvitations();
+      await this.matchingService.recoverUndeliveredInvitationNotifications();
       await this.matchingService.expirePendingInvitations();
+      await this.matchingService.recoverRunsMissingFallbackInvitations();
       await this.matchingService.recoverPlanningRolesAfterReviewerAcceptance();
+      await this.matchingService.recoverFundedStageActivations();
+      await this.matchingService.recoverReadyForFundingNotifications();
       await this.matchingService.recoverBlockedStaffing();
       await this.matchingService.recoverImplementationTasksWithoutMatchingRuns();
       await this.incidents.resolveOperation('matching', 'reconcile');
@@ -49,6 +54,7 @@ export class MatchingAutomationService
         errorCode: 'scan_failed',
         severity: 'critical',
         message,
+        trace: error instanceof Error ? error.stack : undefined,
       });
     } finally {
       this.running = false;

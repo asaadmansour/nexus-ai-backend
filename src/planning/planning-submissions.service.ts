@@ -22,6 +22,7 @@ import { ProjectPlansService } from './project-plans.service';
 import { PlanningEvaluationsService } from './planning-evaluations.service';
 import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requests.service';
 import { MatchingService } from 'src/matching/matching.service';
+import { projectFundingBreakdown } from './project-budget-allocation';
 
 interface Requester {
   userId: string;
@@ -104,6 +105,20 @@ export class PlanningSubmissionsService {
     requester: Requester,
   ) {
     const project = await this.getProject(projectId);
+    const planningFunding = projectFundingBreakdown(project.budgetAllocation);
+    const planningAmount = Number(planningFunding?.planningAmount);
+    const heldAmount = Number(project.heldAmount);
+    if (
+      !planningFunding ||
+      !Number.isFinite(planningAmount) ||
+      planningAmount <= 0 ||
+      !Number.isFinite(heldAmount) ||
+      heldAmount + 0.005 < planningAmount
+    ) {
+      throw new ConflictException(
+        'Planning work starts only after the customer funds the planning package in escrow',
+      );
+    }
     const assignment = await this.assignmentRepo.findOne({
       where: { id: dto.assignmentId },
       relations: ['freelancerProfile'],

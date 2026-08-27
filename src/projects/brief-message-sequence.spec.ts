@@ -149,4 +149,102 @@ describe('BriefService message sequencing', () => {
     expect(manager.create).not.toHaveBeenCalled();
     expect(manager.save).not.toHaveBeenCalled();
   });
+
+  it('extracts the existing project description before asking the first chat question', async () => {
+    const description = [
+      'Main goal: collect clinic appointments.',
+      'Target users: patients, clinic staff.',
+      'Core features: browse doctors, book appointments.',
+      'Platforms: responsive website.',
+      'Solution type: web app.',
+      'Scope details: six screens covering doctor search, booking, and confirmation.',
+      'Integrations: Stripe, email.',
+      'Admin needs: admin dashboard for appointments.',
+      'Deliverables: working web app, source code, deployment.',
+    ].join(' ');
+    const extractedFields = {
+      mainGoal: 'collect clinic appointments',
+      targetUsers: ['patients', 'clinic staff'],
+      coreFeatures: ['browse doctors', 'book appointments'],
+      platforms: ['responsive website'],
+      solutionType: 'web app',
+      scopeDetails:
+        'six screens covering doctor search, booking, and confirmation',
+      integrations: ['Stripe', 'email'],
+      adminNeeds: 'admin dashboard for appointments',
+      deliverables: ['working web app', 'source code', 'deployment'],
+    };
+    const aiService = {
+      validateBrief: jest.fn().mockResolvedValue({
+        projectId: 'project-1',
+        briefId: 'brief-1',
+        isComplete: true,
+        completionPercentage: 100,
+        missingFields: [],
+        suggestedReply: '',
+        assistantReply: null,
+        extractedFields,
+        nextQuestionField: null,
+        fastPathUsed: false,
+        extractionSource: 'llm',
+        replyMode: 'complete',
+        source: 'fastapi',
+      }),
+    };
+    const briefRepository = { save: jest.fn((brief) => brief) };
+    const service = new BriefService(
+      briefRepository as never,
+      null as never,
+      null as never,
+      null as never,
+      aiService as never,
+      null as never,
+      null as never,
+      null as never,
+      null as never,
+      null as never,
+    );
+    const buildInitial = Reflect.get(service, 'buildInitialAgentMessage') as (
+      brief: object,
+      project: object,
+    ) => Promise<string>;
+    const brief = {
+      id: 'brief-1',
+      projectId: 'project-1',
+      aiDecided: null,
+      isComplete: false,
+      confirmedAt: null,
+      completedAt: null,
+    };
+
+    const message = await buildInitial.call(service, brief, {
+      id: 'project-1',
+      title: 'Clinic booking',
+      description,
+      budgetMin: null,
+      budgetMax: null,
+      deadline: null,
+    });
+
+    expect(aiService.validateBrief).toHaveBeenCalledWith(
+      expect.objectContaining({
+        briefText: description,
+        currentBrief: expect.objectContaining({
+          conversationMode: 'initialDescription',
+        }),
+      }),
+    );
+    expect(briefRepository.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        completionPercentage: 100,
+        isComplete: true,
+        platforms: 'website',
+        deliverables: {
+          items: ['working web app', 'source code', 'deployment'],
+        },
+      }),
+    );
+    expect(message).toContain('reviewed the description you already provided');
+    expect(message).toContain('first-release scope is complete');
+  });
 });

@@ -212,6 +212,28 @@ export class GithubService {
     };
   }
 
+  async findRepository(input: {
+    owner: string;
+    repoName: string;
+  }): Promise<GithubRepoResult | null> {
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}`,
+      { method: 'GET' },
+    );
+    if (response.status === 404) return null;
+    const payload = await this.parse<GithubRepoResponse>(
+      response,
+      `read repository ${input.owner}/${input.repoName}`,
+    );
+    return {
+      externalId: payload.id != null ? String(payload.id) : null,
+      repoUrl:
+        payload.html_url ??
+        `https://github.com/${input.owner}/${input.repoName}`,
+      defaultBranch: payload.default_branch ?? 'main',
+    };
+  }
+
   async inviteCollaborator(input: {
     owner: string;
     repoName: string;
@@ -449,8 +471,11 @@ export class GithubService {
       }));
     const manifestPaths = new Set(manifest.map((item) => item.path));
     const staticProject = this.isDependencyFreeStaticProject(manifestPaths);
+    const materialChangedFiles = changedFiles.items.filter(
+      (item) => !this.isGeneratedInspectionPath(item.path),
+    );
     const preferred = [
-      ...changedFiles.items
+      ...materialChangedFiles
         .filter((item) => item.status !== 'removed')
         .map((item) => item.path),
       ...manifest
@@ -469,11 +494,11 @@ export class GithubService {
     );
     const inspectedPaths = new Set(excerpts.map((item) => item.path));
     const removedWithPatch = new Set(
-      changedFiles.items
+      materialChangedFiles
         .filter((item) => item.status === 'removed' && item.patch)
         .map((item) => item.path),
     );
-    const changedPaths = new Set(changedFiles.items.map((item) => item.path));
+    const changedPaths = new Set(materialChangedFiles.map((item) => item.path));
     const changedCovered = [...changedPaths].filter(
       (path) => inspectedPaths.has(path) || removedWithPatch.has(path),
     ).length;
@@ -488,11 +513,11 @@ export class GithubService {
       combinedStatus,
     );
     const githubChecks = this.githubChecks(checks, combinedStatus);
-    const diff = changedFiles.items
+    const diff = materialChangedFiles
       .filter((item) => item.patch)
       .map((item) => `diff -- ${item.path}\n${item.patch}`)
       .join('\n');
-    const diffTruncated = changedFiles.items.some(
+    const diffTruncated = materialChangedFiles.some(
       (item) => item.status !== 'removed' && !item.patch,
     );
     const complete =
@@ -531,6 +556,8 @@ export class GithubService {
       coverage: {
         manifestFiles: manifest.length,
         changedFiles: changedPaths.size,
+        excludedGeneratedFiles:
+          changedFiles.items.length - materialChangedFiles.length,
         inspectedFiles: excerpts.length,
         changedFileCoverage,
         sourceChars: excerpts.reduce(
@@ -926,6 +953,31 @@ export class GithubService {
       'requirements.txt',
       'dockerfile',
     ].includes(name ?? '');
+  }
+
+  private isGeneratedInspectionPath(path: string) {
+    const normalized = path.toLowerCase().replaceAll('\\', '/');
+    const name = normalized.split('/').at(-1) ?? '';
+    if (
+      [
+        'package-lock.json',
+        'npm-shrinkwrap.json',
+        'yarn.lock',
+        'pnpm-lock.yaml',
+        'bun.lock',
+        'bun.lockb',
+        'composer.lock',
+        'poetry.lock',
+        'cargo.lock',
+      ].includes(name)
+    ) {
+      return true;
+    }
+    return (
+      /(^|\/)(?:node_modules|dist|build|coverage|\.next|\.nuxt|vendor|__snapshots__)(?:\/|$)/.test(
+        normalized,
+      ) || name.endsWith('.snap')
+    );
   }
 
   private async parse<T>(response: Response, operation: string): Promise<T> {

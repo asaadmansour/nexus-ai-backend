@@ -86,6 +86,13 @@ export class StripeService {
     return this.stripe.paymentIntents.create(params);
   }
 
+  createRefund(
+    params: Stripe.RefundCreateParams,
+    options?: Stripe.RequestOptions,
+  ) {
+    return this.stripe.refunds.create(params, options);
+  }
+
   createCheckoutSession(params: Stripe.Checkout.SessionCreateParams) {
     return this.stripe.checkout.sessions.create(params);
   }

@@ -31,6 +31,14 @@ import { MatchingRun } from './matching-run.entity';
   unique: true,
   where: '"task_id" IS NOT NULL AND "status" IN (\'pending\', \'accepting\')',
 })
+@Index(
+  'project_invitations_active_role_uidx',
+  ['projectId', 'phase', 'roleKey'],
+  {
+    unique: true,
+    where: '"task_id" IS NULL AND "status" IN (\'pending\', \'accepting\')',
+  },
+)
 export class ProjectInvitation {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -71,7 +79,7 @@ export class ProjectInvitation {
   candidate!: MatchingCandidate | null;
 
   @Column({ type: 'varchar', length: 40 })
-  phase!: 'governance' | 'planning' | 'implementation';
+  phase!: 'governance' | 'planning' | 'staffing' | 'implementation';
 
   @Column({ name: 'role_key', type: 'varchar', length: 80 })
   roleKey!: string;
@@ -93,6 +101,23 @@ export class ProjectInvitation {
 
   @Column({ name: 'response_reason', type: 'text', nullable: true })
   responseReason!: string | null;
+
+  @Column({
+    name: 'notification_status',
+    type: 'varchar',
+    length: 20,
+    default: 'pending',
+  })
+  notificationStatus!: 'pending' | 'sending' | 'sent' | 'failed';
+
+  @Column({ name: 'notification_attempts', type: 'int', default: 0 })
+  notificationAttempts!: number;
+
+  @Column({ name: 'notification_error', type: 'text', nullable: true })
+  notificationError!: string | null;
+
+  @Column({ name: 'notification_sent_at', type: 'timestamptz', nullable: true })
+  notificationSentAt!: Date | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

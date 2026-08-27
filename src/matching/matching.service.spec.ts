@@ -7,6 +7,7 @@ import {
   resolveInvitationTtlHours,
   staffingFailureIsCoolingDown,
 } from './matching.service';
+import { createProjectBudgetAllocation } from 'src/planning/project-budget-allocation';
 
 describe('MatchingService task assignment invariants', () => {
   const task = { id: 'task-a', projectId: 'project-a' };
@@ -62,10 +63,10 @@ describe('MatchingService task assignment invariants', () => {
     expect(requiresReviewerCandidateSelection('frontend')).toBe(true);
   });
 
-  it('defaults project invitations to the required two-hour window', () => {
-    expect(resolveInvitationTtlHours(undefined)).toBe(2);
-    expect(resolveInvitationTtlHours('')).toBe(2);
-    expect(resolveInvitationTtlHours('0')).toBe(2);
+  it('defaults project invitations to the configured five-hour staffing window', () => {
+    expect(resolveInvitationTtlHours(undefined)).toBe(5);
+    expect(resolveInvitationTtlHours('')).toBe(5);
+    expect(resolveInvitationTtlHours('0')).toBe(5);
     expect(resolveInvitationTtlHours('6')).toBe(6);
   });
 
@@ -225,6 +226,45 @@ describe('MatchingService task assignment invariants', () => {
     expect(result).toEqual({ inspected: 1, restarted: 1 });
   });
 
+  it('recovers both funded stages when a process stops after recording the Stripe hold', async () => {
+    const allocation = createProjectBudgetAllocation(1000, 'EGP');
+    const activateFundedProject = jest.fn().mockResolvedValue(undefined);
+    const activateImplementation = jest.fn().mockResolvedValue(undefined);
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      projectRepo: {
+        find: jest.fn().mockResolvedValue([
+          {
+            id: 'planning-project',
+            status: 'ready_for_funding',
+            heldAmount: '500.00',
+            quotedAmount: '1000.00',
+            budgetAllocation: allocation,
+          },
+          {
+            id: 'implementation-project',
+            status: 'ready_for_implementation_funding',
+            heldAmount: '1000.00',
+            quotedAmount: '1000.00',
+            budgetAllocation: allocation,
+          },
+        ]),
+      },
+      activateFundedProject,
+      activateImplementation,
+      logger: { error: jest.fn() },
+    }) as MatchingService;
+
+    await expect(service.recoverFundedStageActivations()).resolves.toEqual({
+      inspected: 2,
+      planningActivated: 1,
+      implementationActivated: 1,
+    });
+    expect(activateFundedProject).toHaveBeenCalledWith('planning-project');
+    expect(activateImplementation).toHaveBeenCalledWith(
+      'implementation-project',
+    );
+  });
+
   it('starts architect and UI/UX matching after governance moved the project to planning matching', async () => {
     const startPlanningRoles = jest.fn().mockResolvedValue(undefined);
     const service = Object.assign(Object.create(MatchingService.prototype), {
@@ -278,5 +318,35 @@ describe('MatchingService task assignment invariants', () => {
 
     expect(autoStartPlanningRoles).toHaveBeenCalledWith('stuck-project');
     expect(result).toEqual({ inspected: 1, restarted: 1 });
+  });
+
+  it('recovers a principal-reviewer run committed before its invitation was persisted', async () => {
+    const inviteNextCandidate = jest
+      .fn()
+      .mockResolvedValue({ id: 'recovered-invitation' });
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      dataSource: {
+        getRepository: jest.fn().mockReturnValue({
+          findOne: jest.fn().mockResolvedValue(null),
+        }),
+      },
+      invitationRepo: { findOne: jest.fn().mockResolvedValue(null) },
+      runRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'principal-run',
+          status: 'completed',
+          createdAt: new Date('2030-01-01T00:00:00.000Z'),
+        }),
+      },
+      candidateRepo: {
+        count: jest.fn().mockResolvedValueOnce(3).mockResolvedValueOnce(2),
+      },
+      inviteNextCandidate,
+    }) as MatchingService;
+
+    await expect(service.autoStartPrincipalReviewer('project-a')).resolves.toBe(
+      true,
+    );
+    expect(inviteNextCandidate).toHaveBeenCalledWith('principal-run');
   });
 });

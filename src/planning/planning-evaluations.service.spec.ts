@@ -60,6 +60,7 @@ describe('PlanningEvaluationsService verdict history', () => {
       producer,
       {} as NotificationsService,
       config,
+      { record: jest.fn().mockResolvedValue(undefined) } as never,
     );
 
     await expect(

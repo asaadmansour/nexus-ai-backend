@@ -18,6 +18,7 @@ import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialE
 import type { EvaluateSubmissionResult } from 'src/agents/ai.service';
 import type { EvaluateSubmissionDto } from 'src/agents/dto/EvaluateSubmissionDto';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
@@ -32,7 +33,6 @@ import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
-import { User } from 'src/users/entities/user.entity';
 import { QueueEvaluationDto } from './dtos/queue-evaluation.dto';
 import { RetryEvaluationDto } from './dtos/retry-evaluation.dto';
 import type {
@@ -77,6 +77,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     private readonly aiJobsProducer: AiJobsProducer,
     private readonly implementationSandbox: ImplementationEvaluationSandboxService,
     private readonly notificationsService: NotificationsService,
+    private readonly incidents: AutomationIncidentsService,
   ) {}
 
   async queueSubmissionEvaluation(input: {
@@ -532,6 +533,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           data.projectId,
           data.taskId ?? null,
           this.getErrorMessage(error),
+          error instanceof Error ? error.stack : undefined,
         ).catch(() => undefined);
         await this.queuePendingRepositoryEvaluation(
           data.submissionId,
@@ -859,6 +861,12 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     run.modelName = result.source;
     run.completedAt = new Date();
     await this.runRepo.save(run);
+    await this.incidents.resolveOperation(
+      'ai_jobs',
+      'evaluate_implementation_submission',
+      run.projectId,
+      'A later implementation evaluation completed successfully.',
+    );
   }
 
   private async applyRevisionVerdict(
@@ -1212,7 +1220,18 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     projectId: string,
     taskId: string | null,
     error: string,
+    trace?: string,
   ) {
+    await this.incidents.record({
+      subsystem: 'ai_jobs',
+      operation: 'evaluate_implementation_submission',
+      projectId,
+      errorCode: 'evaluation_retries_exhausted',
+      severity: 'critical',
+      message: error,
+      context: { taskId },
+      trace,
+    });
     const reviewer = await this.dataSource
       .getRepository(ProjectRoleAssignment)
       .findOne({
@@ -1224,27 +1243,16 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
         },
         relations: ['freelancerProfile'],
       });
-    const admins = await this.dataSource.getRepository(User).find({
-      where: { role: UserRole.ADMIN },
-      select: { id: true },
+    if (!reviewer?.freelancerProfile?.userId) return;
+    await this.notificationsService.createNotification({
+      userId: reviewer.freelancerProfile.userId,
+      projectId,
+      taskId,
+      type: 'reviewer_attention',
+      title: 'AI evaluation needs technical attention',
+      body: 'Automated evaluation remains blocked after its retries. Operations has the failure trace; no approval can bypass the missing verdict.',
+      actionUrl: `/reviewer/projects/${projectId}`,
     });
-    const recipientIds = new Set(admins.map((admin) => admin.id));
-    if (reviewer?.freelancerProfile?.userId) {
-      recipientIds.add(reviewer.freelancerProfile.userId);
-    }
-    await Promise.all(
-      [...recipientIds].map((userId) =>
-        this.notificationsService.createNotification({
-          userId,
-          projectId,
-          taskId,
-          type: 'technical_attention',
-          title: 'AI evaluation needs technical attention',
-          body: `Automated evaluation exhausted its retries. Nexus operations can retry it; no approval can bypass the missing verdict. ${error.slice(0, 300)}`,
-          actionUrl: '/messages',
-        }),
-      ),
-    );
   }
 
   // ---------------------------------------------------------------------------

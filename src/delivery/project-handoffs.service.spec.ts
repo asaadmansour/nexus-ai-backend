@@ -49,6 +49,7 @@ describe('ProjectHandoffsService', () => {
       {} as never,
       notifications as never,
       payments as never,
+      { record: jest.fn().mockResolvedValue(undefined) } as never,
       handoffs as never,
       { find: jest.fn().mockResolvedValue([]) } as never,
       projects as never,

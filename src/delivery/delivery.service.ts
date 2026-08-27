@@ -63,6 +63,16 @@ export function assertTaskAcceptsDraft(task: Pick<ProjectTask, 'status'>) {
   }
 }
 
+export function assertImplementationWorkFunded(
+  task: Pick<ProjectTask, 'assignmentStatus' | 'assignedAt'>,
+) {
+  if (task.assignmentStatus === 'reserved' || !task.assignedAt) {
+    throw new ConflictException(
+      'This task is reserved, but implementation escrow is not funded yet. Work and deadline counters have not started.',
+    );
+  }
+}
+
 export function assertSubmissionMatchesCurrentTask(
   submission: Pick<ProjectSubmission, 'taskId' | 'freelancerProfileId'> & {
     task: Pick<ProjectTask, 'assignedFreelancerProfileId'> | null;
@@ -86,10 +96,13 @@ export function assertSubmissionMatchesCurrentTask(
 
 export function assertSubmissionApprovalEvaluation(
   submission: Pick<ProjectSubmission, 'submissionType' | 'commitSha'>,
-  evaluation: Pick<
-    EvaluationRun,
-    'id' | 'status' | 'recommendation' | 'evaluatedCommitSha'
-  > | null,
+  evaluation:
+    | (Pick<
+        EvaluationRun,
+        'id' | 'status' | 'recommendation' | 'evaluatedCommitSha'
+      > &
+        Partial<Pick<EvaluationRun, 'acceptanceCoverage'>>)
+    | null,
   input: Pick<ReviewSubmissionDto, 'manualReviewAcknowledged' | 'feedback'>,
 ) {
   if (!evaluation || evaluation.status !== 'completed') {
@@ -108,12 +121,19 @@ export function assertSubmissionApprovalEvaluation(
       'Approval is blocked because the evaluation does not match the current submitted commit',
     );
   }
-  if (evaluation.recommendation === 'changes_requested') {
+  const manualReviewRequired =
+    evaluation.recommendation === 'manual_review' ||
+    (evaluation.recommendation === 'changes_requested' &&
+      hasOnlyEvaluatorVisibilityGaps(evaluation));
+  if (
+    evaluation.recommendation === 'changes_requested' &&
+    !manualReviewRequired
+  ) {
     throw new ConflictException(
       'Approval is blocked because the latest evaluation requested changes',
     );
   }
-  if (evaluation.recommendation === 'manual_review') {
+  if (manualReviewRequired) {
     if (
       input.manualReviewAcknowledged !== true ||
       !input.feedback ||
@@ -130,6 +150,41 @@ export function assertSubmissionApprovalEvaluation(
       'Approval is blocked because the evaluation has no approving verdict',
     );
   }
+}
+
+export function assertSubmissionCanBeReviewed(
+  submission: Pick<ProjectSubmission, 'status' | 'reviewedBy'>,
+) {
+  const automatedEvaluationBounce =
+    submission.status === 'changes_requested' && !submission.reviewedBy;
+  if (
+    !['submitted', 'under_review'].includes(submission.status) &&
+    !automatedEvaluationBounce
+  ) {
+    throw new ConflictException(
+      'Only submitted, under-review, or automatically bounced work can be reviewed',
+    );
+  }
+}
+
+export function hasOnlyEvaluatorVisibilityGaps(
+  evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
+) {
+  if (!evaluation?.acceptanceCoverage) return false;
+  const coverage = evaluation.acceptanceCoverage as Record<string, unknown>;
+  const items = Array.isArray(coverage.items)
+    ? (coverage.items as Array<Record<string, unknown>>)
+    : [];
+  const unresolved = items.filter(
+    (item) => item.met !== true && item.status !== 'not_applicable',
+  );
+  return (
+    unresolved.length > 0 &&
+    unresolved.every(
+      (item) =>
+        item.status === 'unverified' || item.key === 'verification_observed_1',
+    )
+  );
 }
 
 export interface SubmissionReviewCriterion {
@@ -366,6 +421,7 @@ export class DeliveryService {
       if (!lockedTask) throw new NotFoundException('Project task not found');
       submission.task = lockedTask;
       assertSubmissionMatchesCurrentTask(submission);
+      assertImplementationWorkFunded(submission.task);
       assertTaskAcceptsDraft(submission.task);
       if (!['draft', 'changes_requested'].includes(submission.status)) {
         throw new ConflictException(
@@ -446,6 +502,7 @@ export class DeliveryService {
       if (!lockedTask) throw new NotFoundException('Project task not found');
       submission.task = lockedTask;
       assertSubmissionMatchesCurrentTask(submission);
+      assertImplementationWorkFunded(submission.task);
       if (['submitted', 'under_review'].includes(submission.status)) {
         return {
           submission,
@@ -549,11 +606,7 @@ export class DeliveryService {
       if (!submission) throw new NotFoundException('Submission not found');
       this.assertReviewerAccess(submission.project, requester);
       assertSubmissionMatchesCurrentTask(submission);
-      if (!['submitted', 'under_review'].includes(submission.status)) {
-        throw new ConflictException(
-          'Only submitted or under-review work can be reviewed',
-        );
-      }
+      assertSubmissionCanBeReviewed(submission);
 
       const latestEvaluation = await manager
         .getRepository(EvaluationRun)
@@ -960,6 +1013,7 @@ export class DeliveryService {
         'The task must be assigned before work can be submitted',
       );
     }
+    assertImplementationWorkFunded(task);
     await this.assertTaskSubmissionAccess(task, requester, manager);
     await this.validateRelatedSubmissionIds(
       manager,
@@ -1424,6 +1478,7 @@ export class DeliveryService {
     task: ProjectTask,
     freelancerProfileId: string | null,
   ) {
+    assertImplementationWorkFunded(task);
     if (
       !freelancerProfileId ||
       task.assignedFreelancerProfileId !== freelancerProfileId

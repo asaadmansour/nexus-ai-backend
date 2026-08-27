@@ -24,10 +24,8 @@ import {
   assessPlanningRequirementProfile,
   type PlanningComplexity,
 } from 'src/planning/planning-evaluation-requirements';
-import {
-  planningRoleAllocation,
-  requiredProjectTotalForRate,
-} from 'src/planning/project-budget-allocation';
+import { planningRoleAllocation } from 'src/planning/project-budget-allocation';
+import { MatchingService } from 'src/matching/matching.service';
 import { CreateRoleAssignmentDto } from './dtos/create-role-assignment.dto';
 import { UpdateAssignmentStatusDto } from './dtos/update-assignment-status.dto';
 import { confirmedBriefValue } from './confirmed-brief-value';
@@ -37,7 +35,6 @@ interface Requester {
   role: UserRole;
 }
 
-const PLANNING_ROLES = ['architect', 'ui_ux'];
 const ACTIVE_STATUSES = ['assigned', 'accepted', 'in_progress'];
 const FREELANCER_ALLOWED_STATUSES = new Set([
   'accepted',
@@ -72,6 +69,7 @@ export class RoleAssignmentsService {
     private readonly aiService: AiService,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
+    private readonly matchingService: MatchingService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -95,7 +93,7 @@ export class RoleAssignmentsService {
     }
 
     const project = await this.getProject(projectId);
-    this.assertProjectFullyFunded(project);
+    this.assertProjectReadyForStaffing(project);
     const brief = await this.briefRepo.findOne({ where: { projectId } });
 
     let candidate: MatchingCandidate | null = null;
@@ -123,7 +121,6 @@ export class RoleAssignmentsService {
     const compensation = this.assertPlanningCompensationCoverage(
       project,
       dto.roleKey,
-      profile,
     );
 
     const assignment = await this.dataSource.transaction(async (manager) => {
@@ -171,7 +168,6 @@ export class RoleAssignmentsService {
         await manager.save(MatchingCandidate, candidate);
       }
 
-      await this.maybeAdvanceToPlanningAssigned(manager, project, adminUserId);
       return created;
     });
 
@@ -243,6 +239,21 @@ export class RoleAssignmentsService {
       });
       if (!assignment) throw new NotFoundException('Assignment not found');
 
+      if (
+        assignment.phase === 'planning' &&
+        ['in_progress', 'completed'].includes(dto.status)
+      ) {
+        const project = await manager.findOne(Project, {
+          where: { id: assignment.projectId },
+          select: { id: true, planningFundedAt: true },
+        });
+        if (!project?.planningFundedAt) {
+          throw new ConflictException(
+            'Planning work cannot start until the customer funds the planning package',
+          );
+        }
+      }
+
       if (!isAdmin) {
         const profile = await this.getProfileByUser(requester.userId);
         if (!profile || assignment.freelancerProfileId !== profile.id) {
@@ -280,6 +291,11 @@ export class RoleAssignmentsService {
         body: `Your ${updated.roleKey} assignment is now ${updated.status}.`,
       });
     }
+    if (['accepted', 'in_progress'].includes(updated.status)) {
+      await this.matchingService.reconcileProjectFundingReadiness(
+        updated.projectId,
+      );
+    }
 
     return {
       id: updated.id,
@@ -310,25 +326,33 @@ export class RoleAssignmentsService {
       ],
     });
 
-    const planningTeam = assignments
-      .filter(
-        (a) =>
-          a.phase === 'planning' &&
-          a.status !== 'cancelled' &&
-          a.status !== 'replaced',
-      )
-      .map((a) => ({
-        roleKey: a.roleKey,
-        status: a.status,
-        freelancer: this.buildPublicFreelancer(a.freelancerProfile),
-      }));
+    const visibleAssignments = assignments.filter(
+      (assignment) =>
+        !['cancelled', 'replaced', 'removed', 'declined'].includes(
+          assignment.status,
+        ),
+    );
+    const publicMember = (assignment: ProjectRoleAssignment) => ({
+      id: assignment.id,
+      phase: assignment.phase,
+      roleKey: assignment.roleKey,
+      status: assignment.status,
+      acceptedAt: assignment.acceptedAt,
+      freelancer: this.buildPublicFreelancer(assignment.freelancerProfile),
+    });
+    const planningTeam = visibleAssignments
+      .filter((a) => a.phase === 'governance' || a.phase === 'planning')
+      .map(publicMember);
+    const implementationTeam = visibleAssignments
+      .filter((assignment) => assignment.phase === 'staffing')
+      .map(publicMember);
 
     return {
       projectId: project.id,
       projectStatus: project.status,
       planningStatus: project.planningStatus,
       planningTeam,
-      implementationTeam: [],
+      implementationTeam,
     };
   }
 
@@ -345,8 +369,9 @@ export class RoleAssignmentsService {
       return { data: [], total: 0 };
     }
 
+    const assignmentPhases = new Set(['governance', 'planning', 'staffing']);
     const assignments =
-      !query.phase || query.phase === 'planning'
+      !query.phase || assignmentPhases.has(query.phase)
         ? await this.assignmentRepo.find({
             where: {
               freelancerProfileId: profile.id,
@@ -379,10 +404,12 @@ export class RoleAssignmentsService {
         briefSummary: briefs.get(assignment.projectId) ?? null,
         roleBriefSummary: this.assignmentRoleBriefSummary(assignment),
         roleBriefStatus: assignment.roleBriefStatus,
-        nextAction: this.assignmentNextAction(
-          assignment.status,
-          assignment.roleKey,
-        ),
+        nextAction:
+          assignment.phase === 'planning' &&
+          assignment.status === 'accepted' &&
+          !project?.planningFundedAt
+            ? 'await_planning_funding'
+            : this.assignmentNextAction(assignment.status, assignment.roleKey),
       };
     });
 
@@ -502,7 +529,7 @@ export class RoleAssignmentsService {
       where: {
         projectId,
         freelancerProfileId: profile.id,
-        phase: 'planning',
+        phase: In(['governance', 'planning', 'staffing']),
         status: In(['assigned', 'accepted', 'in_progress', 'completed']),
       },
       order: { createdAt: 'DESC' },
@@ -633,23 +660,6 @@ export class RoleAssignmentsService {
     }
   }
 
-  private async maybeAdvanceToPlanningAssigned(
-    manager: EntityManager,
-    project: Project,
-    adminUserId: string,
-  ) {
-    const roles = await this.activePlanningRoles(manager, project.id);
-    if (!PLANNING_ROLES.every((role) => roles.has(role))) return;
-    if (project.status === ProjectStatus.PLANNING_ASSIGNED) return;
-
-    await this.transitionProject(manager, project, adminUserId, {
-      status: ProjectStatus.PLANNING_ASSIGNED,
-      planningStatus: 'assigned',
-      reason: 'Both planning roles assigned.',
-      setAssignedAt: true,
-    });
-  }
-
   private async maybeAdvanceToPlanningInProgress(
     manager: EntityManager,
     projectId: string,
@@ -659,10 +669,7 @@ export class RoleAssignmentsService {
       where: { id: projectId },
     });
     if (!project) return;
-    if (
-      project.status !== ProjectStatus.PLANNING_ASSIGNED &&
-      project.status !== ProjectStatus.PLANNING_MATCHING
-    ) {
+    if (project.status !== ProjectStatus.PLANNING_ASSIGNED) {
       return;
     }
     await this.transitionProject(manager, project, actorUserId, {
@@ -670,17 +677,6 @@ export class RoleAssignmentsService {
       planningStatus: 'in_progress',
       reason: 'A planning assignment started.',
     });
-  }
-
-  private async activePlanningRoles(manager: EntityManager, projectId: string) {
-    const rows = await manager
-      .createQueryBuilder(ProjectRoleAssignment, 'a')
-      .select('DISTINCT a.role_key', 'roleKey')
-      .where('a.project_id = :projectId', { projectId })
-      .andWhere('a.phase = :phase', { phase: 'planning' })
-      .andWhere('a.status IN (:...statuses)', { statuses: ACTIVE_STATUSES })
-      .getRawMany<{ roleKey: string }>();
-    return new Set(rows.map((row) => row.roleKey));
   }
 
   private async transitionProject(
@@ -1136,18 +1132,19 @@ export class RoleAssignmentsService {
     };
   }
 
-  private assertProjectFullyFunded(project: Project) {
+  private assertProjectReadyForStaffing(project: Project) {
     const quote = Number(project.quotedAmount);
-    const held = Number(project.heldAmount);
     if (!Number.isFinite(quote) || quote <= 0 || !project.budgetAllocation) {
       throw new ConflictException(
         'Project compensation is not allocated yet. Confirm the brief and generate a valid quote before assigning planning roles.',
       );
     }
-    if (!Number.isFinite(held) || held + 0.005 < quote) {
-      const remaining = Math.max(quote - (Number.isFinite(held) ? held : 0), 0);
+    if (
+      project.quoteStatus === 'not_ready' ||
+      project.quoteStatus === 'out_of_budget'
+    ) {
       throw new ConflictException(
-        `Planning assignments require fully funded escrow. Fund the remaining ${remaining.toFixed(2)} ${project.quotedCurrency ?? project.currency} first.`,
+        'A feasible fixed project quote is required before overriding team matching.',
       );
     }
   }
@@ -1155,7 +1152,6 @@ export class RoleAssignmentsService {
   private assertPlanningCompensationCoverage(
     project: Project,
     roleKey: string,
-    profile: FreelancerProfile,
   ) {
     const allocation = planningRoleAllocation(
       project.budgetAllocation,
@@ -1164,23 +1160,6 @@ export class RoleAssignmentsService {
     if (!allocation) {
       throw new ConflictException(
         `No compensation allocation exists for the ${roleKey} role`,
-      );
-    }
-    const hourlyRate = Number(profile.hourlyRate);
-    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
-      throw new ConflictException(
-        'The selected freelancer must set a positive hourly rate before budget coverage can be verified',
-      );
-    }
-    const expectedCost = hourlyRate * allocation.estimatedHours;
-    if (expectedCost > Number(allocation.amount) + 0.005) {
-      const requiredTotal = requiredProjectTotalForRate(
-        hourlyRate,
-        roleKey as 'architect' | 'ui_ux',
-        allocation.estimatedHours,
-      );
-      throw new ConflictException(
-        `The selected ${roleKey} freelancer is expected to cost ${expectedCost.toFixed(2)} ${project.quotedCurrency ?? project.currency}, above the ${allocation.amount} allocation. Increase the project total to at least ${requiredTotal} or choose a freelancer within ${allocation.maxHourlyRate}/hour.`,
       );
     }
     return {

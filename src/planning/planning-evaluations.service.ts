@@ -8,6 +8,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { createHash, randomUUID } from 'node:crypto';
@@ -21,7 +22,6 @@ import { Brief } from 'src/projects/entities/brief.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
-import { User } from 'src/users/entities/user.entity';
 import { AiJobsProducer } from 'src/queues/ai-jobs.producer';
 import { AI_JOB_RETRY } from 'src/queues/queue.constants';
 import type { PlanningSubmissionEvaluationJobData } from 'src/queues/queue.types';
@@ -55,6 +55,7 @@ export class PlanningEvaluationsService {
     private readonly aiJobsProducer: AiJobsProducer,
     private readonly notificationsService: NotificationsService,
     private readonly configService: ConfigService,
+    private readonly incidents: AutomationIncidentsService,
   ) {
     cloudinary.config({
       cloud_name: this.configService.getOrThrow<string>(
@@ -420,6 +421,7 @@ export class PlanningEvaluationsService {
         await this.notifyReviewerFailure(
           submission,
           this.errorMessage(error),
+          error instanceof Error ? error.stack : undefined,
         ).catch(() => undefined);
       } else {
         submission.evaluationStatus = 'queued';
@@ -536,6 +538,12 @@ export class PlanningEvaluationsService {
     submission.evaluationError = null;
     submission.evaluatedAt = new Date();
     await this.submissionRepo.save(submission);
+    await this.incidents.resolveOperation(
+      'planning',
+      'evaluate_planning_submission',
+      submission.projectId,
+      'A later planning evaluation completed successfully.',
+    );
   }
 
   private async notifyOwner(
@@ -580,7 +588,21 @@ export class PlanningEvaluationsService {
   private async notifyReviewerFailure(
     submission: ProjectPlanningSubmission,
     error: string,
+    trace?: string,
   ) {
+    await this.incidents.record({
+      subsystem: 'planning',
+      operation: 'evaluate_planning_submission',
+      projectId: submission.projectId,
+      errorCode: 'evaluation_retries_exhausted',
+      severity: 'critical',
+      message: error,
+      context: {
+        submissionId: submission.id,
+        submissionType: submission.submissionType,
+      },
+      trace,
+    });
     const reviewer = await this.assignmentRepo.findOne({
       where: {
         projectId: submission.projectId,
@@ -590,26 +612,15 @@ export class PlanningEvaluationsService {
       },
       relations: ['freelancerProfile'],
     });
-    const admins = await this.assignmentRepo.manager.getRepository(User).find({
-      where: { role: UserRole.ADMIN },
-      select: { id: true },
+    if (!reviewer?.freelancerProfile?.userId) return;
+    await this.notificationsService.createNotification({
+      userId: reviewer.freelancerProfile.userId,
+      projectId: submission.projectId,
+      type: 'reviewer_attention',
+      title: 'Planning evaluation needs technical attention',
+      body: 'Automated evaluation remains blocked after its retries. Operations has the failure trace; track the project here while it is recovered.',
+      actionUrl: `/reviewer/projects/${submission.projectId}`,
     });
-    const recipientIds = new Set(admins.map((admin) => admin.id));
-    if (reviewer?.freelancerProfile?.userId) {
-      recipientIds.add(reviewer.freelancerProfile.userId);
-    }
-    await Promise.all(
-      [...recipientIds].map((userId) =>
-        this.notificationsService.createNotification({
-          userId,
-          projectId: submission.projectId,
-          type: 'technical_attention',
-          title: 'Planning evaluation needs technical attention',
-          body: `Automated evaluation exhausted its retries and remains blocked. Nexus operations can retry it. ${error.slice(0, 300)}`,
-          actionUrl: '/messages',
-        }),
-      ),
-    );
   }
 
   private async latestApprovedArchitecture(projectId: string) {

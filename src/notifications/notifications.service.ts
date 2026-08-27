@@ -74,6 +74,25 @@ export class NotificationsService {
     return saved;
   }
 
+  async ensureProjectInvitationNotification(
+    invitationId: string,
+    input: CreateNotificationInput,
+  ) {
+    const existing = await this.notificationRepository
+      .createQueryBuilder('notification')
+      .where('notification.type = :type', { type: 'project_invitation' })
+      .andWhere("notification.metadata ->> 'invitationId' = :invitationId", {
+        invitationId,
+      })
+      .getOne();
+    if (existing) return existing;
+    return this.createNotification({
+      ...input,
+      type: 'project_invitation',
+      metadata: { ...(input.metadata ?? {}), invitationId },
+    });
+  }
+
   stream(userId: string): Observable<MessageEvent> {
     return new Observable<MessageEvent>((subscriber) => {
       const listeners = this.subscribers.get(userId) ?? new Set();
@@ -198,6 +217,11 @@ export class NotificationsService {
         subject: 'A project setup step needs attention',
         body: 'A technical project setup step could not finish automatically. Open the Nexus AI operations view for the exact issue and recovery action.',
         actionLabel: 'Open project operations',
+      },
+      automation_incident: {
+        subject: 'Nexus AI automation needs attention',
+        body: normalizedBody,
+        actionLabel: 'Open incident trace',
       },
       principal_reviewer_status: {
         subject: 'Your principal reviewer status changed',

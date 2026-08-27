@@ -69,6 +69,7 @@ export class PlanningAutomationService
         errorCode: 'scan_failed',
         severity: 'critical',
         message,
+        trace: error instanceof Error ? error.stack : undefined,
       });
     } finally {
       this.running = false;

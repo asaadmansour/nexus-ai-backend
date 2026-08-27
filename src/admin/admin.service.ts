@@ -480,6 +480,8 @@ export class AdminService {
       planningReview: projectStatusCounts[ProjectStatus.PLANNING_REVIEW],
       implementationReady:
         projectStatusCounts[ProjectStatus.IMPLEMENTATION_READY],
+      readyForImplementationFunding:
+        projectStatusCounts[ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING],
       matching: projectStatusCounts[ProjectStatus.MATCHING],
       matched: projectStatusCounts[ProjectStatus.MATCHED],
       specInProgress: projectStatusCounts[ProjectStatus.SPEC_IN_PROGRESS],

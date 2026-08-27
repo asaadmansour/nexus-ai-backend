@@ -71,6 +71,9 @@ export class Project {
   @Column({ type: 'timestamptz', nullable: true })
   deadline: Date | null;
 
+  @Column({ name: 'staffing_deadline', type: 'timestamptz', nullable: true })
+  staffingDeadline: Date | null;
+
   @Column({ name: 'is_deadline_flexible', type: 'boolean', default: false })
   isDeadlineFlexible: boolean;
 
@@ -166,6 +169,23 @@ export class Project {
 
   @Column({ name: 'automation_error_at', type: 'timestamptz', nullable: true })
   automationErrorAt: Date | null;
+
+  @Column({
+    name: 'implementation_capacity_snapshot',
+    type: 'jsonb',
+    nullable: true,
+  })
+  implementationCapacitySnapshot: Record<string, unknown> | null;
+
+  @Column({ name: 'planning_funded_at', type: 'timestamptz', nullable: true })
+  planningFundedAt: Date | null;
+
+  @Column({
+    name: 'implementation_funded_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  implementationFundedAt: Date | null;
 
   @Column({
     name: 'platform_fee_amount',

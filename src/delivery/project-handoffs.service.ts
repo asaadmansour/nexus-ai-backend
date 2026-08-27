@@ -14,6 +14,7 @@ import { DataSource, In, LessThanOrEqual, Repository } from 'typeorm';
 import type { EvaluateSubmissionDto } from 'src/agents/dto/EvaluateSubmissionDto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
+import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { ImplementationEvaluationSandboxService } from 'src/evaluations/implementation-evaluation-sandbox.service';
 import { buildImplementationEvaluationRubric } from 'src/evaluations/submission-quality-criteria';
@@ -32,7 +33,6 @@ import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
 import { GithubService } from 'src/repositories/github.service';
-import { User } from 'src/users/entities/user.entity';
 import { ClientHandoffDecisionDto } from './dtos/client-handoff-decision.dto';
 import { CreateProjectRatingDto } from './dtos/create-project-rating.dto';
 import { ReviewProjectHandoffDto } from './dtos/review-project-handoff.dto';
@@ -66,6 +66,7 @@ export class ProjectHandoffsService
     private readonly sandbox: ImplementationEvaluationSandboxService,
     private readonly notifications: NotificationsService,
     private readonly payments: PaymentReleaseRequestsService,
+    private readonly incidents: AutomationIncidentsService,
     @InjectRepository(ProjectHandoff)
     private readonly handoffs: Repository<ProjectHandoff>,
     @InjectRepository(ProjectRating)
@@ -1123,22 +1124,19 @@ export class ProjectHandoffsService
   }
 
   private async notifyAdmins(projectId: string, title: string, body: string) {
-    const admins = await this.dataSource.getRepository(User).find({
-      where: { role: UserRole.ADMIN },
-      select: { id: true },
+    await this.incidents.record({
+      subsystem: 'delivery',
+      operation: 'final_handoff',
+      projectId,
+      errorCode: title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_|_$/g, '')
+        .slice(0, 80),
+      severity: title.toLowerCase().includes('failed') ? 'critical' : 'error',
+      message: body,
+      context: { title },
     });
-    await Promise.all(
-      admins.map((admin) =>
-        this.notifications.createNotification({
-          userId: admin.id,
-          projectId,
-          title,
-          body,
-          type: 'technical_issue',
-          actionUrl: `/dashboard/admin/projects/${projectId}/delivery`,
-        }),
-      ),
-    );
   }
 
   private async assertProjectAccess(project: Project, requester: JwtPayload) {

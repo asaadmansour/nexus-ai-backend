@@ -11,6 +11,20 @@ describe('GithubService read-only inspection', () => {
       }),
     } as unknown as ConfigService);
 
+  it('excludes generated artifacts and lockfiles from source-inspection coverage', () => {
+    const github = service();
+    const isGenerated = Reflect.get(github, 'isGeneratedInspectionPath') as (
+      path: string,
+    ) => boolean;
+
+    expect(isGenerated.call(github, 'package-lock.json')).toBe(true);
+    expect(isGenerated.call(github, 'frontend/.next/server/app.js')).toBe(true);
+    expect(isGenerated.call(github, 'src/__snapshots__/view.snap')).toBe(true);
+    expect(isGenerated.call(github, 'src/orders/orders.service.ts')).toBe(
+      false,
+    );
+  });
+
   it('builds complete source and static verification evidence for a tiny PR', async () => {
     const commitSha = 'a'.repeat(40);
     const fetchMock = jest
@@ -168,6 +182,42 @@ describe('GithubService read-only inspection', () => {
         sha: 'c'.repeat(40),
         message: 'Pull request was merged by a concurrent integration run',
       });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('recovers an already-created deterministic repository', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(
+      Response.json({
+        id: 42,
+        html_url: 'https://github.com/nexus-ai/project-a',
+        default_branch: 'main',
+      }),
+    );
+
+    try {
+      await expect(
+        service().findRepository({ owner: 'nexus-ai', repoName: 'project-a' }),
+      ).resolves.toEqual({
+        externalId: '42',
+        repoUrl: 'https://github.com/nexus-ai/project-a',
+        defaultBranch: 'main',
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('returns null when the deterministic repository does not exist', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response('not found', { status: 404 }));
+
+    try {
+      await expect(
+        service().findRepository({ owner: 'nexus-ai', repoName: 'missing' }),
+      ).resolves.toBeNull();
     } finally {
       fetchMock.mockRestore();
     }

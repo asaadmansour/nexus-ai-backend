@@ -13,6 +13,7 @@ import { SUPPORTED_CURRENCIES } from 'src/projects/dtos/create-project.dto';
 
 const PAYMENT_PURPOSES = [
   'planning_deposit',
+  'implementation_deposit',
   'milestone_funding',
   'full_project_deposit',
   'change_request',

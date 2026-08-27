@@ -1307,6 +1307,15 @@ export class ProjectPlansService {
         .where('task.id = :taskId', { taskId })
         .getOne();
       if (!lockedTask) throw new NotFoundException('Task not found');
+      if (
+        lockedTask.assignmentStatus === 'reserved' &&
+        dto.status &&
+        dto.status !== 'todo'
+      ) {
+        throw new ConflictException(
+          'Implementation work cannot start until the customer funds the implementation escrow',
+        );
+      }
 
       if (!isAdmin) {
         const profile = await manager.findOne(FreelancerProfile, {

@@ -1,6 +1,7 @@
 import {
   createProjectBudgetAllocation,
   planningRoleAllocation,
+  projectFundingBreakdown,
   requiredProjectTotalForRate,
 } from './project-budget-allocation';
 
@@ -78,5 +79,22 @@ describe('project budget allocation', () => {
     expect(allocation.implementation.people).toBe(2);
     expect(allocation.implementation.estimatedHours).toBe(60);
     expect(allocation.minimumRecommendedAmount).toBe('1000.00');
+  });
+
+  it('funds the paid planning package before the implementation pool', () => {
+    const allocation = createProjectBudgetAllocation(1000, 'EGP', 'standard');
+
+    expect(projectFundingBreakdown(allocation)).toEqual({
+      currency: 'EGP',
+      totalAmount: '1000.00',
+      planningAmount: '500.00',
+      implementationAmount: '500.00',
+      planningIncludes: {
+        platformFee: '100.00',
+        principalReviewer: '100.00',
+        architect: '150.00',
+        uiUx: '150.00',
+      },
+    });
   });
 });

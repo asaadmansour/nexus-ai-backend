@@ -7,14 +7,13 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   ArrayMaxSize,
   MaxLength,
   Max,
   Min,
   ValidateNested,
 } from 'class-validator';
-
-const PLANNING_ROLE_KEYS = ['architect', 'ui_ux'] as const;
 
 export class PlanningMatchingFiltersDto {
   @IsOptional()
@@ -58,7 +57,11 @@ export class PlanningMatchingFiltersDto {
 export class StartPlanningMatchingDto {
   @IsOptional()
   @IsArray()
-  @IsIn(PLANNING_ROLE_KEYS, { each: true })
+  @ArrayMaxSize(3)
+  @Matches(/^(?:principal_reviewer|architect|ui_ux)$/, {
+    each: true,
+    message: 'each role must be principal_reviewer, architect, or ui_ux',
+  })
   roles?: string[];
 
   @IsOptional()

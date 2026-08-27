@@ -80,6 +80,14 @@ export class TaskDeadlinesService
     if (checkpoint.task.assignedFreelancerProfileId !== profile.id) {
       throw new ForbiddenException('This checkpoint is not assigned to you');
     }
+    if (
+      checkpoint.task.assignmentStatus === 'reserved' ||
+      !checkpoint.task.assignedAt
+    ) {
+      throw new ConflictException(
+        'Checkpoint countdowns start only after implementation escrow is funded',
+      );
+    }
     if (!['pending', 'missed'].includes(checkpoint.status)) {
       throw new ConflictException('Checkpoint is already completed');
     }
@@ -169,7 +177,11 @@ export class TaskDeadlinesService
       const task = await manager.findOne(ProjectTask, {
         where: { id: checkpoint.taskId },
       });
-      if (!task?.assignedFreelancerProfileId) {
+      if (
+        !task?.assignedFreelancerProfileId ||
+        task.assignmentStatus === 'reserved' ||
+        !task.assignedAt
+      ) {
         // Staffing delays are not freelancer failures. Park the checkpoint;
         // assignment acceptance rebases it onto the assignee's real schedule.
         checkpoint.status = 'deferred';

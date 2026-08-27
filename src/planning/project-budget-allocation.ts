@@ -47,6 +47,19 @@ export interface ProjectBudgetAllocation extends Record<string, unknown> {
   generatedAt: string;
 }
 
+export interface ProjectFundingBreakdown {
+  currency: string;
+  totalAmount: string;
+  planningAmount: string;
+  implementationAmount: string;
+  planningIncludes: {
+    platformFee: string;
+    principalReviewer: string;
+    architect: string;
+    uiUx: string;
+  };
+}
+
 type LegacyProjectBudgetAllocation = {
   version: 1;
   strategy: 'planning_25_25_implementation_50';
@@ -267,6 +280,94 @@ export function implementationBudgetAmount(
 ) {
   const allocation = projectBudgetAllocation(value);
   return allocation ? Number(allocation.implementation.amount) : null;
+}
+
+/**
+ * Split customer funding at the point where each cost becomes knowable.
+ *
+ * Planning is a useful paid deliverable in its own right: the customer receives
+ * reviewed architecture, UI/UX, and an executable Scrum plan even if exact
+ * implementation staffing later proves impossible. Collecting this amount
+ * before that work starts means Nexus never has to finance those freelancers.
+ * The implementation pool is collected only after the materialized tasks have
+ * accepted assignees.
+ */
+export function projectFundingBreakdown(
+  value: Record<string, unknown> | null | undefined,
+): ProjectFundingBreakdown | null {
+  const allocation = projectBudgetAllocation(value);
+  if (!allocation) return null;
+
+  if (!('platformFee' in allocation)) {
+    const architect = toCents(allocation.planning.architect.amount);
+    const uiUx = toCents(allocation.planning.ui_ux.amount);
+    const implementation = toCents(allocation.implementation.amount);
+    const planning = architect + uiUx;
+    return {
+      currency: normalizeCurrency(allocation.currency),
+      totalAmount: fromCents(planning + implementation),
+      planningAmount: fromCents(planning),
+      implementationAmount: fromCents(implementation),
+      planningIncludes: {
+        platformFee: '0.00',
+        principalReviewer: '0.00',
+        architect: fromCents(architect),
+        uiUx: fromCents(uiUx),
+      },
+    };
+  }
+
+  const platformFee = toCents(allocation.platformFee.amount);
+  const principalReviewer = toCents(
+    allocation.governance.principalReviewer.amount,
+  );
+  const architect = toCents(allocation.planning.architect.amount);
+  const uiUx = toCents(allocation.planning.ui_ux.amount);
+  const implementation = toCents(allocation.implementation.amount);
+  const planning = platformFee + principalReviewer + architect + uiUx;
+
+  return {
+    currency: normalizeCurrency(allocation.currency),
+    totalAmount: fromCents(planning + implementation),
+    planningAmount: fromCents(planning),
+    implementationAmount: fromCents(implementation),
+    planningIncludes: {
+      platformFee: fromCents(platformFee),
+      principalReviewer: fromCents(principalReviewer),
+      architect: fromCents(architect),
+      uiUx: fromCents(uiUx),
+    },
+  };
+}
+
+export function implementationTeamRoleAllocation(
+  value: Record<string, unknown> | null | undefined,
+) {
+  const allocation = projectBudgetAllocation(value);
+  if (!allocation) return null;
+  const implementation = allocation.implementation;
+  const people = Math.max(
+    1,
+    Math.round('people' in implementation ? (implementation.people ?? 1) : 1),
+  );
+  const totalAmount = Number(allocation.implementation.amount);
+  const totalHours = Math.max(
+    people,
+    Math.round(
+      'estimatedHours' in implementation
+        ? (implementation.estimatedHours ?? people * 40)
+        : people * 40,
+    ),
+  );
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0) return null;
+  const amount = totalAmount / people;
+  const estimatedHours = Math.max(1, Math.ceil(totalHours / people));
+  return {
+    amount: amount.toFixed(2),
+    estimatedHours,
+    people,
+    maxHourlyRate: (amount / estimatedHours).toFixed(2),
+  };
 }
 
 export function requiredProjectTotalForRate(

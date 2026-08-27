@@ -45,18 +45,21 @@ import { AutomationIncidentsService } from 'src/automation/automation-incidents.
 const RECENT_BRIEF_MESSAGE_LIMIT = 5;
 const MAX_SUMMARY_LENGTH = 1000;
 const MAX_BRIEF_TEXT_LENGTH = 5000;
-const INITIAL_AGENT_MESSAGE_VERSION = 4;
+const INITIAL_AGENT_MESSAGE_VERSION = 5;
 const MAX_AI_REVISION_MESSAGES = 3;
 const INITIAL_GREETING_MESSAGE =
   'The customer opened the requirements chat. Greet them warmly using the project context, acknowledge what the project seems to be about, and ask one helpful next question. Do not ask for project name, project type, budget, or deadline.';
 const PROJECT_DERIVED_FIELDS = new Set(['projectType', 'budget', 'deadline']);
 const USER_REQUIRED_BRIEF_FIELDS = [...PRICEABLE_BRIEF_FIELDS];
 const BRIEF_CHANGE_LOCKED_PROJECT_STATUSES = new Set<ProjectStatus>([
+  ProjectStatus.WAITING_FOR_PR,
   ProjectStatus.PLANNING_MATCHING,
+  ProjectStatus.READY_FOR_FUNDING,
   ProjectStatus.PLANNING_ASSIGNED,
   ProjectStatus.PLANNING_IN_PROGRESS,
   ProjectStatus.PLANNING_REVIEW,
   ProjectStatus.IMPLEMENTATION_READY,
+  ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
   ProjectStatus.MATCHING,
   ProjectStatus.MATCHED,
   ProjectStatus.SPEC_IN_PROGRESS,
@@ -305,6 +308,7 @@ export class BriefService {
           errorCode: 'queue_failed',
           message: document.error,
           context: { documentId: document.id },
+          trace: error instanceof Error ? error.stack : undefined,
         });
         throw new ServiceUnavailableException(
           'The document was stored safely, but processing could not be queued. It will be retried automatically.',
@@ -399,6 +403,7 @@ export class BriefService {
             documentId: document.id,
             attempts: document.processingAttempts,
           },
+          trace: error instanceof Error ? error.stack : undefined,
         });
       }
       throw error;
@@ -991,7 +996,7 @@ export class BriefService {
         project.automationStatus =
           projectQuote.quoteStatus === 'out_of_budget'
             ? 'budget_revision_required'
-            : 'awaiting_funding';
+            : 'awaiting_principal_reviewer';
       } else if (!project.budgetAllocation && project.quotedAmount) {
         project.budgetAllocation = createProjectBudgetAllocation(
           project.quotedAmount,
@@ -1298,24 +1303,26 @@ export class BriefService {
 
   private async buildInitialAgentMessage(brief: Brief, project: Project) {
     const projectDefaultFields = this.extractProjectDefaultFields(project);
+    const projectDescription = project.description?.trim() ?? '';
+    const initialEvidence = projectDescription || INITIAL_GREETING_MESSAGE;
     const currentBrief = this.buildCurrentBriefContext(
       brief,
       projectDefaultFields,
       this.buildProjectContext(project),
-      'initialGreeting',
+      projectDescription ? 'initialDescription' : 'initialGreeting',
     );
 
     try {
       const aiResult = await this.aiService.validateBrief({
         projectId: project.id,
         briefId: brief.id,
-        briefText: INITIAL_GREETING_MESSAGE,
+        briefText: initialEvidence,
         currentBrief,
         recentMessages: [],
       });
       const sanitizedAiFields = this.sanitizeExtractedFields(
         aiResult.extractedFields,
-        INITIAL_GREETING_MESSAGE,
+        initialEvidence,
         this.getPendingField(brief),
       );
       const extractedFields = this.mergeExtractedFields(
@@ -1336,6 +1343,9 @@ export class BriefService {
       aiResult.isComplete = missingFields.length === 0;
       aiResult.nextQuestionField = nextQuestionField;
 
+      brief.isComplete = missingFields.length === 0;
+      brief.completedAt =
+        brief.completedAt ?? (brief.isComplete ? new Date() : null);
       this.setBriefWorkflowState(brief, {
         missingFields,
         completionPercentage,
@@ -1346,18 +1356,25 @@ export class BriefService {
         aiSource: aiResult.source,
       });
       brief.aiDecided = this.buildAiDiagnostics(brief.aiDecided, aiResult);
-      this.applyExtractedFieldsToBrief(brief, extractedFields, '');
+      this.applyExtractedFieldsToBrief(
+        brief,
+        extractedFields,
+        projectDescription,
+      );
       await this.briefRepo.save(brief);
 
-      return this.resolveAgentReply(
+      const reply = this.resolveAgentReply(
         aiResult.suggestedReply,
         aiResult.assistantReply,
         missingFields,
         [],
-        INITIAL_GREETING_MESSAGE,
+        initialEvidence,
         nextQuestionField,
         aiResult.replyMode,
       );
+      return projectDescription
+        ? `Hi! I reviewed the description you already provided and used it to start the brief. ${reply}`
+        : reply;
     } catch {
       return this.buildInitialFallbackMessage(project);
     }
@@ -1564,7 +1581,7 @@ export class BriefService {
       quote.rationale,
       `Recommended minimum: ${quote.recommendedMinimum.toFixed(2)} ${quote.currency}. Budget gap: ${quote.budgetGap.toFixed(2)} ${quote.currency}.`,
       quote.roleEstimates.length
-        ? `Team cost assumptions: ${quote.roleEstimates.map((role) => `${role.people} ${role.roleKey} × ${role.hoursEach}h × ${role.hourlyRate.toFixed(2)} ${quote.currency}`).join('; ')}.`
+        ? `Fixed team-package allocation: ${quote.roleEstimates.map((role) => `${role.roleKey} ${role.subtotal.toFixed(2)} ${quote.currency}${role.people > 1 ? ` for ${role.people} people` : ''}`).join('; ')}. Internal effort estimates are used for capacity and payout coverage, not to calculate the customer price.`
         : null,
       quote.assumptions.length
         ? `Assumptions: ${quote.assumptions.join(' ')}`
@@ -1621,7 +1638,7 @@ export class BriefService {
     });
     return {
       schemaVersion: 1,
-      estimatorVersion: 'scope-tiered-fixed-price-v2',
+      estimatorVersion: 'marketplace-fixed-package-v3',
       generatedAt: generatedAt.toISOString(),
       source: quote.source,
       currency: quote.currency,

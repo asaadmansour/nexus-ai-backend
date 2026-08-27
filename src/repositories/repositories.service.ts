@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -16,7 +17,6 @@ import { ProjectRepository } from 'src/projects/entities/project-repository.enti
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { RepositoryCollaborator } from 'src/projects/entities/repository-collaborator.entity';
-import { User } from 'src/users/entities/user.entity';
 import { CreateRepositoryDto } from './dtos/create-repository.dto';
 import {
   ResendInviteDto,
@@ -66,13 +66,6 @@ export class RepositoriesService {
     adminUserId: string | null,
   ) {
     const project = await this.getProject(projectId);
-    const existing = await this.findProjectRepository(projectId);
-    if (existing && existing.status !== 'failed') {
-      await this.syncEvaluationWebhook(existing);
-      await this.repoRepo.save(existing);
-      return this.toRepositoryResponse(existing);
-    }
-
     const owner = dto.owner ?? this.github.owner;
     if (!owner) {
       throw new ServiceUnavailableException(
@@ -82,23 +75,68 @@ export class RepositoriesService {
     const repoName = dto.repoName ?? this.buildRepoName(project);
     const visibility = dto.visibility ?? this.github.defaultVisibility;
 
-    const row =
-      existing ??
-      this.repoRepo.create({
-        projectId,
-        provider: dto.provider ?? 'github',
-        createdBy: adminUserId,
+    // Claim provisioning in the database before calling GitHub. Previously two
+    // acceptance/reconciliation paths could both see "no repository", both call
+    // GitHub, and one would fail or create an unnecessary suffixed repository.
+    // Locking the project makes the claim atomic across every backend instance.
+    const claim = await this.repoRepo.manager.transaction(async (manager) => {
+      await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :projectId', { projectId })
+        .getOneOrFail();
+      const repository = await manager.findOne(ProjectRepository, {
+        where: { projectId, status: Not('archived') },
+        order: { createdAt: 'DESC' },
       });
-    row.owner = owner;
-    row.repoName = repoName;
-    row.repoUrl = `https://github.com/${owner}/${repoName}`;
-    row.defaultBranch = dto.defaultBranch ?? 'main';
+      if (repository?.status === 'active') {
+        return { row: repository, provision: false, previousFailure: null };
+      }
+      const staleCreating =
+        repository?.status === 'creating' &&
+        repository.updatedAt.getTime() <= Date.now() - 5 * 60_000;
+      if (repository?.status === 'creating' && !staleCreating) {
+        return { row: repository, provision: false, previousFailure: null };
+      }
+      const row =
+        repository ??
+        manager.create(ProjectRepository, {
+          projectId,
+          provider: dto.provider ?? 'github',
+          createdBy: adminUserId,
+        });
+      const previousFailure =
+        typeof repository?.metadata?.error === 'string'
+          ? repository.metadata.error
+          : null;
+      row.owner = owner;
+      row.repoName = repoName;
+      row.repoUrl = `https://github.com/${owner}/${repoName}`;
+      row.defaultBranch = dto.defaultBranch ?? 'main';
+      row.status = 'creating';
+      row.metadata = {
+        visibility,
+        provisioningStartedAt: new Date().toISOString(),
+      };
+      return {
+        row: await manager.save(ProjectRepository, row),
+        provision: true,
+        previousFailure,
+      };
+    });
+    if (!claim.provision) {
+      const settled =
+        claim.row.status === 'creating'
+          ? await this.waitForRepositoryProvisioning(claim.row.id)
+          : claim.row;
+      return this.toRepositoryResponse(settled);
+    }
+    const row = claim.row;
 
     let failure: string | null = null;
-    const previousFailure =
-      typeof existing?.metadata?.error === 'string'
-        ? existing.metadata.error
-        : null;
+    let failureTrace: string | null = null;
+    const previousFailure = claim.previousFailure;
     try {
       // If the name is somehow still taken — a leftover repo, or a caller-supplied
       // name — walk a suffix rather than dead-ending the project. ISSUES.md #3.
@@ -108,7 +146,10 @@ export class RepositoriesService {
       let attemptName = repoName;
       for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
-          created = await this.github.createRepository({
+          // Recover a remote repository created by a previous process that died
+          // before persisting GitHub's response. This is the common "manual retry
+          // works" race and avoids creating a second suffixed repository.
+          created = await this.createOrRecoverRemoteRepository({
             owner,
             repoName: attemptName,
             visibility,
@@ -136,6 +177,10 @@ export class RepositoriesService {
       row.status = 'active';
       row.lastSyncedAt = new Date();
       row.metadata = { visibility };
+      // Publish the usable repository before optional webhook work. Otherwise
+      // a concurrent assignment can wait on `creating` until the webhook HTTP
+      // timeout even though GitHub already created the repository successfully.
+      await this.repoRepo.save(row);
       await this.syncEvaluationWebhook(row);
     } catch (error) {
       // Never silently mock: keep the failure visible and retryable.
@@ -146,6 +191,7 @@ export class RepositoriesService {
       row.status = 'failed';
       row.metadata = { visibility, error: message };
       failure = message;
+      failureTrace = error instanceof Error ? (error.stack ?? null) : null;
     }
     const saved = await this.repoRepo.save(row);
     if (failure && failure !== previousFailure) {
@@ -153,6 +199,12 @@ export class RepositoriesService {
         projectId,
         'GitHub repository provisioning failed',
         failure,
+        {
+          operation: 'provision_project',
+          errorCode: 'provisioning_failed',
+          trace: failureTrace,
+          context: { repositoryId: saved.id },
+        },
       );
     }
     return this.toRepositoryResponse(saved);
@@ -196,6 +248,12 @@ export class RepositoriesService {
           repository.projectId,
           'GitHub evaluation webhook failed',
           message,
+          {
+            operation: 'sync_evaluation_webhook',
+            errorCode: 'webhook_sync_failed',
+            trace: error instanceof Error ? error.stack : undefined,
+            context: { repositoryId: repository.id },
+          },
         );
       }
     }
@@ -305,18 +363,15 @@ export class RepositoriesService {
     let missingUsername = 0;
 
     for (const profile of profiles) {
-      const row =
-        (await this.collaboratorRepo.findOne({
-          where: {
-            repositoryId: repository.id,
-            freelancerProfileId: profile.id,
-          },
-        })) ??
-        this.collaboratorRepo.create({
-          repositoryId: repository.id,
-          projectId,
-          freelancerProfileId: profile.id,
-        });
+      // Claim/create the collaborator row while briefly locking the repository.
+      // Multiple role acceptances can call this method together; without the
+      // claim both callers could observe no row and one would fail the unique
+      // index, making automatic provisioning appear to require a manual retry.
+      const row = await this.claimCollaboratorRow(
+        repository,
+        projectId,
+        profile.id,
+      );
       row.permission = permission;
 
       // Already invited or accepted: return the current row, do not re-invite.
@@ -344,6 +399,19 @@ export class RepositoriesService {
       }
 
       row.githubUsername = profile.githubUsername;
+      const claimed = await this.collaboratorRepo
+        .createQueryBuilder()
+        .update(RepositoryCollaborator)
+        .set({
+          githubUsername: profile.githubUsername,
+          permission,
+          inviteStatus: 'sending',
+        })
+        .where('id = :id', { id: row.id })
+        .andWhere("invite_status NOT IN ('sending', 'invited', 'accepted')")
+        .execute();
+      if (!claimed.affected) continue;
+      row.inviteStatus = 'sending';
       await this.sendInvite(repository, row);
       if (row.inviteStatus === 'invited' || row.inviteStatus === 'accepted') {
         invited += 1;
@@ -398,6 +466,20 @@ export class RepositoriesService {
   }
 
   async provisionForAssignedTeam(projectId: string) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+      select: {
+        id: true,
+        planningFundedAt: true,
+        implementationFundedAt: true,
+      },
+    });
+    if (!project) throw new NotFoundException('Project not found');
+    if (!project.planningFundedAt && !project.implementationFundedAt) {
+      throw new ConflictException(
+        'Repository collaborator access starts only after the relevant escrow stage is funded',
+      );
+    }
     let repository = await this.findProjectRepository(projectId);
     if (!repository || repository.status === 'failed') {
       await this.createRepository(projectId, {}, null);
@@ -411,8 +493,8 @@ export class RepositoriesService {
     return this.syncCollaborators(
       projectId,
       {
-        includeTaskAssignees: true,
-        includePlanningAssignees: true,
+        includeTaskAssignees: Boolean(project.implementationFundedAt),
+        includePlanningAssignees: Boolean(project.planningFundedAt),
         permission: DEFAULT_PERMISSION,
       },
       null,
@@ -492,7 +574,10 @@ export class RepositoriesService {
     const cutoff = new Date(Date.now() - 5 * 60_000);
     const projectIds = new Set<string>();
     const failedRepositories = await this.repoRepo.find({
-      where: { status: 'failed', updatedAt: LessThanOrEqual(cutoff) },
+      where: {
+        status: In(['failed', 'creating']),
+        updatedAt: LessThanOrEqual(cutoff),
+      },
       take: 20,
       order: { updatedAt: 'ASC' },
     });
@@ -503,6 +588,11 @@ export class RepositoriesService {
     const missingTaskProjects = await this.taskRepo
       .createQueryBuilder('task')
       .select('DISTINCT task.projectId', 'projectId')
+      .innerJoin(
+        Project,
+        'fundedTaskProject',
+        'fundedTaskProject.id = task.projectId AND fundedTaskProject.implementationFundedAt IS NOT NULL',
+      )
       .leftJoin(
         RepositoryCollaborator,
         'collaborator',
@@ -519,6 +609,11 @@ export class RepositoriesService {
     const missingPlanningProjects = await this.assignmentRepo
       .createQueryBuilder('assignment')
       .select('DISTINCT assignment.projectId', 'projectId')
+      .innerJoin(
+        Project,
+        'fundedPlanningProject',
+        'fundedPlanningProject.id = assignment.projectId AND fundedPlanningProject.planningFundedAt IS NOT NULL',
+      )
       .leftJoin(
         RepositoryCollaborator,
         'collaborator',
@@ -565,7 +660,7 @@ export class RepositoriesService {
 
     const retryRows = await this.collaboratorRepo.find({
       where: {
-        inviteStatus: In(['missing_username', 'failed']),
+        inviteStatus: In(['missing_username', 'failed', 'sending']),
         updatedAt: LessThanOrEqual(cutoff),
       },
       relations: ['freelancerProfile'],
@@ -609,6 +704,7 @@ export class RepositoriesService {
         ? row.metadata.error
         : null;
     let failure: string | null = null;
+    let failureTrace: string | null = null;
     try {
       const result = await this.github.inviteCollaborator({
         owner: repository.owner,
@@ -634,6 +730,7 @@ export class RepositoriesService {
       row.inviteStatus = 'failed';
       row.metadata = { error: message };
       failure = message;
+      failureTrace = error instanceof Error ? (error.stack ?? null) : null;
     }
     await this.collaboratorRepo.save(row);
     if (failure && failure !== previousFailure) {
@@ -641,6 +738,15 @@ export class RepositoriesService {
         row.projectId,
         'GitHub collaborator invitation failed',
         `${row.githubUsername ?? 'Unknown GitHub user'}: ${failure}`,
+        {
+          operation: 'invite_collaborator',
+          errorCode: 'collaborator_invite_failed',
+          trace: failureTrace,
+          context: {
+            collaboratorId: row.id,
+            githubUsername: row.githubUsername,
+          },
+        },
       );
     }
     return row;
@@ -650,42 +756,41 @@ export class RepositoriesService {
     projectId: string,
     title: string,
     body: string,
+    details: {
+      operation: string;
+      errorCode: string;
+      trace?: string | null;
+      context?: Record<string, unknown>;
+    },
   ) {
     try {
-      const [admins, reviewer] = await Promise.all([
-        this.projectRepo.manager.getRepository(User).find({
-          where: { role: UserRole.ADMIN },
-          select: { id: true },
-        }),
-        this.assignmentRepo.findOne({
-          where: {
-            projectId,
-            phase: 'governance',
-            roleKey: 'principal_reviewer',
-            status: In(ASSIGNMENT_ACTIVE_STATUSES),
-          },
-          relations: ['freelancerProfile'],
-        }),
-      ]);
-      const recipients = new Set(admins.map((admin) => admin.id));
-      if (reviewer?.freelancerProfile?.userId) {
-        recipients.add(reviewer.freelancerProfile.userId);
-      }
-      await Promise.all(
-        [...recipients].map((userId) =>
-          this.notificationsService.createNotification({
-            userId,
-            projectId,
-            type: 'technical_issue',
-            title,
-            body,
-            actionUrl:
-              userId === reviewer?.freelancerProfile?.userId
-                ? `/reviewer/projects/${projectId}`
-                : `/dashboard/admin/repositories?projectId=${projectId}`,
-          }),
-        ),
-      );
+      await this.incidents.record({
+        subsystem: 'repositories',
+        operation: details.operation,
+        projectId,
+        errorCode: details.errorCode,
+        message: body,
+        context: details.context,
+        trace: details.trace,
+      });
+      const reviewer = await this.assignmentRepo.findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(ASSIGNMENT_ACTIVE_STATUSES),
+        },
+        relations: ['freelancerProfile'],
+      });
+      if (!reviewer?.freelancerProfile?.userId) return;
+      await this.notificationsService.createNotification({
+        userId: reviewer.freelancerProfile.userId,
+        projectId,
+        type: 'reviewer_attention',
+        title,
+        body: 'Repository automation needs operations attention. You can continue tracking the project from your reviewer workspace.',
+        actionUrl: `/reviewer/projects/${projectId}`,
+      });
     } catch (error) {
       this.logger.error(
         `Could not notify operations about repository failure for ${projectId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -751,6 +856,71 @@ export class RepositoriesService {
     });
   }
 
+  private async claimCollaboratorRow(
+    repository: ProjectRepository,
+    projectId: string,
+    freelancerProfileId: string,
+  ) {
+    return this.repoRepo.manager.transaction(async (manager) => {
+      await manager
+        .getRepository(ProjectRepository)
+        .createQueryBuilder('repository')
+        .setLock('pessimistic_write')
+        .where('repository.id = :repositoryId', {
+          repositoryId: repository.id,
+        })
+        .getOneOrFail();
+      const existing = await manager.findOne(RepositoryCollaborator, {
+        where: { repositoryId: repository.id, freelancerProfileId },
+      });
+      if (existing) return existing;
+      return manager.save(
+        RepositoryCollaborator,
+        manager.create(RepositoryCollaborator, {
+          repositoryId: repository.id,
+          projectId,
+          freelancerProfileId,
+          inviteStatus: 'pending',
+        }),
+      );
+    });
+  }
+
+  private async waitForRepositoryProvisioning(repositoryId: string) {
+    const deadline = Date.now() + 12_000;
+    let repository = await this.repoRepo.findOneByOrFail({ id: repositoryId });
+    while (repository.status === 'creating' && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      repository = await this.repoRepo.findOneByOrFail({ id: repositoryId });
+    }
+    return repository;
+  }
+
+  private async createOrRecoverRemoteRepository(input: {
+    owner: string;
+    repoName: string;
+    visibility: string;
+    description?: string | null;
+  }) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        // GET-first makes a retry safe when GitHub created the repository but
+        // the original response was lost before the local row was committed.
+        const existing = await this.github.findRepository(input);
+        if (existing) return existing;
+        return await this.github.createRepository(input);
+      } catch (error) {
+        lastError = error;
+        if (!this.isRetryableGithubError(error) || attempt === 2) throw error;
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, 250 * 2 ** attempt),
+        );
+      }
+    }
+    throw lastError;
+  }
+
   /**
    * Repository names were derived from the project title alone, so two projects
    * called "mobile store" and "Mobile Store" both wanted `project-mobile-store`.
@@ -771,6 +941,13 @@ export class RepositoriesService {
   private isNameTakenError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return /422|already exists|name already/i.test(message);
+  }
+
+  private isRetryableGithubError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /unreachable|timed?\s*out|status (?:408|425|429|5\d\d)\b/i.test(
+      message,
+    );
   }
 
   private async getCollaboratorCounts(repositoryIds: string[]) {

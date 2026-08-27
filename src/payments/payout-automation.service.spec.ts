@@ -19,13 +19,11 @@ describe('PayoutAutomationService', () => {
       save: jest.fn((entry: EscrowLedgerEntry) => Promise.resolve(entry)),
     };
     const profileRepo = { findOne: jest.fn() };
-    const userRepo = { find: jest.fn().mockResolvedValue([]) };
     const stripeService = { createTransfer: jest.fn() };
     const notificationsService = { createNotification: jest.fn() };
     const service = new PayoutAutomationService(
       ledgerRepo as never,
       profileRepo as never,
-      userRepo as never,
       stripeService as never,
       notificationsService as never,
     );

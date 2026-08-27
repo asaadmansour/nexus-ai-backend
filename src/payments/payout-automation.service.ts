@@ -7,10 +7,8 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Repository } from 'typeorm';
-import { UserRole } from 'src/common/enums/user-role.enum';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { NotificationsService } from 'src/notifications/notifications.service';
-import { User } from 'src/users/entities/user.entity';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { StripeService } from './stripe.service';
 import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
@@ -28,8 +26,6 @@ export class PayoutAutomationService
     private readonly ledgerRepo: Repository<EscrowLedgerEntry>,
     @InjectRepository(FreelancerProfile)
     private readonly profileRepo: Repository<FreelancerProfile>,
-    @InjectRepository(User)
-    private readonly userRepo: Repository<User>,
     private readonly stripeService: StripeService,
     private readonly notificationsService: NotificationsService,
     @Optional()
@@ -147,9 +143,10 @@ export class PayoutAutomationService
           severity: 'critical',
           message,
           context: { ledgerEntryId: entry.id },
+          trace: error instanceof Error ? error.stack : undefined,
         });
         if (previousStatus !== 'failed') {
-          await this.notifyTransferFailure(entry, profile.userId, message);
+          await this.notifyTransferFailure(entry, profile.userId);
         }
       }
     }
@@ -184,32 +181,16 @@ export class PayoutAutomationService
   private async notifyTransferFailure(
     entry: EscrowLedgerEntry,
     freelancerUserId: string,
-    message: string,
   ) {
-    const admins = await this.userRepo.find({
-      where: { role: UserRole.ADMIN },
-      select: { id: true },
+    await this.notificationsService.createNotification({
+      userId: freelancerUserId,
+      projectId: entry.projectId,
+      type: 'payout_delayed',
+      title: 'Payout transfer delayed',
+      body: 'Your earnings are safely recorded, but Stripe could not complete the external transfer yet. The system will retry automatically.',
+      actionUrl: '/freelancer/payments',
+      metadata: { ledgerEntryId: entry.id },
     });
-    await Promise.all([
-      this.notificationsService.createNotification({
-        userId: freelancerUserId,
-        projectId: entry.projectId,
-        type: 'payout_delayed',
-        title: 'Payout transfer delayed',
-        body: 'Your earnings are safely recorded, but Stripe could not complete the external transfer yet. The system will retry automatically.',
-        actionUrl: '/freelancer/payments',
-      }),
-      ...admins.map((admin) =>
-        this.notificationsService.createNotification({
-          userId: admin.id,
-          projectId: entry.projectId,
-          type: 'technical_issue',
-          title: 'Stripe payout requires attention',
-          body: `Ledger ${entry.id} will retry automatically. Latest error: ${message.slice(0, 500)}`,
-          actionUrl: '/dashboard/admin/payment-release-requests',
-        }),
-      ),
-    ]);
   }
 
   private enabled() {
