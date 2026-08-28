@@ -61,4 +61,7 @@ jobs:
             echo "BACKEND_TAG=$GITHUB_SHA" >> .env
             docker compose pull backend migrate
             docker compose up -d
+            # Drop images no longer referenced by a container so the disk
+            # does not fill up with one image per deploy.
+            docker image prune -af
             docker compose ps
