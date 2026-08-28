@@ -56,4 +56,14 @@ describe('freelancer GitHub username onboarding', () => {
       validateSync(dto).some((error) => error.property === 'githubUsername'),
     ).toBe(true);
   });
+
+  it('does not require a GitHub username when Google signup selects client', () => {
+    const dto = plainToInstance(CompleteSignupDto, {
+      phoneNumber: '+201001234567',
+      role: UserRole.CUSTOMER,
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.githubUsername).toBeUndefined();
+  });
 });

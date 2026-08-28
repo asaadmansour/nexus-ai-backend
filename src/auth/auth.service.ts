@@ -463,7 +463,7 @@ export class AuthService {
       await queryRunner.manager.save(user);
 
       let freelancerProfile: FreelancerProfile | null = null;
-      if (user.role === UserRole.FREELANCER) {
+      if (payload.role === UserRole.FREELANCER) {
         if (!payload.githubUsername) {
           throw new BadRequestException(
             'A GitHub username is required for freelancer accounts.',
