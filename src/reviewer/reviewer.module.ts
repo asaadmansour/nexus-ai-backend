@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { DeliveryModule } from 'src/delivery/delivery.module';
+import { EvaluationsModule } from 'src/evaluations/evaluations.module';
 import { MatchingModule } from 'src/matching/matching.module';
 import { PaymentsModule } from 'src/payments/payments.module';
 import { PlanningModule } from 'src/planning/planning.module';
@@ -7,7 +8,13 @@ import { ReviewerController } from './reviewer.controller';
 import { ReviewerService } from './reviewer.service';
 
 @Module({
-  imports: [PlanningModule, MatchingModule, DeliveryModule, PaymentsModule],
+  imports: [
+    PlanningModule,
+    MatchingModule,
+    DeliveryModule,
+    EvaluationsModule,
+    PaymentsModule,
+  ],
   controllers: [ReviewerController],
   providers: [ReviewerService],
 })

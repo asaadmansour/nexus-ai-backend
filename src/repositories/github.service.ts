@@ -433,27 +433,21 @@ export class GithubService {
   }): Promise<GithubReadOnlyInspection> {
     const root = `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}`;
     const [tree, changedFiles, checks, combinedStatus] = await Promise.all([
-      this.parse<GithubTreeResponse>(
-        await this.request(
-          `${root}/git/trees/${encodeURIComponent(input.commitSha)}?recursive=1`,
-          { method: 'GET' },
-        ),
+      this.requestAndParse<GithubTreeResponse>(
+        `${root}/git/trees/${encodeURIComponent(input.commitSha)}?recursive=1`,
+        { method: 'GET' },
         `read source tree ${input.owner}/${input.repoName}@${input.commitSha}`,
       ),
       this.readChangedFiles(root, input),
-      this.parse<GithubChecksResponse>(
-        await this.request(
-          `${root}/commits/${encodeURIComponent(input.commitSha)}/check-runs?per_page=100`,
-          { method: 'GET' },
-        ),
+      this.readOptionalInspectionSignal<GithubChecksResponse>(
+        `${root}/commits/${encodeURIComponent(input.commitSha)}/check-runs?per_page=100`,
         `read checks for ${input.owner}/${input.repoName}@${input.commitSha}`,
+        { total_count: 0, check_runs: [] },
       ),
-      this.parse<GithubCombinedStatusResponse>(
-        await this.request(
-          `${root}/commits/${encodeURIComponent(input.commitSha)}/status`,
-          { method: 'GET' },
-        ),
+      this.readOptionalInspectionSignal<GithubCombinedStatusResponse>(
+        `${root}/commits/${encodeURIComponent(input.commitSha)}/status`,
         `read status for ${input.owner}/${input.repoName}@${input.commitSha}`,
+        { statuses: [] },
       ),
     ]);
 
@@ -696,6 +690,31 @@ export class GithubService {
         `GitHub is unreachable: ${message}`,
       );
     }
+  }
+
+  private requestAndParse<T>(
+    path: string,
+    init: { method: string; body?: Record<string, unknown> },
+    operation: string,
+  ): Promise<T> {
+    return this.request(path, init).then((response) =>
+      this.parse<T>(response, operation),
+    );
+  }
+
+  private async readOptionalInspectionSignal<T>(
+    path: string,
+    operation: string,
+    fallback: T,
+  ): Promise<T> {
+    const response = await this.request(path, { method: 'GET' });
+    if (response.status === 403 || response.status === 404) {
+      this.logger.warn(
+        `GitHub ${operation} is unavailable (${response.status}); continuing with a human-verification evidence gap`,
+      );
+      return fallback;
+    }
+    return this.parse<T>(response, operation);
   }
 
   private async readChangedFiles(

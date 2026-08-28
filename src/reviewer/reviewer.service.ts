@@ -7,6 +7,7 @@ import { DataSource, In, IsNull } from 'typeorm';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { DeliveryService } from 'src/delivery/delivery.service';
+import { EvaluationsService } from 'src/evaluations/evaluations.service';
 import { ProjectHandoffsService } from 'src/delivery/project-handoffs.service';
 import { ReviewProjectHandoffDto } from 'src/delivery/dtos/review-project-handoff.dto';
 import { ReviewSubmissionDto } from 'src/delivery/dtos/review-submission.dto';
@@ -25,6 +26,7 @@ import { ProjectPlan } from 'src/projects/entities/project-plan.entity';
 import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
+import { EvaluationRun } from 'src/projects/entities/evaluation-run.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { ProjectHandoff } from 'src/projects/entities/project-handoff.entity';
 import { Project } from 'src/projects/entities/project.entity';
@@ -45,6 +47,7 @@ export class ReviewerService {
     private readonly plans: ProjectPlansService,
     private readonly matching: MatchingService,
     private readonly delivery: DeliveryService,
+    private readonly evaluations: EvaluationsService,
     private readonly handoffs: ProjectHandoffsService,
     private readonly releases: PaymentReleaseRequestsService,
   ) {}
@@ -339,6 +342,30 @@ export class ReviewerService {
       dto,
       this.adminIdentity(userId),
       'principal_reviewer',
+    );
+  }
+
+  async retrySubmissionEvaluation(id: string, userId: string) {
+    const item = await this.dataSource
+      .getRepository(ProjectSubmission)
+      .findOne({ where: { id }, select: { id: true, projectId: true } });
+    if (!item) throw new NotFoundException('Submission not found');
+    await this.assertReviewer(item.projectId, userId);
+
+    const latestRun = await this.dataSource
+      .getRepository(EvaluationRun)
+      .findOne({ where: { submissionId: id }, order: { createdAt: 'DESC' } });
+    if (latestRun) {
+      return this.evaluations.retryRun(
+        latestRun.id,
+        { reason: 'principal_reviewer_retry' },
+        userId,
+      );
+    }
+    return this.evaluations.queueForSubmission(
+      id,
+      { mode: 'async', reason: 'principal_reviewer_retry' },
+      userId,
     );
   }
 

@@ -131,6 +131,108 @@ describe('GithubService read-only inspection', () => {
     }
   });
 
+  it('continues source inspection when the token cannot read GitHub checks', async () => {
+    const commitSha = 'a'.repeat(40);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation((input) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        if (url.includes('/git/trees/')) {
+          return Promise.resolve(
+            Response.json({
+              truncated: false,
+              tree: [
+                {
+                  path: 'src/index.ts',
+                  type: 'blob',
+                  size: 24,
+                  sha: 'source-sha',
+                },
+                {
+                  path: 'package.json',
+                  type: 'blob',
+                  size: 20,
+                  sha: 'manifest-sha',
+                },
+              ],
+            }),
+          );
+        }
+        if (url.includes('/pulls/2/files')) {
+          return Promise.resolve(
+            Response.json([
+              {
+                filename: 'src/index.ts',
+                status: 'modified',
+                changes: 1,
+                patch: '+export const ready = true;',
+              },
+            ]),
+          );
+        }
+        if (url.includes('/check-runs') || url.endsWith('/status')) {
+          return Promise.resolve(
+            Response.json(
+              { message: 'Resource not accessible by personal access token' },
+              { status: 403 },
+            ),
+          );
+        }
+        if (url.includes('/contents/src/index.ts')) {
+          return Promise.resolve(
+            Response.json({
+              type: 'file',
+              encoding: 'base64',
+              path: 'src/index.ts',
+              sha: 'source-sha',
+              content: Buffer.from('export const ready = true;').toString(
+                'base64',
+              ),
+            }),
+          );
+        }
+        if (url.includes('/contents/package.json')) {
+          return Promise.resolve(
+            Response.json({
+              type: 'file',
+              encoding: 'base64',
+              path: 'package.json',
+              sha: 'manifest-sha',
+              content: Buffer.from('{"scripts":{}}').toString('base64'),
+            }),
+          );
+        }
+        return Promise.resolve(new Response('not found', { status: 404 }));
+      });
+
+    try {
+      const result = await service().inspectRepositorySnapshot({
+        owner: 'muhanadmedhat',
+        repoName: 'project-hello-world',
+        commitSha,
+        pullRequestNumber: 2,
+      });
+
+      expect(result.inspection).toMatchObject({
+        sourceInspected: true,
+        snapshotVerified: true,
+        verificationComplete: false,
+        coverage: { inspectedFiles: 2 },
+      });
+      expect(result.audit.githubChecks).toMatchObject({
+        checkRuns: [],
+        statuses: [],
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('treats a concurrently completed merge as successful', async () => {
     const headSha = 'a'.repeat(40);
     const baseSha = 'b'.repeat(40);

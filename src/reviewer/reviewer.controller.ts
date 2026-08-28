@@ -220,6 +220,17 @@ export class ReviewerController {
     };
   }
 
+  @Post('submissions/:id/evaluation/retry')
+  async retrySubmissionEvaluation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.reviewer.retrySubmissionEvaluation(id, user.sub),
+    };
+  }
+
   @Get('submissions/:id')
   async submission(
     @Param('id', ParseUUIDPipe) id: string,
