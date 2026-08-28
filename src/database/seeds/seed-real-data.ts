@@ -561,70 +561,10 @@ const PROJECTS: ProjectSeed[] = [
   },
 ];
 
-// One project per generated customer. requiredSkills rotate through the same
-// four discipline-exclusive pools the flagship briefs use, so no specialist can
-// out-match another on the shared list and role fit stays the decider.
-const ARCHITECT_ONLY = ['Solution Architecture', 'Microservices', 'Event-Driven Architecture',
-  'Domain-Driven Design', 'AWS', 'Kubernetes', 'Scalability', 'API Design', 'Technical Leadership'];
-const UIUX_ONLY = ['Figma', 'Design Systems', 'User Flows', 'Wireframing', 'Prototyping',
-  'UI Design', 'UX Research', 'Interaction Design', 'Usability Testing', 'Design Tokens'];
-const BACKEND_ONLY = ['Node.js', 'TypeORM', 'REST APIs', 'GraphQL', 'Redis', 'BullMQ',
-  'Authentication', 'Stripe Integration', 'Performance Optimization', 'Testing'];
-const FRONTEND_ONLY = ['React', 'Next.js', 'Tailwind CSS', 'Redux', 'React Query',
-  'Web Performance', 'Component Libraries', 'Jest', 'Testing Library'];
-
-const pick = (list: string[], index: number, n: number) =>
-  Array.from({ length: n }, (_, k) => list[(index * 3 + k) % list.length]);
-
-const PROJECT_SHAPES = [
-  ['customer portal', 'Give customers a self-service account area', 'account portal, profile management, document uploads, support requests'],
-  ['booking platform', 'Take bookings online instead of by phone', 'availability calendar, online booking, reminders, staff schedule'],
-  ['ecommerce storefront', 'Sell the full catalogue online', 'product catalog, cart, checkout, order tracking'],
-  ['internal dashboard', 'Replace the spreadsheets the team runs on', 'reporting dashboard, data import, user roles, audit trail'],
-  ['mobile companion app', 'Put the service in customers pockets', 'mobile ordering, notifications, loyalty points, account history'],
-  ['inventory system', 'Know what is in stock without counting it', 'stock levels, purchase orders, supplier records, low stock alerts'],
-];
-
-const STATUS_CYCLE: [ProjectStatus, string][] = [
-  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
-  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
-  [ProjectStatus.PLANNING_MATCHING, 'matching'],
-  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
-  [ProjectStatus.PLANNING_ASSIGNED, 'assigned'],
-  [ProjectStatus.ACTIVE, 'completed'],
-  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
-  [ProjectStatus.COMPLETED, 'completed'],
-];
-
-const GENERATED_PROJECTS: ProjectSeed[] = GENERATED_CUSTOMERS.map((customer, index) => {
-  const [shape, goal, features] = PROJECT_SHAPES[index % PROJECT_SHAPES.length];
-  const [status, planningStatus] = STATUS_CYCLE[index % STATUS_CYCLE.length];
-  const budget = 6000 + (index % 9) * 3000;
-  return {
-    customerIndex: CUSTOMERS.length + index,
-    title: `${customer.company} ${shape}`,
-    description: `${goal} for ${customer.company}, a ${customer.domain} business. Core scope covers ${features}.`,
-    budgetMin: `${budget}.00`,
-    budgetMax: `${budget * 2}.00`,
-    status,
-    planningStatus,
-    projectType: shape,
-    domain: customer.domain,
-    mainGoal: goal + '.',
-    targetUsers: `${customer.company} customers and the team running the service.`,
-    coreFeatures: features,
-    platforms: index % 3 === 0 ? 'web' : 'web, mobile',
-    requiredSkills: [
-      ...pick(ARCHITECT_ONLY, index, 3),
-      ...pick(UIUX_ONLY, index, 3),
-      ...pick(BACKEND_ONLY, index, 3),
-      ...pick(FRONTEND_ONLY, index, 3),
-    ],
-    deadlineDays: 30 + (index % 10) * 12,
-  };
-});
-
-const ALL_PROJECTS = [...PROJECTS, ...GENERATED_PROJECTS];
+// The generated customers deliberately have no projects of their own: the
+// marketplace has many more clients than open briefs, which is what a real one
+// looks like. ALL_PROJECTS therefore stays the twelve hand-written flagships.
+const ALL_PROJECTS = PROJECTS;
 
 // Every top freelancer carries the platform's full domain vocabulary, taken
 // from the project list itself. projectFit is a BM25 rank over the brief text
@@ -638,6 +578,11 @@ const DOMAIN_VOCAB = Array.from(
       .filter((word) => word.length > 1)),
   ),
 ).join(', ');
+
+const TOP_BIO =
+  'Senior specialist on the platform with a perfect delivery record across ' +
+  'architecture, backend, frontend and product design work. Delivered across: ' +
+  `${DOMAIN_VOCAB}.`;
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -712,9 +657,7 @@ async function createFreelancer(seed: FreelancerSeed): Promise<void> {
     profiles.create({
       userId: user.id,
       headline: seed.headline,
-      bio: seed.isTop
-        ? `${seed.bio} Delivered across: ${DOMAIN_VOCAB}.`
-        : seed.bio,
+      bio: seed.isTop ? TOP_BIO : seed.bio,
       skills: seed.skills,
       githubUsername: seed.githubUsername,
       yearsExperience: seed.yearsExperience,
@@ -767,7 +710,12 @@ async function createFreelancer(seed: FreelancerSeed): Promise<void> {
     ),
   );
 
-  const sourceText = `${seed.headline}\n${profile.bio}\nSkills: ${seed.skills.join(', ')}`;
+  // Top profiles embed their shared bio alone. Including the headline or the
+  // skill list would reintroduce a per-discipline tilt, and the dense arm is a
+  // pool-wide rank: a small similarity gap becomes a large projectFit gap.
+  const sourceText = seed.isTop
+    ? TOP_BIO
+    : `${seed.headline}\n${profile.bio}\nSkills: ${seed.skills.join(', ')}`;
   const vector = await embed(sourceText);
   if (vector) {
     await dataSource.query(

@@ -1,0 +1,38 @@
+{
+  "system_context": {
+    "summary": "CargoLink serves business customers, dispatchers, and operations managers at one depot. The browser, Next.js client, NestJS API, PostgreSQL shipment database, Redis-backed email worker, and deployment configuration are inside the solution; the email provider is external. TLS/authentication protects the customer boundary, role guards protect depot operations, one reduced public route resolves a tracking code, and the worker reads only committed outbox events. Live GPS maps, route optimisation, native driver apps, invoicing, customs, warehouse inventory, extra depots, and microservices are explicitly outside release one."
+  },
+  "architecture_diagram": {
+    "summary": "The diagram shows customer, dispatcher, manager, and anonymous tracking traffic reaching one responsive Next.js client over HTTPS, the client calling one role-protected NestJS REST API, and the API owning transactional shipment, run, and stop data in PostgreSQL. The API publishes only committed notification jobs to Redis; an independent worker sends idempotent HTTPS requests to the email provider and records delivery state. Booking and dispatch never depend synchronously on email availability.",
+    "artifacts": ["planning/architecture-diagram.mmd"]
+  },
+  "technology_stack": {
+    "summary": "Use TypeScript Next.js for the responsive web client, NestJS for the modular-monolith REST API, PostgreSQL for relational shipment data and run-capacity constraints, Redis/BullMQ only for notification retries, and an email-provider adapter with a fake local transport. Docker and GitHub Actions support reproducible staging and production. A single depot with manual dispatch does not justify GraphQL, microservices, event streaming, telematics services, or Kubernetes; one deployable API preserves assignment transactions and reduces operating cost."
+  },
+  "module_boundaries": {
+    "summary": "Identity owns users/sessions/roles; Directory owns drivers, vehicles, service levels, and zones; Capacity owns dated runs, stop capacity, and blackout dates; Shipments owns booking, tracking codes, and cancellation; Dispatch owns stop assignment, ordering, and capacity locks; Tracking owns validated status transitions and the event timeline; Reporting owns manager-only aggregates; Notifications owns outbox rows, templates, retries, and provider calls. Modules expose application services and REST DTOs rather than repositories. Backend, customer web, depot web, and integration/quality have separate owned paths so four freelancers can work without network-service boundaries."
+  },
+  "api_contract": {
+    "summary": "The contract defines login, service-level reads, customer shipment create/list/detail/cancel, an anonymous reduced tracking-code lookup, dispatcher board reads, run creation, stop assignment and resequencing, status transitions with failure reason codes, driver blackout editing, and manager summary reads with roles, input fields, responses, and errors. Validation is 400 with field details, unauthorized scope is 403, missing records are 404, and a full or stale run is 409 RUN_AT_CAPACITY or ASSIGNMENT_CONFLICT. Mutations accept idempotency keys; internal notification events carry shipment ID, template type, recipient, and unique occurrence ID.",
+    "artifacts": ["planning/architecture-submission.md"]
+  },
+  "data_model": {
+    "summary": "Persistent entities are users, drivers, vehicles, service levels, zones and postcodes, dated runs, driver blackouts, shipments, stops, tracking events, and notification outbox rows. Keys and indexes cover unique email, unique tracking code, one run per driver and per vehicle per date, unique stop sequence within a run, a single active stop per shipment and kind, board lookups by date and zone, customer shipment lists, and due jobs. Assigning a stop locks the run row and counts active stops against capacity so an overfilled vehicle is impossible. Schema changes use additive, backward-compatible migrations before cleanup.",
+    "artifacts": ["planning/architecture-submission.md"]
+  },
+  "integrations": {
+    "summary": "Transactional email is the only external integration. A worker claims committed outbox rows, passes the occurrence ID as the provider idempotency key, times out after 10 seconds, and retries network, 429, and 5xx failures after 1, 5, and 20 minutes. Permanent address errors are recorded and visible to depot staff but never reverse a booking or a delivery status. Provider downtime cannot block booking or dispatch. Payments, invoicing, SMS, map and telematics services, customs systems, carrier hand-off APIs, and social login are prohibited in release one."
+  },
+  "non_functional": {
+    "summary": "Board and tracking reads must have p95 below 500 ms and mutations below 800 ms at 50 concurrent users, excluding asynchronous email. A 20-request race test must produce zero shipments on two runs and zero runs over capacity. Target 99.5% monthly availability, WCAG 2.1 AA, keyboard-complete flows, 44px controls, and a 320px viewport. Store instants in UTC and render Africa/Cairo, evaluating service cut-offs in depot local time. No addresses, contact details, driver location history, or payment data may enter logs; every status change and reassignment is audited with actor and timestamp."
+  },
+  "deployment_observability": {
+    "summary": "Local, staging, and production use validated database, Redis, session, public-URL, and email configuration. CI runs format, lint, type, unit/integration, migration, and end-to-end checks. Deploy backward-compatible migrations before API, worker, and web, then smoke-test health, login, a booking, one assignment, and a fake-provider notification. Structured logs carry correlation IDs without addresses or contact details. Alert on health failure, 5xx rate, queue backlog, shipments still unassigned after cut-off, and repeated email failures. Back up daily for 14 days; rollback uses the previous image."
+  },
+  "implementation_handoff": {
+    "summary": "Use apps/api, apps/web, packages/contracts, tests, deploy, and docs/runbooks. The architect owns shared schemas; contract changes require focused review. Implement contracts/schema first, then backend dispatch and customer/depot clients in parallel against fixtures, followed by integration/release. Require TypeScript strict mode, migration-per-schema-change, and no cross-module repository imports. Integration gates are contract tests, capacity-race tests, role matrix, responsive/accessibility checks, complete user journeys, then staging smoke and rollback tests."
+  },
+  "project_feature_coverage": {
+    "summary": "Shipment booking uses Directory and Capacity to validate service level, zone, and collection window, Shipments to write the booking and tracking code atomically, and Notifications to confirm. Dispatch assignment locks the target run, enforces stop capacity and a single active assignment, and records ordered stops. Delivery status tracking validates dispatcher-only transitions, requires a reason code on failure, writes the timeline, and exposes a reduced public view. Delivery performance review returns manager-only date-range volume, on-time rate, and failure reasons. Identity, directory, capacity, and email exist only to support these four confirmed features."
+  }
+}

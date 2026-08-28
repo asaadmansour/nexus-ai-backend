@@ -1,0 +1,30 @@
+flowchart LR
+  subgraph Public[Public trust boundary]
+    Tracker[Public tracking lookup]
+  end
+  subgraph Customer[Authenticated customer boundary]
+    Shipper[Business customer browser]
+  end
+  subgraph Depot[Authenticated depot boundary]
+    Dispatcher[Dispatcher browser]
+    Manager[Operations manager browser]
+  end
+  subgraph CargoLink[CargoLink deployment]
+    Web[Next.js responsive web]
+    API[NestJS modular-monolith API]
+    DB[(PostgreSQL shipment and run data)]
+    Queue[(Redis notification queue)]
+    Worker[Email worker]
+  end
+  Email[Transactional email provider]
+
+  Tracker -->|HTTPS + tracking code| Web
+  Shipper -->|HTTPS + customer role| Web
+  Dispatcher -->|HTTPS + dispatcher role| Web
+  Manager -->|HTTPS + manager role| Web
+  Web -->|REST JSON + authenticated session| API
+  API -->|transactions and run capacity locks| DB
+  API -->|committed outbox job| Queue
+  Queue --> Worker
+  Worker -->|idempotent HTTPS request| Email
+  Worker -->|delivery state| DB

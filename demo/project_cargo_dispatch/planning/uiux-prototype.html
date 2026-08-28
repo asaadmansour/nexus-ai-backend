@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CargoLink UI/UX prototype</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #151b23;
+        --surface: #fff;
+        --canvas: #f2f5f8;
+        --primary: #1b4f8a;
+        --accent: #c2620a;
+        --danger: #b42318;
+        --border: #c9d3de;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--canvas);
+        color: var(--ink);
+        font:
+          16px/1.5 Inter,
+          system-ui,
+          sans-serif;
+      }
+      button {
+        min-height: 44px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--ink);
+        padding: 10px 16px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:focus-visible {
+        outline: 3px solid #7ba3cd;
+        outline-offset: 2px;
+      }
+      button.primary {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: #fff;
+      }
+      button.danger {
+        color: var(--danger);
+      }
+      button.compact {
+        min-height: 44px;
+        min-width: 44px;
+        padding: 8px 12px;
+      }
+      header {
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+      }
+      .bar {
+        max-width: 1120px;
+        min-height: 68px;
+        margin: auto;
+        padding: 12px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .brand {
+        font-size: 24px;
+        font-weight: 700;
+      }
+      .roles {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .roles button[aria-pressed='true'] {
+        border-color: var(--primary);
+        color: var(--primary);
+        font-weight: 700;
+      }
+      main {
+        max-width: 1120px;
+        margin: auto;
+        padding: 28px 20px 60px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        letter-spacing: 0;
+      }
+      h2 {
+        margin: 0 0 12px;
+        font-size: 20px;
+        letter-spacing: 0;
+      }
+      .lede {
+        margin: 0 0 24px;
+        color: #4b5763;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 280px minmax(0, 1fr);
+        gap: 24px;
+      }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 20px;
+      }
+      label {
+        display: block;
+        margin: 0 0 6px;
+        font-weight: 700;
+      }
+      select,
+      input {
+        width: 100%;
+        min-height: 44px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #fff;
+        padding: 9px 12px;
+        font: inherit;
+      }
+      .field {
+        margin-bottom: 18px;
+      }
+      .list {
+        display: grid;
+        gap: 12px;
+      }
+      .item {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+      }
+      .item p {
+        margin: 3px 0 0;
+        color: #4b5763;
+      }
+      .slots {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(100px, 1fr));
+        gap: 10px;
+        margin: 18px 0;
+      }
+      .tag {
+        display: inline-block;
+        border-radius: 999px;
+        background: #e4edf6;
+        color: #14406f;
+        padding: 3px 9px;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .tag.warn {
+        background: #f7e9dc;
+        color: #8a4506;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin: 18px 0;
+      }
+      .metric {
+        border-left: 4px solid var(--accent);
+        background: #fff;
+        padding: 14px;
+      }
+      .metric strong {
+        display: block;
+        font-size: 26px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--border);
+        padding: 12px 8px;
+        text-align: left;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+      .notice {
+        border-left: 4px solid var(--primary);
+        background: #e4edf6;
+        padding: 14px;
+      }
+      .timeline {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 10px;
+      }
+      .timeline li {
+        border-left: 3px solid var(--primary);
+        padding: 2px 0 2px 14px;
+      }
+      .timeline li[aria-disabled='true'] {
+        border-left-color: var(--border);
+        color: #4b5763;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 719px) {
+        .bar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        main {
+          padding: 22px 16px 80px;
+        }
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        .slots {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .metrics {
+          grid-template-columns: 1fr;
+        }
+        .item {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        table,
+        thead,
+        tbody,
+        tr,
+        th,
+        td {
+          display: block;
+        }
+        thead {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+        }
+        tr {
+          border-bottom: 1px solid var(--border);
+          padding: 8px 0;
+        }
+        td {
+          border: 0;
+          padding: 4px 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <div class="brand">CargoLink</div>
+        <nav class="roles" aria-label="Prototype role">
+          <button data-role="customer" aria-pressed="true">Customer</button
+          ><button data-role="dispatcher" aria-pressed="false">
+            Dispatcher</button
+          ><button data-role="manager" aria-pressed="false">Manager</button>
+        </nav>
+      </div>
+    </header>
+    <main>
+      <section id="customer">
+        <h1 tabindex="-1">Book a pickup</h1>
+        <p class="lede">
+          Enter the shipment, choose a service level, and pick a Cairo-time
+          collection window.
+        </p>
+        <div class="layout">
+          <aside class="panel">
+            <div class="field">
+              <label for="service">Service level</label
+              ><select id="service">
+                <option>Next day (cut-off 16:00)</option>
+                <option>Two day economy</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="date">Collection date</label
+              ><input id="date" type="date" value="2026-09-03" />
+            </div>
+            <button>Apply</button>
+          </aside>
+          <div class="panel" id="customer-step">
+            <h2>Shipment details</h2>
+            <div class="field">
+              <label for="pickup">Pickup address</label
+              ><input id="pickup" value="14 Talaat Harb, Downtown" />
+            </div>
+            <div class="field">
+              <label for="delivery">Delivery address</label
+              ><input id="delivery" value="8 Road 9, Maadi (11431)" />
+            </div>
+            <div class="field">
+              <label for="pieces">Pieces</label
+              ><input id="pieces" type="number" value="3" min="1" />
+            </div>
+            <div class="actions">
+              <button class="primary" id="choose-window">
+                Choose collection window
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="dispatcher" hidden>
+        <h1 tabindex="-1">Dispatch board</h1>
+        <p class="lede">
+          Thursday, 3 September. Assignments and status changes are announced and
+          audited.
+        </p>
+        <div class="layout">
+          <aside class="panel">
+            <h2>Unassigned</h2>
+            <div class="list">
+              <div class="item">
+                <div>
+                  <strong>CL-4821</strong>
+                  <p>Maadi, 3 pieces, next day</p>
+                </div>
+                <button class="primary" id="assign">Assign</button>
+              </div>
+              <div class="item">
+                <div>
+                  <strong>CL-4822</strong>
+                  <p>Nasr City, 1 piece, economy</p>
+                </div>
+                <button>Assign</button>
+              </div>
+            </div>
+          </aside>
+          <div class="panel" id="run-panel">
+            <h2>Run 12 - Hassan Fouad, van 4471</h2>
+            <p class="lede">
+              Maadi zone. <span class="tag">9 of 12 stops</span>
+            </p>
+            <div class="list">
+              <div class="item">
+                <div>
+                  <span class="tag">Delivered</span
+                  ><strong> 1. CL-4790 - Maadi Sarayat</strong>
+                  <p>Completed 09:42</p>
+                </div>
+                <button class="compact" disabled>Move up</button>
+              </div>
+              <div class="item">
+                <div>
+                  <span class="tag warn">Out for delivery</span
+                  ><strong> 2. CL-4801 - Degla</strong>
+                  <p>Promised today, 2 pieces</p>
+                </div>
+                <div class="actions" style="margin: 0">
+                  <button class="compact" aria-label="Move CL-4801 up">
+                    Move up</button
+                  ><button class="compact" aria-label="Move CL-4801 down">
+                    Move down
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="primary">Mark delivered</button
+              ><button class="danger">Record failed delivery</button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="manager" hidden>
+        <h1 tabindex="-1">Delivery performance</h1>
+        <p class="lede">
+          A read-only summary for the selected Cairo date range.
+        </p>
+        <div class="metrics">
+          <div class="metric"><span>Delivered</span><strong>612</strong></div>
+          <div class="metric"><span>On-time rate</span><strong>94.1%</strong></div>
+          <div class="metric">
+            <span>Failed deliveries</span><strong>2.6%</strong>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Daily breakdown</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Booked</th>
+                <th>Delivered</th>
+                <th>Failed</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1 Sep</td>
+                <td>212</td>
+                <td>203</td>
+                <td>6</td>
+              </tr>
+              <tr>
+                <td>2 Sep</td>
+                <td>198</td>
+                <td>191</td>
+                <td>4</td>
+              </tr>
+              <tr>
+                <td>3 Sep</td>
+                <td>224</td>
+                <td>218</td>
+                <td>6</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script>
+      const step = document.querySelector('#customer-step');
+      document.querySelectorAll('[data-role]').forEach((button) =>
+        button.addEventListener('click', () => {
+          document
+            .querySelectorAll('[data-role]')
+            .forEach((item) =>
+              item.setAttribute('aria-pressed', String(item === button)),
+            );
+          ['customer', 'dispatcher', 'manager'].forEach(
+            (role) =>
+              (document.querySelector(`#${role}`).hidden =
+                role !== button.dataset.role),
+          );
+          document.querySelector(`#${button.dataset.role} h1`).focus();
+        }),
+      );
+      document.querySelector('#choose-window').addEventListener('click', () => {
+        step.innerHTML =
+          '<h2>Choose a collection window</h2><p>Thursday, 3 September. Windows use Africa/Cairo.</p><div class="slots"><button>09:00-11:00</button><button>11:00-13:00</button><button>13:00-15:00</button><button>15:00-17:00</button></div><div class="notice">If the 16:00 cut-off passes while you book, the promised date moves to the next working day and we ask you to confirm again.</div>';
+        step.querySelectorAll('.slots button').forEach((button) =>
+          button.addEventListener('click', () => {
+            step.innerHTML = `<h2>Review pickup</h2><p><strong>Next day, 3 pieces</strong><br>14 Talaat Harb, Downtown<br>8 Road 9, Maadi (11431)<br>Thursday, 3 September, ${button.textContent}</p><div class="actions"><button>Change window</button><button class="primary" id="confirm">Confirm booking</button></div>`;
+            step.querySelector('#confirm').addEventListener('click', () => {
+              step.innerHTML =
+                '<h2>Pickup booked</h2><div class="notice" role="status">Tracking code <strong>CL-4821</strong>. We sent a confirmation email.</div><ul class="timeline"><li><strong>Booked</strong><br>3 Sep, 08:12</li><li aria-disabled="true"><strong>Collected</strong><br>Expected 3 Sep</li><li aria-disabled="true"><strong>Out for delivery</strong><br>Expected 4 Sep</li><li aria-disabled="true"><strong>Delivered</strong><br>Promised 4 Sep</li></ul><div class="actions"><button>View my shipments</button><button class="danger">Cancel pickup</button></div>';
+            });
+          }),
+        );
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+Business domain: Regional parcel logistics and last-mile delivery dispatch.
+Main goal: Replace the spreadsheet and phone dispatch process so business customers can book pickups and follow their own shipments without calling the depot.
+Target users: Business customers book pickups and track shipments; dispatchers build daily driver runs and update delivery status; operations managers review delivery performance.
+Core features: Email and password sign-in; shipment booking with addresses, pieces, weight, and service level; tracking code lookup and status timeline; dispatcher board for assigning shipments to dated driver runs; delivery status updates with failure reasons; email notifications on booking and delivery milestones; manager delivery performance summary.
+Platforms: Responsive website for desktop and mobile browsers.
+Solution type: Web application with customer, dispatcher, and manager role-based areas.
+Scope details: About 12 screens covering sign-in, my shipments, shipment booking details, service level and pickup window, booking review, booking confirmation with tracking code, shipment tracking timeline, cancellation, the daily dispatch board, run detail with stop ordering, driver and vehicle availability, and a manager performance summary. The primary journey is book a pickup, receive a tracking code, watch the status timeline, then cancel before pickup if plans change.
+Integrations: Transactional email for booking confirmations and delivery milestone notices. No payments, invoicing, live GPS map tracking, carrier APIs, customs systems, SMS, social login, or native mobile integration in the first release.
+Admin needs: A private depot area to manage drivers, vehicles, service levels, delivery zones, blackout dates, daily runs, stop order, and shipment status; managers can view delivered volume, on-time rate, and failed-delivery rate.
+Deliverables: Approved architecture and UI/UX handoffs, working responsive web app, source repository, automated tests, deployment configuration, live staging link, and setup/runbook documentation.
+Constraints and preferences: English first; accessible keyboard navigation and WCAG AA contrast; plain operational visual style that stays readable on a depot screen; store no driver location history or customer payment data; one depot; Cairo time zone; avoid native apps and microservices.
+Client background: Non-technical operations director.
+Suggested team size: 4
+Experience level: Mid-to-senior freelancers with senior architecture review.
+Minimum years: 3

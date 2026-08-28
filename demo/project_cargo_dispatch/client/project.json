@@ -1,0 +1,9 @@
+{
+  "title": "CargoLink dispatch and delivery tracking portal",
+  "description": "A responsive logistics web application where business customers book pickups and track shipments, dispatchers build daily driver runs and update delivery status, and operations managers review delivery performance for one depot. The first release deliberately excludes live GPS maps, automatic route optimisation, a native driver app, invoicing and payments, customs paperwork, and warehouse inventory.",
+  "budgetMin": 11000,
+  "budgetMax": 20000,
+  "currency": "EGP",
+  "deadlineDays": 45,
+  "isDeadlineFlexible": true
+}
