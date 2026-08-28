@@ -151,7 +151,7 @@ const TOP: FreelancerSeed[] = [
     ratingsCount: 54,
   },
   {
-    email: 'ibrahimmostafa9939@gmai.com',
+    email: 'ibrahimmostafa9939@gmail.com',
     firstName: 'Ibrahim',
     lastName: 'Mostafa',
     githubUsername: 'ebrahimmostafa133',
