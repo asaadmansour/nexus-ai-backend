@@ -103,6 +103,10 @@ type GithubCombinedStatusResponse = {
   }>;
 };
 
+type GithubCompareResponse = {
+  status?: string;
+};
+
 export type GithubReadOnlyInspection = {
   inspection: Record<string, unknown>;
   audit: Record<string, unknown>;
@@ -380,6 +384,23 @@ export class GithubService {
       );
     }
     return updated;
+  }
+
+  async isCommitAncestor(input: {
+    owner: string;
+    repoName: string;
+    ancestorSha: string;
+    descendantSha: string;
+  }): Promise<boolean> {
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}/compare/${encodeURIComponent(input.ancestorSha)}...${encodeURIComponent(input.descendantSha)}`,
+      { method: 'GET' },
+    );
+    const payload = await this.parse<GithubCompareResponse>(
+      response,
+      `compare commits ${input.owner}/${input.repoName}`,
+    );
+    return payload.status === 'ahead' || payload.status === 'identical';
   }
 
   async mergePullRequest(input: {

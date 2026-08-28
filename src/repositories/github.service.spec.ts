@@ -363,6 +363,25 @@ describe('GithubService read-only inspection', () => {
     }
   });
 
+  it('recognizes a project commit embedded in a later pull request', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(Response.json({ status: 'ahead' }));
+
+    try {
+      await expect(
+        service().isCommitAncestor({
+          owner: 'nexus-ai',
+          repoName: 'app',
+          ancestorSha: 'a'.repeat(40),
+          descendantSha: 'b'.repeat(40),
+        }),
+      ).resolves.toBe(true);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('returns null when the deterministic repository does not exist', async () => {
     const fetchMock = jest
       .spyOn(global, 'fetch')

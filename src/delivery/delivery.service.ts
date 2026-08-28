@@ -61,6 +61,7 @@ type PullRequestReviewReadiness = {
   baseRef: string | null;
   requiredBaseRef: string;
   targetReady: boolean;
+  historyReady: boolean;
   evaluationCurrent: boolean;
   canRetarget: boolean;
   blocker: string | null;
@@ -191,7 +192,7 @@ export function hasOnlyEvaluatorVisibilityGaps(
   evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
 ) {
   if (!evaluation?.acceptanceCoverage) return false;
-  const coverage = evaluation.acceptanceCoverage as Record<string, unknown>;
+  const coverage = evaluation.acceptanceCoverage;
   const items = Array.isArray(coverage.items)
     ? (coverage.items as Array<Record<string, unknown>>)
     : [];
@@ -1010,6 +1011,15 @@ export class DeliveryService {
         `Approval is blocked because the pull request must target ${submission.repository.defaultBranch}`,
       );
     }
+    const embeddedPrerequisite = await this.findEmbeddedUnintegratedSubmission(
+      submission,
+      pullRequest,
+    );
+    if (embeddedPrerequisite) {
+      throw new ConflictException(
+        `Approval is blocked because this pull request contains ${embeddedPrerequisite.title ?? 'another project submission'}, which must be approved and integrated first`,
+      );
+    }
     if (
       (pullRequest.state !== 'open' && !pullRequest.merged) ||
       pullRequest.draft
@@ -1064,8 +1074,13 @@ export class DeliveryService {
         number,
       });
       const targetReady = pullRequest.baseRef === requiredBaseRef;
+      const embeddedPrerequisite = targetReady
+        ? await this.findEmbeddedUnintegratedSubmission(submission, pullRequest)
+        : null;
+      const historyReady = !embeddedPrerequisite;
       const evaluationCurrent =
         targetReady &&
+        historyReady &&
         evaluation?.evidenceBundle?.baseCommitSha === pullRequest.baseSha;
       const prerequisite = targetReady
         ? null
@@ -1078,7 +1093,9 @@ export class DeliveryService {
         prerequisite && this.prerequisiteIsIntegrated(prerequisite),
       );
       let blocker: string | null = null;
-      if (!targetReady) {
+      if (embeddedPrerequisite) {
+        blocker = `Approve and integrate ${embeddedPrerequisite.title ?? 'the embedded project submission'} before approving this pull request.`;
+      } else if (!targetReady) {
         blocker = canRetarget
           ? `Retarget this pull request to ${requiredBaseRef} and run a fresh evaluation before approval.`
           : prerequisite
@@ -1087,22 +1104,24 @@ export class DeliveryService {
       } else if (!evaluationCurrent) {
         blocker = `The ${requiredBaseRef} branch changed after this evaluation. Run a fresh evaluation before approval.`;
       }
+      const blockingPrerequisite = embeddedPrerequisite ?? prerequisite;
       return {
         number,
         headRef: pullRequest.headRef,
         baseRef: pullRequest.baseRef,
         requiredBaseRef,
         targetReady,
+        historyReady,
         evaluationCurrent,
         canRetarget,
         blocker,
         error: null,
-        prerequisiteSubmission: prerequisite
+        prerequisiteSubmission: blockingPrerequisite
           ? {
-              id: prerequisite.id,
-              title: prerequisite.title,
-              status: prerequisite.status,
-              integrationStatus: this.integrationStatus(prerequisite),
+              id: blockingPrerequisite.id,
+              title: blockingPrerequisite.title,
+              status: blockingPrerequisite.status,
+              integrationStatus: this.integrationStatus(blockingPrerequisite),
             }
           : null,
       };
@@ -1113,6 +1132,7 @@ export class DeliveryService {
         baseRef: null,
         requiredBaseRef,
         targetReady: false,
+        historyReady: false,
         evaluationCurrent: false,
         canRetarget: false,
         blocker: 'Pull-request readiness could not be verified.',
@@ -1136,6 +1156,45 @@ export class DeliveryService {
       },
       order: { createdAt: 'DESC' },
     });
+  }
+
+  private async findEmbeddedUnintegratedSubmission(
+    submission: ProjectSubmission,
+    pullRequest: { headSha: string },
+  ) {
+    if (!submission.repository) return null;
+    const candidates = await this.submissionsRepository
+      .createQueryBuilder('candidate')
+      .where('candidate.projectId = :projectId', {
+        projectId: submission.projectId,
+      })
+      .andWhere('candidate.id <> :submissionId', {
+        submissionId: submission.id,
+      })
+      .andWhere('candidate.commitSha IS NOT NULL')
+      .orderBy('candidate.createdAt', 'ASC')
+      .getMany();
+    for (const candidate of candidates) {
+      if (
+        (submission.taskId !== null &&
+          candidate.taskId === submission.taskId) ||
+        !candidate.commitSha ||
+        this.prerequisiteIsIntegrated(candidate)
+      ) {
+        continue;
+      }
+      if (
+        await this.githubService.isCommitAncestor({
+          owner: submission.repository.owner,
+          repoName: submission.repository.repoName,
+          ancestorSha: candidate.commitSha,
+          descendantSha: pullRequest.headSha,
+        })
+      ) {
+        return candidate;
+      }
+    }
+    return null;
   }
 
   private integrationStatus(submission: ProjectSubmission) {
