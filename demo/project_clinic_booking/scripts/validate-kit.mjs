@@ -7,11 +7,16 @@ const requiredFiles = [
   'client/project.json',
   'client/requirements-message.txt',
   'planning/architecture-submission.md',
+  'planning/architecture-answers.json',
+  'planning/architecture-diagram.mmd',
   'planning/uiux-submission.md',
+  'planning/uiux-answers.json',
+  'planning/uiux-prototype.html',
   'implementation/task-01-backend-scheduling.md',
   'implementation/task-02-patient-web.md',
   'implementation/task-03-staff-dashboard.md',
   'implementation/task-04-integration-quality.md',
+  'scripts/00-ready-planning-answers.mjs',
 ];
 
 for (const file of requiredFiles) await access(resolve(kitRoot, file));
@@ -31,6 +36,49 @@ const requiredLabels = [
 ];
 for (const label of requiredLabels) {
   if (!requirements.includes(label)) throw new Error(`Missing ${label}`);
+}
+const requiredAnswerKeys = {
+  architecture: [
+    'system_context',
+    'architecture_diagram',
+    'technology_stack',
+    'module_boundaries',
+    'api_contract',
+    'data_model',
+    'integrations',
+    'non_functional',
+    'deployment_observability',
+    'implementation_handoff',
+    'project_feature_coverage',
+  ],
+  uiux: [
+    'design_source',
+    'information_architecture',
+    'user_flows',
+    'screen_designs',
+    'clickable_prototype',
+    'screen_states',
+    'responsive_accessibility',
+    'design_system',
+    'api_data_mapping',
+    'asset_handoff',
+    'project_feature_coverage',
+  ],
+};
+for (const [type, keys] of Object.entries(requiredAnswerKeys)) {
+  const file =
+    type === 'architecture'
+      ? 'planning/architecture-answers.json'
+      : 'planning/uiux-answers.json';
+  const answers = await readKitJson(file);
+  for (const key of keys) {
+    if (
+      typeof answers[key]?.summary !== 'string' ||
+      answers[key].summary.length < 80
+    ) {
+      throw new Error(`${file} needs a substantive answer for ${key}`);
+    }
+  }
 }
 if (project.deadlineDays < 28 || project.deadlineDays > 60) {
   throw new Error('Demo deadline must remain small-to-medium (28-60 days).');

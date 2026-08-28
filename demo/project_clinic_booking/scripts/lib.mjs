@@ -86,7 +86,11 @@ export async function writeOutput(fileName, value) {
   const output = resolve(kitRoot, 'output');
   await mkdir(output, { recursive: true });
   const path = resolve(output, fileName);
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+  const content =
+    typeof value === 'string'
+      ? `${value.trimEnd()}\n`
+      : `${JSON.stringify(value, null, 2)}\n`;
+  await writeFile(path, content);
   return path;
 }
 
@@ -106,7 +110,7 @@ export async function resolveProjectId() {
 }
 
 export function artifactUrl(relativePath) {
-  return `https://github.com/asaadmansour/nexus-ai-backend/blob/dev/demo/project_clinic_booking/${relativePath}`;
+  return `https://raw.githubusercontent.com/asaadmansour/nexus-ai-backend/dev/demo/project_clinic_booking/${relativePath}`;
 }
 
 export function hasFlag(flag) {

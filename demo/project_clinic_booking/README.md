@@ -27,6 +27,7 @@ Run these from `nexus-ai-backend`:
 
 ```bash
 npm run demo:clinic:validate
+npm run demo:clinic:answers
 npm run demo:clinic:intake
 npm run demo:clinic:planning
 npm run demo:clinic:implementation
@@ -35,6 +36,9 @@ npm run demo:clinic:implementation
 `demo:clinic:intake` creates the client project, sends a complete labelled brief
 through the real requirements chat, verifies that the brief is complete, and
 optionally confirms it.
+
+`demo:clinic:answers` needs no server or login. It writes copy-ready architecture
+and UI/UX answers, including evidence URLs, under `output/` for the live form.
 
 `demo:clinic:planning` discovers the architect and UI/UX assignments, reads the
 live adaptive requirements, and writes ready-to-submit payloads under `output/`.
@@ -55,7 +59,11 @@ demo useful for regression testing instead of silently forcing impossible state.
 The ready-made human handoffs are:
 
 - `planning/architecture-submission.md`
+- `planning/architecture-answers.json` (ready answers for every live checklist field)
+- `planning/architecture-diagram.mmd`
 - `planning/uiux-submission.md`
+- `planning/uiux-answers.json` (ready answers for every live checklist field)
+- `planning/uiux-prototype.html`
 - `implementation/task-01-backend-scheduling.md`
 - `implementation/task-02-patient-web.md`
 - `implementation/task-03-staff-dashboard.md`

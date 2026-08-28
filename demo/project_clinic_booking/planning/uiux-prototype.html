@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QuickClinic UI/UX prototype</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #18201d;
+        --surface: #fff;
+        --canvas: #f4f7f5;
+        --primary: #176b5b;
+        --accent: #d8a12e;
+        --danger: #b42318;
+        --border: #cbd5d0;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--canvas);
+        color: var(--ink);
+        font:
+          16px/1.5 Inter,
+          system-ui,
+          sans-serif;
+      }
+      button {
+        min-height: 44px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--ink);
+        padding: 10px 16px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:focus-visible {
+        outline: 3px solid #80b8ad;
+        outline-offset: 2px;
+      }
+      button.primary {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: #fff;
+      }
+      button.danger {
+        color: var(--danger);
+      }
+      header {
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+      }
+      .bar {
+        max-width: 1120px;
+        min-height: 68px;
+        margin: auto;
+        padding: 12px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .brand {
+        font-size: 24px;
+        font-weight: 700;
+      }
+      .roles {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .roles button[aria-pressed='true'] {
+        border-color: var(--primary);
+        color: var(--primary);
+        font-weight: 700;
+      }
+      main {
+        max-width: 1120px;
+        margin: auto;
+        padding: 28px 20px 60px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        letter-spacing: 0;
+      }
+      h2 {
+        margin: 0 0 12px;
+        font-size: 20px;
+        letter-spacing: 0;
+      }
+      .lede {
+        margin: 0 0 24px;
+        color: #4d5c57;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 24px;
+      }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 20px;
+      }
+      label {
+        display: block;
+        margin: 0 0 6px;
+        font-weight: 700;
+      }
+      select,
+      input {
+        width: 100%;
+        min-height: 44px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #fff;
+        padding: 9px 12px;
+        font: inherit;
+      }
+      .field {
+        margin-bottom: 18px;
+      }
+      .list {
+        display: grid;
+        gap: 12px;
+      }
+      .item {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+      }
+      .item p {
+        margin: 3px 0 0;
+        color: #4d5c57;
+      }
+      .slots {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(100px, 1fr));
+        gap: 10px;
+        margin: 18px 0;
+      }
+      .tag {
+        display: inline-block;
+        border-radius: 999px;
+        background: #e5f1ed;
+        color: #125448;
+        padding: 3px 9px;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin: 18px 0;
+      }
+      .metric {
+        border-left: 4px solid var(--accent);
+        background: #fff;
+        padding: 14px;
+      }
+      .metric strong {
+        display: block;
+        font-size: 26px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--border);
+        padding: 12px 8px;
+        text-align: left;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+      .notice {
+        border-left: 4px solid var(--primary);
+        background: #e5f1ed;
+        padding: 14px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 719px) {
+        .bar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        main {
+          padding: 22px 16px 80px;
+        }
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        .slots {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .metrics {
+          grid-template-columns: 1fr;
+        }
+        .item {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        table,
+        thead,
+        tbody,
+        tr,
+        th,
+        td {
+          display: block;
+        }
+        thead {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+        }
+        tr {
+          border-bottom: 1px solid var(--border);
+          padding: 8px 0;
+        }
+        td {
+          border: 0;
+          padding: 4px 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <div class="brand">QuickClinic</div>
+        <nav class="roles" aria-label="Prototype role">
+          <button data-role="patient" aria-pressed="true">Patient</button
+          ><button data-role="reception" aria-pressed="false">Reception</button
+          ><button data-role="manager" aria-pressed="false">Manager</button>
+        </nav>
+      </div>
+    </header>
+    <main>
+      <section id="patient">
+        <h1 tabindex="-1">Find an appointment</h1>
+        <p class="lede">
+          Choose a service, doctor, and available Cairo-time slot.
+        </p>
+        <div class="layout">
+          <aside class="panel">
+            <div class="field">
+              <label for="service">Service</label
+              ><select id="service">
+                <option>General consultation</option>
+                <option>Follow-up visit</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="date">Date</label
+              ><input id="date" type="date" value="2026-09-03" />
+            </div>
+            <button>Apply filters</button>
+          </aside>
+          <div class="panel" id="patient-step">
+            <h2>Available doctors</h2>
+            <div class="list">
+              <div class="item">
+                <div>
+                  <strong>Dr. Salma Nabil</strong>
+                  <p>General practice, 30 minutes</p>
+                </div>
+                <button class="primary" id="choose-doctor">View times</button>
+              </div>
+              <div class="item">
+                <div>
+                  <strong>Dr. Omar Adel</strong>
+                  <p>General practice, 30 minutes</p>
+                </div>
+                <button>View times</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="reception" hidden>
+        <h1 tabindex="-1">Today's queue</h1>
+        <p class="lede">
+          Thursday, 3 September. Updates are announced and audited.
+        </p>
+        <div class="panel">
+          <div class="list">
+            <div class="item">
+              <div>
+                <span class="tag">Waiting</span
+                ><strong> 09:30 - Mariam Hassan</strong>
+                <p>Dr. Salma Nabil, general consultation</p>
+              </div>
+              <button class="primary">Start visit</button>
+            </div>
+            <div class="item">
+              <div>
+                <span class="tag">Checked in</span
+                ><strong> 10:00 - Karim Ali</strong>
+                <p>Dr. Omar Adel, follow-up visit</p>
+              </div>
+              <button>Move to waiting</button>
+            </div>
+          </div>
+          <div class="actions">
+            <button>Edit availability</button><button>View calendar</button>
+          </div>
+        </div>
+      </section>
+      <section id="manager" hidden>
+        <h1 tabindex="-1">Appointment activity</h1>
+        <p class="lede">
+          A read-only summary for the selected Cairo date range.
+        </p>
+        <div class="metrics">
+          <div class="metric"><span>Appointments</span><strong>84</strong></div>
+          <div class="metric"><span>Completed</span><strong>69</strong></div>
+          <div class="metric">
+            <span>Cancellation rate</span><strong>8.3%</strong>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Daily breakdown</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Booked</th>
+                <th>Completed</th>
+                <th>Cancelled</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1 Sep</td>
+                <td>27</td>
+                <td>23</td>
+                <td>2</td>
+              </tr>
+              <tr>
+                <td>2 Sep</td>
+                <td>29</td>
+                <td>24</td>
+                <td>3</td>
+              </tr>
+              <tr>
+                <td>3 Sep</td>
+                <td>28</td>
+                <td>22</td>
+                <td>2</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script>
+      const step = document.querySelector('#patient-step');
+      document.querySelectorAll('[data-role]').forEach((button) =>
+        button.addEventListener('click', () => {
+          document
+            .querySelectorAll('[data-role]')
+            .forEach((item) =>
+              item.setAttribute('aria-pressed', String(item === button)),
+            );
+          ['patient', 'reception', 'manager'].forEach(
+            (role) =>
+              (document.querySelector(`#${role}`).hidden =
+                role !== button.dataset.role),
+          );
+          document.querySelector(`#${button.dataset.role} h1`).focus();
+        }),
+      );
+      document.querySelector('#choose-doctor').addEventListener('click', () => {
+        step.innerHTML =
+          '<h2>Choose a time with Dr. Salma</h2><p>Thursday, 3 September. Times use Africa/Cairo.</p><div class="slots"><button>09:00</button><button>09:30</button><button>10:30</button><button>11:00</button></div><div class="notice">If another patient takes a selected slot, this list refreshes and keeps your doctor and date.</div>';
+        step.querySelectorAll('.slots button').forEach((button) =>
+          button.addEventListener('click', () => {
+            step.innerHTML = `<h2>Review appointment</h2><p><strong>General consultation</strong><br>Dr. Salma Nabil<br>Thursday, 3 September at ${button.textContent}</p><div class="actions"><button>Change time</button><button class="primary" id="confirm">Confirm booking</button></div>`;
+            step.querySelector('#confirm').addEventListener('click', () => {
+              step.innerHTML =
+                '<h2>Appointment confirmed</h2><div class="notice" role="status">Your appointment is booked. We sent a confirmation email.</div><div class="actions"><button>View my appointments</button><button class="danger">Cancel appointment</button></div>';
+            });
+          }),
+        );
+      });
+    </script>
+  </body>
+</html>

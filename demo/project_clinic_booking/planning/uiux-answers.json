@@ -1,0 +1,38 @@
+{
+  "design_source": {
+    "summary": "The responsive QuickClinic prototype is the immutable design source. It contains the patient directory, doctor/date and slot selection, booking review/confirmation, appointment actions, reception queue/calendar behavior, availability entry point, and manager summary. The accompanying handoff inventories all 12 release-one screens and explicitly excludes medical records, insurance, payment, native-app, and multi-location screens.",
+    "artifacts": ["planning/uiux-prototype.html"]
+  },
+  "information_architecture": {
+    "summary": "Public entry points are sign in and doctor discovery. Patient navigation contains Find appointment and My appointments; reception contains Today and Availability; manager contains Activity and a read-only Today view. Authorization selects the workspace, so the UI never offers a role switch in production. Desktop uses a compact header and local navigation; mobile uses a labelled bottom bar. Page titles and breadcrumbs identify context without hiding primary actions."
+  },
+  "user_flows": {
+    "summary": "Booking is service filter, doctor/date, live slot, review, confirm, success/email. A 409 preserves doctor/date, refreshes slots, announces the conflict, and focuses results. Reschedule selects an existing appointment, new slot, old/new comparison, and explicit confirmation. Cancel uses a destructive confirmation. Reception advances only valid check-in, waiting, in-service, completed/no-show states and restores server state after failure. Manager selects a date range and reads metrics plus an accessible table, including a deliberate empty-period state."
+  },
+  "screen_designs": {
+    "summary": "The prototype specifies visual hierarchy, controls, spacing, color, status treatments, patient interaction, reception queue, and manager metrics at desktop and below 720px. Desktop patient discovery uses a 260-280px filter rail and fluid results; mobile becomes one column with two-column slot buttons and labelled controls. Staff data tables become labelled row groups on mobile. The handoff defines all additional screens and their required loading, empty, permission, error, confirmation, and success variants.",
+    "artifacts": ["planning/uiux-prototype.html"]
+  },
+  "clickable_prototype": {
+    "summary": "Open the HTML artifact in a browser. Patient controls advance from doctor selection to available slots, review, and booking confirmation. The Patient, Reception, and Manager controls switch between role-specific workspaces; the reception view demonstrates queue actions and the manager view demonstrates metrics and tabular activity. Fixed demo data keeps the artifact deterministic. It demonstrates interaction and responsive behavior while the approved architecture remains the source of API truth.",
+    "artifacts": ["planning/uiux-prototype.html"]
+  },
+  "screen_states": {
+    "summary": "Every data region defines skeleton/loading, empty, field validation, 403 permission, network failure with Retry, and success. Required-input actions remain disabled with nearby explanation. Slot 409 preserves doctor/date and focuses refreshed results. Booking success is a page state with a polite live announcement. Cancellation is focus-trapped and restores focus. Queue updates show Saving during optimism and restore the last server value on failure; unknown statuses use a neutral Needs attention label."
+  },
+  "responsive_accessibility": {
+    "summary": "Use one column at 320-719px, tablet at 720-1023px, and constrained desktop from 1024px. Body text is at least 16px and targets at least 44px. DOM/focus order follows visual order; inputs have persistent labels and described errors; dialogs trap and restore focus; status combines text and color. Meet WCAG 2.1 AA, expose chart values as tables, announce async updates through polite live regions, and remove nonessential motion under prefers-reduced-motion."
+  },
+  "design_system": {
+    "summary": "Typography is system/Inter with 16/24 body, 14/20 labels, 20/28 section headings, and 28/36 page titles. Tokens are ink #18201D, surface #FFFFFF, canvas #F4F7F5, primary #176B5B, accent #D8A12E, danger #B42318, border #CBD5D0; spacing is 4/8/12/16/24/32/48 and radius 6px. Reuse Button, TextField, Select, DatePicker, SlotButton, StatusTag, InlineAlert, Dialog, Skeleton, EmptyState, and DataTable with default, hover, focus, disabled, loading, and error states."
+  },
+  "api_data_mapping": {
+    "summary": "Doctor filters/list read GET /doctors; SlotPicker reads GET /doctors/:id/slots and handles 409; BookingReview posts /appointments; AppointmentList reads /appointments/me and uses reschedule/cancel PATCH routes with ownership. DailyCalendar and QueueBoard use staff GET routes plus reception-only status PATCH. AvailabilityEditor submits rules/exceptions with version and reloads on 409. AppointmentSummary calls the manager-only summary route and does not retry a reception 403. All instants render in Africa/Cairo and field errors stay next to their controls."
+  },
+  "asset_handoff": {
+    "summary": "The prototype and handoff provide the exact layout hierarchy, token values, reusable component inventory, responsive transformations, status/error copy intent, focus behavior, API mapping, and acceptance states. Implement tokens as CSS variables and share primitives while route components own orchestration. Decorative assets must be hidden from assistive technology and meaningful assets named. Analytics and client logs exclude patient details. Only final logo artwork and email wording remain open; the QuickClinic text mark and confirmed UI copy are approved fallbacks."
+  },
+  "project_feature_coverage": {
+    "summary": "Appointment booking is covered by directory, doctor/date, slots, review, success, and stale-slot recovery. Rescheduling is covered by appointment detail, new-slot selection, old/new comparison, and confirmation. Daily queue management is covered by reception day list, order, status tags, and validated transition controls. Appointment activity review is covered by manager date selection, summary metrics, empty behavior, and accessible table. No visual behavior is supplied for excluded medical, insurance, payment, native, or multi-location scope."
+  }
+}
