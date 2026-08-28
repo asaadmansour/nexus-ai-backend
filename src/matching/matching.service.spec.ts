@@ -3,6 +3,8 @@ import {
   assertTaskMatchingRunInvariant,
   MatchingService,
   completedEmptyRunIsCoolingDown,
+  hasProjectTaskCapacity,
+  MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER,
   requiresReviewerCandidateSelection,
   resolveInvitationTtlHours,
   staffingFailureIsCoolingDown,
@@ -68,6 +70,15 @@ describe('MatchingService task assignment invariants', () => {
     expect(resolveInvitationTtlHours('')).toBe(5);
     expect(resolveInvitationTtlHours('0')).toBe(5);
     expect(resolveInvitationTtlHours('6')).toBe(6);
+  });
+
+  it('allows up to three active tasks or reservations in one project', () => {
+    expect(MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER).toBe(3);
+    expect(hasProjectTaskCapacity(0, 0)).toBe(true);
+    expect(hasProjectTaskCapacity(2, 0)).toBe(true);
+    expect(hasProjectTaskCapacity(1, 1)).toBe(true);
+    expect(hasProjectTaskCapacity(2, 1)).toBe(false);
+    expect(hasProjectTaskCapacity(3, 0)).toBe(false);
   });
 
   it('backs off briefly before retrying an empty completed shortlist', () => {
