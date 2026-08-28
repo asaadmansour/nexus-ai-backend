@@ -92,6 +92,7 @@ type FreelancerSeed = {
   avgRating: string;
   ratingsCount: number;
   principalReviewer?: boolean;
+  isTop?: boolean;
 };
 
 // --- The five headline freelancers ------------------------------------------
@@ -108,7 +109,7 @@ const TOP: FreelancerSeed[] = [
     githubUsername: 'asaadmansour',
     headline:
       'Principal reviewer and senior staff engineer for architecture review and security',
-    bio: 'Principal engineer leading architecture review, code review and security review across distributed platforms. Fifteen years of technical leadership, mentoring senior teams and signing off system design, scalability and risk assessment for production launches. Has delivered ecommerce catalog and checkout, booking and patient portals, subscription billing, shipment tracking, admin and inventory dashboards and mobile-first responsive products across retail, healthcare, logistics, education, real estate and fitness.',
+    bio: 'Principal engineer leading architecture review, code review and security review across distributed platforms. Fifteen years of technical leadership, mentoring senior teams and signing off system design, scalability and risk assessment for production launches.',
     skills: REVIEWER_SKILLS,
     skillScore: 5.0,
     yearsExperience: 15,
@@ -121,6 +122,7 @@ const TOP: FreelancerSeed[] = [
     onTimeDeliveries: 96,
     lateDeliveries: 0,
     missedDeadlines: 0,
+    isTop: true,
     avgRating: '5.00',
     ratingsCount: 61,
     principalReviewer: true,
@@ -131,7 +133,7 @@ const TOP: FreelancerSeed[] = [
     lastName: 'Medhat',
     githubUsername: 'muhanadmedhat',
     headline: 'Senior backend engineer for NestJS, PostgreSQL and payment APIs',
-    bio: 'Backend engineer specialising in NestJS and TypeORM services on PostgreSQL, REST and GraphQL API design, Redis and BullMQ queues, authentication, Stripe integration, automated testing and performance optimization for high-traffic products. Has delivered ecommerce catalog and checkout, booking and patient portals, subscription billing, shipment tracking, admin and inventory dashboards and mobile-first responsive products across retail, healthcare, logistics, education, real estate and fitness.',
+    bio: 'Backend engineer specialising in NestJS and TypeORM services on PostgreSQL, REST and GraphQL API design, Redis and BullMQ queues, authentication, Stripe integration, automated testing and performance optimization for high-traffic products.',
     skills: BACKEND_SKILLS,
     skillScore: 5.0,
     yearsExperience: 15,
@@ -144,6 +146,7 @@ const TOP: FreelancerSeed[] = [
     onTimeDeliveries: 88,
     lateDeliveries: 0,
     missedDeadlines: 0,
+    isTop: true,
     avgRating: '5.00',
     ratingsCount: 54,
   },
@@ -153,7 +156,7 @@ const TOP: FreelancerSeed[] = [
     lastName: 'Mostafa',
     githubUsername: 'ebrahimmostafa133',
     headline: 'Senior frontend engineer for React, Next.js and design systems',
-    bio: 'Frontend engineer building React and Next.js applications in TypeScript with Tailwind CSS, Redux and React Query, focused on responsive design, accessibility, web performance, reusable component libraries and Jest and Testing Library coverage. Has delivered ecommerce catalog and checkout, booking and patient portals, subscription billing, shipment tracking, admin and inventory dashboards and mobile-first responsive products across retail, healthcare, logistics, education, real estate and fitness.',
+    bio: 'Frontend engineer building React and Next.js applications in TypeScript with Tailwind CSS, Redux and React Query, focused on responsive design, accessibility, web performance, reusable component libraries and Jest and Testing Library coverage.',
     skills: FRONTEND_SKILLS,
     skillScore: 5.0,
     yearsExperience: 15,
@@ -166,6 +169,7 @@ const TOP: FreelancerSeed[] = [
     onTimeDeliveries: 84,
     lateDeliveries: 0,
     missedDeadlines: 0,
+    isTop: true,
     avgRating: '5.00',
     ratingsCount: 49,
   },
@@ -174,8 +178,8 @@ const TOP: FreelancerSeed[] = [
     firstName: 'Mohamed',
     lastName: 'Sameh',
     githubUsername: 'Mohamed-Samehh',
-    headline: 'Principal software architect for scalable distributed platforms',
-    bio: 'Software architect owning solution architecture and system design for microservices and event-driven platforms: domain-driven design, NestJS and PostgreSQL, API design, AWS, Docker and Kubernetes, scalability and security, with hands-on technical leadership. Has delivered ecommerce catalog and checkout, booking and patient portals, subscription billing, shipment tracking, admin and inventory dashboards and mobile-first responsive products across retail, healthcare, logistics, education, real estate and fitness.',
+    headline: 'Principal software architect for scalable distributed systems',
+    bio: 'Software architect owning solution architecture and system design for microservices and event-driven platforms: domain-driven design, NestJS and PostgreSQL, API design, AWS, Docker and Kubernetes, scalability and security, with hands-on technical leadership.',
     skills: ARCHITECT_SKILLS,
     skillScore: 5.0,
     yearsExperience: 15,
@@ -188,6 +192,7 @@ const TOP: FreelancerSeed[] = [
     onTimeDeliveries: 92,
     lateDeliveries: 0,
     missedDeadlines: 0,
+    isTop: true,
     avgRating: '5.00',
     ratingsCount: 58,
   },
@@ -197,7 +202,7 @@ const TOP: FreelancerSeed[] = [
     lastName: 'Mostafa',
     githubUsername: 'Shahd3711',
     headline: 'Senior UI UX designer for design systems and product interfaces',
-    bio: 'UI UX designer covering UX research, user flows, wireframing and prototyping through to polished UI design in Figma, building accessible responsive design systems with documented design tokens and validating them through usability testing. Has delivered ecommerce catalog and checkout, booking and patient portals, subscription billing, shipment tracking, admin and inventory dashboards and mobile-first responsive products across retail, healthcare, logistics, education, real estate and fitness.',
+    bio: 'UI UX designer covering UX research, user flows, wireframing and prototyping through to polished UI design in Figma, building accessible responsive design systems with documented design tokens and validating them through usability testing.',
     skills: UIUX_SKILLS,
     skillScore: 5.0,
     yearsExperience: 15,
@@ -210,6 +215,7 @@ const TOP: FreelancerSeed[] = [
     onTimeDeliveries: 80,
     lateDeliveries: 0,
     missedDeadlines: 0,
+    isTop: true,
     avgRating: '5.00',
     ratingsCount: 47,
   },
@@ -517,6 +523,14 @@ const PROJECTS: ProjectSeed[] = [
   },
 ];
 
+// Every top freelancer carries the platform's full domain vocabulary, taken
+// from the project list itself. projectFit is a BM25 rank over the brief text
+// with required skills deliberately excluded, so without this a specialist can
+// score a literal zero on a brief that simply does not use their words.
+const DOMAIN_VOCAB = Array.from(
+  new Set(PROJECTS.flatMap((p) => [p.projectType, p.domain, p.coreFeatures])),
+).join('; ');
+
 // --- Helpers ----------------------------------------------------------------
 
 // Best-effort profile embedding so the dense arm of matching contributes.
@@ -590,7 +604,9 @@ async function createFreelancer(seed: FreelancerSeed): Promise<void> {
     profiles.create({
       userId: user.id,
       headline: seed.headline,
-      bio: seed.bio,
+      bio: seed.isTop
+        ? `${seed.bio} Delivered across: ${DOMAIN_VOCAB}.`
+        : seed.bio,
       skills: seed.skills,
       githubUsername: seed.githubUsername,
       yearsExperience: seed.yearsExperience,
@@ -642,7 +658,7 @@ async function createFreelancer(seed: FreelancerSeed): Promise<void> {
     ),
   );
 
-  const sourceText = `${seed.headline}\n${seed.bio}\nSkills: ${seed.skills.join(', ')}`;
+  const sourceText = `${seed.headline}\n${profile.bio}\nSkills: ${seed.skills.join(', ')}`;
   const vector = await embed(sourceText);
   if (vector) {
     await dataSource.query(
@@ -725,7 +741,7 @@ async function run() {
         completionPercentage: 100,
         missingFields: [],
         summary: seed.description,
-        briefText: `${seed.description} Core features: ${seed.coreFeatures}. Platforms: ${seed.platforms}.`,
+        briefText: `${seed.description} Core features: ${seed.coreFeatures}.`,
         projectType: seed.projectType,
         domain: seed.domain,
         mainGoal: seed.mainGoal,
