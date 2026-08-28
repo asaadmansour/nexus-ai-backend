@@ -719,6 +719,7 @@ async function createFreelancer(seed: FreelancerSeed): Promise<void> {
       githubUsername: seed.githubUsername,
       yearsExperience: seed.yearsExperience,
       hourlyRate: seed.hourlyRate,
+      hourlyRateCurrency: 'EGP',
       availabilityHoursPerWeek: seed.availabilityHoursPerWeek,
       isAvailable: true,
       verificationStatus: 'approved',
