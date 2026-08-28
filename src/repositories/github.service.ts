@@ -986,6 +986,11 @@ export class GithubService {
       this.logger.error(
         `GitHub ${operation} failed (${response.status}): ${detail}`,
       );
+      if (response.status === 403 && /webhooks?/i.test(operation)) {
+        throw new ServiceUnavailableException(
+          `GitHub ${operation} failed with status 403. The configured fine-grained personal access token needs repository permission "Webhooks: Read and write" for this repository.`,
+        );
+      }
       throw new ServiceUnavailableException(
         `GitHub ${operation} failed with status ${response.status}`,
       );

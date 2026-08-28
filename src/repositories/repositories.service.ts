@@ -227,6 +227,14 @@ export class RepositoriesService {
           syncedAt: new Date().toISOString(),
         },
       };
+      if (webhook.active) {
+        await this.incidents.resolveOperation(
+          'repositories',
+          'sync_evaluation_webhook',
+          repository.projectId,
+          'The GitHub evaluation webhook was synchronized successfully.',
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(
@@ -343,9 +351,6 @@ export class RepositoriesService {
         'The project repository is not active yet; create or retry it first',
       );
     }
-    await this.syncEvaluationWebhook(repository);
-    await this.repoRepo.save(repository);
-
     const permission = dto.permission ?? DEFAULT_PERMISSION;
     const profileIds = await this.resolveCollaboratorProfileIds(projectId, dto);
     if (!profileIds.length) {

@@ -222,4 +222,33 @@ describe('GithubService read-only inspection', () => {
       fetchMock.mockRestore();
     }
   });
+
+  it('explains the fine-grained token permission required for webhooks', async () => {
+    const github = new GithubService({
+      get: jest.fn((key: string) => {
+        if (key === 'GITHUB_TOKEN') return 'test-token';
+        if (key === 'GITHUB_WEBHOOK_SECRET') return 'test-secret';
+        if (key === 'GITHUB_WEBHOOK_URL')
+          return 'https://nexus.test/api/repositories/webhooks/github';
+        if (key === 'GITHUB_API_URL') return 'https://api.github.test';
+        return undefined;
+      }),
+    } as unknown as ConfigService);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(
+        Response.json(
+          { message: 'Resource not accessible by personal access token' },
+          { status: 403 },
+        ),
+      );
+
+    try {
+      await expect(
+        github.ensureEvaluationWebhook({ owner: 'nexus-ai', repoName: 'app' }),
+      ).rejects.toThrow('Webhooks: Read and write');
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
 });
