@@ -1402,11 +1402,15 @@ export class PaymentsService {
         : fundingStage === 'implementation'
           ? implementationRemainingAmount
           : null;
+    const planningCapacityBlocked =
+      fundingStage === 'planning' &&
+      project.implementationCapacitySnapshot?.status === 'unavailable';
     const canPay =
       stageAmount !== null &&
       stageAmount > 0 &&
       quoteStatus !== 'not_ready' &&
-      quoteStatus !== 'out_of_budget';
+      quoteStatus !== 'out_of_budget' &&
+      !planningCapacityBlocked;
 
     return {
       project: {
@@ -1455,6 +1459,7 @@ export class PaymentsService {
           finalAmount,
           remainingAmount,
           fundingStage,
+          planningCapacityBlocked,
         ),
         suggestedPaymentAmount: canPay ? stageAmount : null,
         suggestedPaymentPurpose:
@@ -1705,6 +1710,7 @@ export class PaymentsService {
     finalAmount: number | null,
     remainingAmount: number | null,
     fundingStage: string,
+    planningCapacityBlocked = false,
   ) {
     if (quoteStatus === 'out_of_budget') {
       return 'The final estimate is above the project budget. Revise the budget range before funding escrow.';
@@ -1714,6 +1720,9 @@ export class PaymentsService {
     }
     if (remainingAmount !== null && remainingAmount <= 0) {
       return 'Escrow is fully funded.';
+    }
+    if (fundingStage === 'planning' && planningCapacityBlocked) {
+      return 'Planning payment is temporarily locked because the latest capacity sweep found too few available implementation freelancers. Nexus AI rechecks automatically and will email you with a payment link when enough freelancers are available.';
     }
     if (fundingStage === 'planning') return null;
     if (fundingStage === 'implementation') return null;

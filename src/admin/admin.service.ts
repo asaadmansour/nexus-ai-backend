@@ -302,6 +302,7 @@ export class AdminService {
     filters: {
       status?: string;
       automationStatus?: string;
+      capacityStatus?: string;
       search?: string;
       customerId?: string;
       dateFrom?: string;
@@ -322,6 +323,12 @@ export class AdminService {
       query.andWhere('project.automationStatus = :automationStatus', {
         automationStatus: filters.automationStatus,
       });
+    }
+    if (filters.capacityStatus) {
+      query.andWhere(
+        "project.implementationCapacitySnapshot ->> 'status' = :capacityStatus",
+        { capacityStatus: filters.capacityStatus },
+      );
     }
     if (filters.customerId) {
       query.andWhere('project.customerId = :customerId', {

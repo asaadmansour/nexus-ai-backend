@@ -79,6 +79,7 @@ export class AdminController {
     @Query('limit') limit: string = '50',
     @Query('status') status?: string,
     @Query('automationStatus') automationStatus?: string,
+    @Query('capacityStatus') capacityStatus?: string,
     @Query('search') search?: string,
     @Query('customerId') customerId?: string,
     @Query('dateFrom') dateFrom?: string,
@@ -88,7 +89,15 @@ export class AdminController {
     const { projects, total } = await this.adminService.getProjects(
       pageNum,
       limitNum,
-      { status, automationStatus, search, customerId, dateFrom, dateTo },
+      {
+        status,
+        automationStatus,
+        capacityStatus,
+        search,
+        customerId,
+        dateFrom,
+        dateTo,
+      },
     );
     return {
       status: 'success',

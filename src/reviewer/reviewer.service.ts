@@ -46,24 +46,31 @@ export class ReviewerService {
   async listProjects(userId: string) {
     const assignments = await this.dataSource
       .getRepository(ProjectRoleAssignment)
-      .find({
-        where: {
-          phase: 'governance',
-          roleKey: 'principal_reviewer',
-          status: In(ACTIVE_REVIEWER_STATUSES),
-          freelancerProfile: { userId },
-        },
-        relations: { project: true },
-        order: { assignedAt: 'DESC' },
-      });
-    return assignments.map((assignment) => ({
-      assignmentId: assignment.id,
-      status: assignment.status,
-      acceptedAt: assignment.acceptedAt,
-      budgetAmount: assignment.budgetAmount,
-      currency: assignment.currency,
-      project: assignment.project,
-    }));
+      .createQueryBuilder('assignment')
+      .innerJoinAndSelect('assignment.project', 'project')
+      .innerJoin('assignment.freelancerProfile', 'profile')
+      .where('assignment.phase = :phase', { phase: 'governance' })
+      .andWhere('assignment.roleKey = :roleKey', {
+        roleKey: 'principal_reviewer',
+      })
+      .andWhere('assignment.status IN (:...statuses)', {
+        statuses: ACTIVE_REVIEWER_STATUSES,
+      })
+      .andWhere('profile.userId = :userId', { userId })
+      .andWhere('project.deletedAt IS NULL')
+      .orderBy('assignment.assignedAt', 'DESC')
+      .getMany();
+    return Promise.all(
+      assignments.map(async (assignment) => ({
+        assignmentId: assignment.id,
+        status: assignment.status,
+        acceptedAt: assignment.acceptedAt,
+        budgetAmount: assignment.budgetAmount,
+        currency: assignment.currency,
+        project: assignment.project,
+        attention: await this.getAttentionCounts(assignment.projectId),
+      })),
+    );
   }
 
   async overview(projectId: string, userId: string) {
@@ -72,6 +79,13 @@ export class ReviewerService {
       where: { id: projectId },
     });
     if (!project) throw new NotFoundException('Project not found');
+    return {
+      project,
+      attention: await this.getAttentionCounts(projectId),
+    };
+  }
+
+  private async getAttentionCounts(projectId: string) {
     const [
       planningAwaitingReview,
       generatedPlans,
@@ -134,16 +148,13 @@ export class ReviewerService {
       }),
     ]);
     return {
-      project,
-      attention: {
-        planningAwaitingReview,
-        generatedPlans,
-        matchingRuns,
-        submissionsAwaitingReview,
-        releaseRequests,
-        openTasks,
-        finalHandoffsAwaitingReview,
-      },
+      planningAwaitingReview,
+      generatedPlans,
+      matchingRuns,
+      submissionsAwaitingReview,
+      releaseRequests,
+      openTasks,
+      finalHandoffsAwaitingReview,
     };
   }
 

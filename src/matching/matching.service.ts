@@ -68,9 +68,9 @@ function staffingRoleBase(roleKey: string) {
 
 function requiredPreFundingRoles() {
   // Exact implementation roles do not exist until architecture/UI/UX have been
-  // approved and the Scrum plan is materialized. Before planning we only run a
-  // non-binding capacity preflight; inviting generic developers here made them
-  // accept work whose tasks, deadlines, and compensation were still unknown.
+  // approved and the Scrum plan is materialized. The capacity sweep gates
+  // planning payment, but does not invite generic developers to accept work
+  // whose tasks, deadlines, and compensation are still unknown.
   return [...PLANNING_ROLES];
 }
 // The current staffing policy gives each candidate five hours to respond.
@@ -480,7 +480,7 @@ export class MatchingService {
         await this.estimateImplementationCapacity(project);
       project.implementationCapacitySnapshot = refreshedCapacity;
       if (refreshedCapacity.status === 'unavailable') {
-        project.automationStatus = 'capacity_preflight_failed';
+        project.automationStatus = 'ready_for_funding_capacity_at_risk';
         project.automationError = refreshedCapacity.blockingReasons.join(' ');
         project.automationErrorCategory = 'implementation_capacity';
         project.automationErrorAt = new Date();
@@ -543,7 +543,7 @@ export class MatchingService {
       !reviewer ||
       missing.length > 0 ||
       pendingInvitations > 0 ||
-      !['viable', 'at_risk'].includes(capacityStatus ?? '')
+      capacityStatus === 'unavailable'
     ) {
       const details = [
         !reviewer ? 'principal reviewer not accepted' : null,
@@ -551,12 +551,12 @@ export class MatchingService {
         pendingInvitations
           ? `${pendingInvitations} invitation(s) still pending`
           : null,
-        !['viable', 'at_risk'].includes(capacityStatus ?? '')
-          ? 'implementation capacity preflight has not found enough available freelancers'
+        capacityStatus === 'unavailable'
+          ? 'the latest implementation-capacity sweep found too few available freelancers'
           : null,
       ].filter(Boolean);
       throw new ConflictException(
-        `Planning funding is locked until the reviewer and planning team have accepted and implementation capacity is plausible${details.length ? ` (${details.join('; ')})` : ''}.`,
+        `Planning funding is locked until the reviewer and planning team have accepted and the implementation-capacity sweep finds enough available freelancers${details.length ? ` (${details.join('; ')})` : ''}.`,
       );
     }
     return project;
@@ -775,14 +775,35 @@ export class MatchingService {
       where: { id: projectId },
     });
     if (!project) return true;
+    const capacityAtRisk =
+      project.implementationCapacitySnapshot?.status === 'unavailable';
     await this.notifyProjectOwner(
       project,
       'Your project team is ready',
-      'Your principal reviewer, architect, and UI/UX designer have accepted. An implementation-capacity preflight also passed. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+      capacityAtRisk
+        ? 'Your principal reviewer, architect, and UI/UX designer have accepted. The latest capacity sweep found too few available implementation freelancers, so planning payment remains locked. Nexus AI will keep checking and email you with a payment link as soon as enough freelancers are available.'
+        : 'Your principal reviewer, architect, and UI/UX designer have accepted. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+      undefined,
+      {
+        customerActionUrl: `/projects/${project.id}/payments`,
+        customerType: capacityAtRisk
+          ? 'implementation_capacity_update'
+          : 'staffing_update',
+      },
     );
     await this.projectRepo.update(
-      { id: project.id, automationStatus: 'ready_for_funding' },
-      { automationStatus: 'ready_for_funding_notified' },
+      {
+        id: project.id,
+        automationStatus: In([
+          'ready_for_funding',
+          'ready_for_funding_capacity_at_risk',
+        ]),
+      },
+      {
+        automationStatus: capacityAtRisk
+          ? 'ready_for_funding_capacity_at_risk_notified'
+          : 'ready_for_funding_notified',
+      },
     );
     return true;
   }
@@ -791,25 +812,163 @@ export class MatchingService {
     const projects = await this.projectRepo.find({
       where: {
         status: ProjectStatus.READY_FOR_FUNDING,
-        automationStatus: 'ready_for_funding',
+        automationStatus: In([
+          'ready_for_funding',
+          'ready_for_funding_capacity_at_risk',
+        ]),
       },
       order: { updatedAt: 'ASC' },
       take: 25,
     });
     let notified = 0;
     for (const project of projects) {
+      const capacityAtRisk =
+        project.implementationCapacitySnapshot?.status === 'unavailable';
       await this.notifyProjectOwner(
         project,
         'Your project team is ready',
-        'Your principal reviewer, architect, and UI/UX designer have accepted. An implementation-capacity preflight also passed. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+        capacityAtRisk
+          ? 'Your principal reviewer, architect, and UI/UX designer have accepted. The latest capacity sweep found too few available implementation freelancers, so planning payment remains locked. Nexus AI will keep checking and email you with a payment link as soon as enough freelancers are available.'
+          : 'Your principal reviewer, architect, and UI/UX designer have accepted. Fund the planning package to begin architecture and design; implementation is charged only after the exact Scrum tasks are staffed.',
+        undefined,
+        {
+          customerActionUrl: `/projects/${project.id}/payments`,
+          customerType: capacityAtRisk
+            ? 'implementation_capacity_update'
+            : 'staffing_update',
+        },
       );
       await this.projectRepo.update(
-        { id: project.id, automationStatus: 'ready_for_funding' },
-        { automationStatus: 'ready_for_funding_notified' },
+        {
+          id: project.id,
+          automationStatus: In([
+            'ready_for_funding',
+            'ready_for_funding_capacity_at_risk',
+          ]),
+        },
+        {
+          automationStatus: capacityAtRisk
+            ? 'ready_for_funding_capacity_at_risk_notified'
+            : 'ready_for_funding_notified',
+        },
       );
       notified += 1;
     }
     return { inspected: projects.length, notified };
+  }
+
+  async recoverPlanningFundingReadiness() {
+    const projects = await this.projectRepo.find({
+      where: {
+        status: In([
+          ProjectStatus.BRIEF_COMPLETE,
+          ProjectStatus.WAITING_FOR_PR,
+          ProjectStatus.PLANNING_MATCHING,
+        ]),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let unlocked = 0;
+    for (const project of projects) {
+      try {
+        if (await this.reconcileProjectFundingReadiness(project.id)) {
+          unlocked += 1;
+        }
+      } catch (error) {
+        this.logger.error(
+          `Planning funding readiness recovery failed for ${project.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: projects.length, unlocked };
+  }
+
+  async refreshUnavailableImplementationCapacity() {
+    const projects = await this.projectRepo.find({
+      where: {
+        status: ProjectStatus.READY_FOR_FUNDING,
+        automationStatus: In([
+          'ready_for_funding_capacity_at_risk',
+          'ready_for_funding_capacity_at_risk_notified',
+        ]),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let refreshed = 0;
+    let available = 0;
+    for (const project of projects) {
+      const checkedAt = Date.parse(
+        typeof project.implementationCapacitySnapshot?.checkedAt === 'string'
+          ? project.implementationCapacitySnapshot.checkedAt
+          : '',
+      );
+      if (Number.isFinite(checkedAt) && checkedAt > Date.now() - 15 * 60_000) {
+        continue;
+      }
+      try {
+        const capacity = await this.estimateImplementationCapacity(project);
+        const isNowAvailable = capacity.status !== 'unavailable';
+        const nextAutomationStatus = isNowAvailable
+          ? 'ready_for_funding_capacity_available'
+          : project.automationStatus;
+        const result = await this.projectRepo
+          .createQueryBuilder()
+          .update(Project)
+          .set({
+            implementationCapacitySnapshot: () =>
+              'CAST(:implementationCapacitySnapshot AS jsonb)',
+            automationStatus: nextAutomationStatus,
+            automationError: isNowAvailable
+              ? null
+              : capacity.blockingReasons.join(' '),
+            automationErrorCategory: isNowAvailable
+              ? null
+              : 'implementation_capacity',
+            automationErrorAt: isNowAvailable ? null : new Date(),
+          })
+          .where('id = :projectId', { projectId: project.id })
+          .andWhere('automation_status IN (:...automationStatuses)', {
+            automationStatuses: [
+              'ready_for_funding_capacity_at_risk',
+              'ready_for_funding_capacity_at_risk_notified',
+            ],
+          })
+          .setParameter(
+            'implementationCapacitySnapshot',
+            JSON.stringify(capacity),
+          )
+          .execute();
+        if (!result.affected) continue;
+        refreshed += 1;
+        if (!isNowAvailable) continue;
+        available += 1;
+        project.implementationCapacitySnapshot = capacity;
+        await this.notifyProjectOwner(
+          project,
+          'Capacity is available and planning is ready to fund',
+          `The latest capacity check found ${capacity.workableCandidates} workable implementation freelancer(s) for the estimated ${capacity.requiredPeople}-person team. Open the payment page to fund planning. Exact freelancers will still accept the generated Scrum tasks before implementation funding is enabled.`,
+          undefined,
+          {
+            customerActionUrl: `/projects/${project.id}/payments`,
+            customerType: 'implementation_capacity_update',
+          },
+        );
+        await this.projectRepo.update(
+          {
+            id: project.id,
+            automationStatus: 'ready_for_funding_capacity_available',
+          },
+          { automationStatus: 'ready_for_funding_capacity_available_notified' },
+        );
+      } catch (error) {
+        this.logger.error(
+          `Implementation capacity refresh failed for ${project.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: projects.length, refreshed, available };
   }
 
   /**
@@ -1654,14 +1813,7 @@ export class MatchingService {
         where: { id: result.task.projectId },
       });
       if (readyProject) {
-        const implementationAmount = projectFundingBreakdown(
-          readyProject.budgetAllocation,
-        )?.implementationAmount;
-        await this.notifyProjectOwner(
-          readyProject,
-          'Your implementation team is ready',
-          `Every Scrum task now has an accepted freelancer. Fund the implementation escrow${implementationAmount ? ` (${implementationAmount} ${readyProject.quotedCurrency ?? readyProject.currency})` : ''} to start work and all deadline counters together.`,
-        );
+        await this.notifyImplementationFundingReady(readyProject);
       }
     }
     if (result.scheduleOverrun) {
@@ -1785,6 +1937,54 @@ export class MatchingService {
       });
     }
     return false;
+  }
+
+  async recoverImplementationFundingReadyNotifications() {
+    const projects = await this.projectRepo.find({
+      where: {
+        status: ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
+        automationStatus: 'implementation_team_ready_for_funding',
+      },
+      order: { updatedAt: 'ASC' },
+      take: 25,
+    });
+    let notified = 0;
+    for (const project of projects) {
+      if (await this.notifyImplementationFundingReady(project)) notified += 1;
+    }
+    return { inspected: projects.length, notified };
+  }
+
+  private async notifyImplementationFundingReady(project: Project) {
+    const implementationAmount = projectFundingBreakdown(
+      project.budgetAllocation,
+    )?.implementationAmount;
+    try {
+      await this.notificationsService.ensureImplementationFundingReadyNotification(
+        {
+          userId: project.customerId,
+          projectId: project.id,
+          title: 'Your implementation team is ready to fund',
+          body: `Every Scrum task now has an accepted freelancer, so the implementation payment lock has been removed. Fund the implementation escrow${implementationAmount ? ` (${implementationAmount} ${project.quotedCurrency ?? project.currency})` : ''} to start work and all deadline counters together.`,
+          actionUrl: `/projects/${project.id}/payments`,
+          metadata: { fundingStage: 'implementation' },
+        },
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Implementation funding-ready notification failed for ${project.id}: ${this.safeErrorMessage(error)}`,
+      );
+      return false;
+    }
+    await this.projectRepo.update(
+      {
+        id: project.id,
+        status: ProjectStatus.READY_FOR_IMPLEMENTATION_FUNDING,
+        automationStatus: 'implementation_team_ready_for_funding',
+      },
+      { automationStatus: 'implementation_team_ready_for_funding_notified' },
+    );
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -2216,15 +2416,17 @@ export class MatchingService {
 
   async listInvitations(userId: string, status?: string) {
     const profile = await this.getProfileByUserId(userId);
-    const where: Record<string, unknown> = {
-      freelancerProfileId: profile.id,
-    };
-    if (status) where.status = status;
-    const invitations = await this.invitationRepo.find({
-      where,
-      relations: ['project', 'task'],
-      order: { createdAt: 'DESC' },
-    });
+    const query = this.invitationRepo
+      .createQueryBuilder('invitation')
+      .innerJoinAndSelect('invitation.project', 'project')
+      .leftJoinAndSelect('invitation.task', 'task')
+      .where('invitation.freelancerProfileId = :profileId', {
+        profileId: profile.id,
+      })
+      .andWhere('project.deletedAt IS NULL')
+      .orderBy('invitation.createdAt', 'DESC');
+    if (status) query.andWhere('invitation.status = :status', { status });
+    const invitations = await query.getMany();
     return invitations.map((invitation) => ({
       ...invitation,
       githubUsername: profile.githubUsername,
@@ -3820,15 +4022,19 @@ export class MatchingService {
     title: string,
     body: string,
     actorUserId?: string,
+    options?: {
+      customerActionUrl?: string;
+      customerType?: string;
+    },
   ) {
     await this.notificationsService
       .createNotification({
         userId: project.customerId,
         projectId: project.id,
-        type: 'staffing_update',
+        type: options?.customerType ?? 'staffing_update',
         title,
         body,
-        actionUrl: `/projects/${project.id}/team`,
+        actionUrl: options?.customerActionUrl ?? `/projects/${project.id}/team`,
       })
       .catch((error: unknown) =>
         this.logger.warn(
@@ -4299,26 +4505,28 @@ export class MatchingService {
 
     const capacity = await this.estimateImplementationCapacity(project);
     project.implementationCapacitySnapshot = capacity;
-    if (capacity.status === 'unavailable') {
-      project.automationStatus = 'capacity_preflight_failed';
+    const capacityAtRisk = capacity.status === 'unavailable';
+    if (capacityAtRisk) {
+      project.automationStatus = 'ready_for_funding_capacity_at_risk';
       project.automationError = capacity.blockingReasons.join(' ');
       project.automationErrorCategory = 'implementation_capacity';
       project.automationErrorAt = new Date();
-      await manager.save(Project, project);
-      return false;
     }
 
     await this.transitionProject(manager, project, adminUserId, {
       status: ProjectStatus.READY_FOR_FUNDING,
       planningStatus: 'team_confirmed',
-      reason:
-        'The planning team accepted and estimated implementation capacity passed; planning funding is now enabled.',
+      reason: capacityAtRisk
+        ? 'The planning team accepted; the project reached the funding screen but payment remains locked until the implementation-capacity sweep passes.'
+        : 'The planning team accepted and estimated implementation capacity passed; planning funding is now enabled.',
       setAssignedAt: true,
     });
-    project.automationStatus = 'ready_for_funding';
-    project.automationError = null;
-    project.automationErrorCategory = null;
-    project.automationErrorAt = null;
+    if (!capacityAtRisk) {
+      project.automationStatus = 'ready_for_funding';
+      project.automationError = null;
+      project.automationErrorCategory = null;
+      project.automationErrorAt = null;
+    }
     await manager.save(Project, project);
     return true;
   }
@@ -4454,7 +4662,7 @@ export class MatchingService {
       coveredSkills,
       blockingReasons,
       disclaimer:
-        'This is a non-binding capacity preflight. Exact invitations are sent only after the approved Scrum plan creates concrete tasks.',
+        'This sweep gates planning payment but does not reserve freelancers. Exact invitations are sent only after the approved Scrum plan creates concrete tasks.',
     };
   }
 

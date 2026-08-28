@@ -349,6 +349,144 @@ describe('MatchingService task assignment invariants', () => {
     );
   });
 
+  it('shows the funding stage but keeps payment capacity-locked after the planning team accepts', async () => {
+    const project = {
+      id: 'project-a',
+      status: 'planning_matching',
+      automationStatus: 'matching_planning_team',
+      automationError: null,
+      automationErrorCategory: null,
+      automationErrorAt: null,
+    };
+    const projectQuery: Record<string, jest.Mock> = {};
+    for (const method of ['setLock', 'where']) {
+      projectQuery[method] = jest.fn().mockReturnValue(projectQuery);
+    }
+    projectQuery.getOne = jest.fn().mockResolvedValue(project);
+    const roleQuery: Record<string, jest.Mock> = {};
+    for (const method of ['select', 'where', 'andWhere']) {
+      roleQuery[method] = jest.fn().mockReturnValue(roleQuery);
+    }
+    roleQuery.getRawMany = jest
+      .fn()
+      .mockResolvedValue([{ roleKey: 'architect' }, { roleKey: 'ui_ux' }]);
+    const manager = {
+      getRepository: jest.fn().mockReturnValue({
+        createQueryBuilder: jest.fn().mockReturnValue(projectQuery),
+      }),
+      createQueryBuilder: jest.fn().mockReturnValue(roleQuery),
+      findOne: jest.fn().mockResolvedValue({ id: 'reviewer-a' }),
+      exists: jest.fn().mockResolvedValue(false),
+      save: jest.fn().mockResolvedValue(project),
+    };
+    const transitionProject = jest.fn().mockResolvedValue(undefined);
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      estimateImplementationCapacity: jest.fn().mockResolvedValue({
+        status: 'unavailable',
+        blockingReasons: ['No implementation candidates are available now.'],
+      }),
+      transitionProject,
+    }) as unknown as {
+      maybeAdvanceToPlanningAssigned: (
+        manager: typeof manager,
+        projectId: string,
+        adminUserId: string | null,
+      ) => Promise<boolean>;
+    };
+
+    await expect(
+      service.maybeAdvanceToPlanningAssigned(manager, 'project-a', null),
+    ).resolves.toBe(true);
+    expect(transitionProject).toHaveBeenCalledWith(
+      manager,
+      project,
+      null,
+      expect.objectContaining({
+        status: 'ready_for_funding',
+        reason: expect.stringContaining('payment remains locked'),
+      }),
+    );
+    expect(project).toMatchObject({
+      automationStatus: 'ready_for_funding_capacity_at_risk',
+      automationErrorCategory: 'implementation_capacity',
+    });
+  });
+
+  it('periodically recovers planning funding readiness after a missed acceptance event', async () => {
+    const reconcileProjectFundingReadiness = jest
+      .fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      projectRepo: {
+        find: jest
+          .fn()
+          .mockResolvedValue([{ id: 'project-a' }, { id: 'project-b' }]),
+      },
+      reconcileProjectFundingReadiness,
+      logger: { error: jest.fn() },
+    }) as MatchingService;
+
+    await expect(service.recoverPlanningFundingReadiness()).resolves.toEqual({
+      inspected: 2,
+      unlocked: 1,
+    });
+    expect(reconcileProjectFundingReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('emails the customer once limited implementation capacity becomes available', async () => {
+    const updateQuery: Record<string, jest.Mock> = {};
+    for (const method of [
+      'update',
+      'set',
+      'where',
+      'andWhere',
+      'setParameter',
+    ]) {
+      updateQuery[method] = jest.fn().mockReturnValue(updateQuery);
+    }
+    updateQuery.execute = jest.fn().mockResolvedValue({ affected: 1 });
+    const project = {
+      id: 'project-a',
+      status: 'ready_for_funding',
+      automationStatus: 'ready_for_funding_capacity_at_risk_notified',
+      implementationCapacitySnapshot: {
+        status: 'unavailable',
+        checkedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+      },
+    };
+    const notifyProjectOwner = jest.fn().mockResolvedValue(undefined);
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      projectRepo: {
+        find: jest.fn().mockResolvedValue([project]),
+        createQueryBuilder: jest.fn().mockReturnValue(updateQuery),
+        update: jest.fn().mockResolvedValue({ affected: 1 }),
+      },
+      estimateImplementationCapacity: jest.fn().mockResolvedValue({
+        status: 'viable',
+        workableCandidates: 4,
+        requiredPeople: 3,
+        blockingReasons: [],
+      }),
+      notifyProjectOwner,
+      logger: { error: jest.fn() },
+    }) as MatchingService;
+
+    await expect(
+      service.refreshUnavailableImplementationCapacity(),
+    ).resolves.toEqual({ inspected: 1, refreshed: 1, available: 1 });
+    expect(notifyProjectOwner).toHaveBeenCalledWith(
+      project,
+      'Capacity is available and planning is ready to fund',
+      expect.stringContaining('4 workable implementation freelancer'),
+      undefined,
+      expect.objectContaining({
+        customerActionUrl: '/projects/project-a/payments',
+        customerType: 'implementation_capacity_update',
+      }),
+    );
+  });
+
   it('starts architect and UI/UX matching after governance moved the project to planning matching', async () => {
     const startPlanningRoles = jest.fn().mockResolvedValue(undefined);
     const service = Object.assign(Object.create(MatchingService.prototype), {
@@ -373,6 +511,51 @@ describe('MatchingService task assignment invariants', () => {
       'project-a',
       { roles: ['architect', 'ui_ux'] },
       null,
+    );
+  });
+
+  it('recovers the client payment email after implementation funding unlocks', async () => {
+    const project = {
+      id: 'project-a',
+      customerId: 'customer-a',
+      status: 'ready_for_implementation_funding',
+      automationStatus: 'implementation_team_ready_for_funding',
+      budgetAllocation: createProjectBudgetAllocation(1000, 'EGP'),
+      quotedCurrency: 'EGP',
+      currency: 'EGP',
+    };
+    const ensureImplementationFundingReadyNotification = jest
+      .fn()
+      .mockResolvedValue({ id: 'notification-a' });
+    const update = jest.fn().mockResolvedValue({ affected: 1 });
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      projectRepo: {
+        find: jest.fn().mockResolvedValue([project]),
+        update,
+      },
+      notificationsService: {
+        ensureImplementationFundingReadyNotification,
+      },
+      logger: { warn: jest.fn() },
+    }) as MatchingService;
+
+    await expect(
+      service.recoverImplementationFundingReadyNotifications(),
+    ).resolves.toEqual({ inspected: 1, notified: 1 });
+    expect(ensureImplementationFundingReadyNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'customer-a',
+        projectId: 'project-a',
+        actionUrl: '/projects/project-a/payments',
+        metadata: { fundingStage: 'implementation' },
+      }),
+    );
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'project-a',
+        automationStatus: 'implementation_team_ready_for_funding',
+      }),
+      { automationStatus: 'implementation_team_ready_for_funding_notified' },
     );
   });
 

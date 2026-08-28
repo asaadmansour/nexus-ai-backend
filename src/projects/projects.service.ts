@@ -6,13 +6,17 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { DataSource, In, Repository } from 'typeorm';
 import { Project } from './entities/project.entity';
 import { CreateProjectDto } from './dtos/create-project.dto';
 import { UpdateProjectDto } from './dtos/update-project.dto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { ProjectPayment } from 'src/payments/entities/project-payment.entity';
 import { MIN_DEADLINE_LEAD_DAYS } from 'src/common/decorators/is-future-date.decorator';
+import { ProjectRoleAssignment } from './entities/project-role-assignment.entity';
+import { ProjectTask } from './entities/project-task.entity';
+import { ProjectInvitation } from 'src/matching/entities/project-invitation.entity';
+import { Notification } from 'src/notifications/entities/notification.entity';
 
 const NON_DELETABLE_PROJECT_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_ASSIGNED,
@@ -39,6 +43,7 @@ export class ProjectsService {
     private readonly projectRepository: Repository<Project>,
     @InjectRepository(ProjectPayment)
     private readonly projectPaymentRepository: Repository<ProjectPayment>,
+    private readonly dataSource: DataSource,
   ) {}
 
   async create(customerId: string, dto: CreateProjectDto) {
@@ -160,15 +165,65 @@ export class ProjectsService {
   }
 
   async remove(id: string, userId: string, isAdmin: boolean) {
-    const project = await this.findOne(id, userId, isAdmin);
+    await this.dataSource.transaction(async (manager) => {
+      const project = await manager
+        .getRepository(Project)
+        .createQueryBuilder('project')
+        .setLock('pessimistic_write')
+        .where('project.id = :id', { id })
+        .getOne();
+      if (!project) throw new NotFoundException('Project not found');
+      if (!isAdmin && project.customerId !== userId) {
+        throw new ForbiddenException('You can only delete your own projects');
+      }
 
-    if (NON_DELETABLE_PROJECT_STATUSES.has(project.status)) {
-      throw new BadRequestException(
-        'Projects cannot be deleted after they are assigned to freelancers',
+      const acceptedAssignment = await manager.exists(ProjectRoleAssignment, {
+        where: {
+          projectId: id,
+          status: In(['accepted', 'in_progress', 'completed']),
+        },
+      });
+      if (
+        project.principalReviewerAssignmentId ||
+        acceptedAssignment ||
+        NON_DELETABLE_PROJECT_STATUSES.has(project.status)
+      ) {
+        throw new ConflictException(
+          'This project cannot be deleted after the principal reviewer or another freelancer has accepted it',
+        );
+      }
+
+      const now = new Date();
+      await manager.update(
+        ProjectInvitation,
+        { projectId: id, status: In(['pending', 'accepting']) },
+        {
+          status: 'cancelled',
+          respondedAt: now,
+          responseReason: 'Project deleted by the customer',
+        },
       );
-    }
-
-    await this.projectRepository.softRemove(project);
+      await manager.update(
+        ProjectRoleAssignment,
+        { projectId: id, status: 'assigned' },
+        {
+          status: 'cancelled',
+          endedAt: now,
+          decisionReason: 'Project deleted by the customer',
+        },
+      );
+      await manager.update(
+        ProjectTask,
+        { projectId: id },
+        {
+          status: 'cancelled',
+          assignmentStatus: 'unassigned',
+          assignedFreelancerProfileId: null,
+        },
+      );
+      await manager.delete(Notification, { projectId: id });
+      await manager.getRepository(Project).softDelete(id);
+    });
   }
 
   private assertDeadline(value: string | undefined) {

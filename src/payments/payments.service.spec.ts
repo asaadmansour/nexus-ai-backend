@@ -11,6 +11,8 @@ import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assign
 import { ProjectPlanningSubmission } from 'src/projects/entities/project-planning-submission.entity';
 import { User } from 'src/users/entities/user.entity';
 import { MatchingService } from 'src/matching/matching.service';
+import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { createProjectBudgetAllocation } from 'src/planning/project-budget-allocation';
 import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
@@ -110,6 +112,58 @@ describe('PaymentsService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('locks planning payment until the capacity sweep finds enough freelancers', () => {
+    const project = {
+      id: 'project-a',
+      title: 'Capacity-gated project',
+      status: ProjectStatus.READY_FOR_FUNDING,
+      quoteStatus: 'ready',
+      quotedAmount: '1000.00',
+      quotedCurrency: 'EGP',
+      currency: 'EGP',
+      budgetAllocation: createProjectBudgetAllocation(1000, 'EGP'),
+      implementationCapacitySnapshot: {
+        status: 'unavailable',
+        requiredPeople: 3,
+        workableCandidates: 1,
+      },
+      budgetMin: '900.00',
+      budgetMax: '1100.00',
+      deadline: null,
+      createdAt: new Date(),
+      heldAmount: '0.00',
+      releasedAmount: '0.00',
+      planningFundedAt: null,
+      implementationFundedAt: null,
+    } as unknown as Project;
+    const buildSummary = (
+      service as unknown as {
+        buildProjectPaymentSummary: (
+          project: Project,
+          payments: ProjectPayment[],
+          milestones: ProjectMilestone[],
+        ) => {
+          actions: { canPay: boolean; payBlockedReason: string | null };
+        };
+      }
+    ).buildProjectPaymentSummary.bind(service);
+
+    const blocked = buildSummary(project, [], []);
+    expect(blocked.actions.canPay).toBe(false);
+    expect(blocked.actions.payBlockedReason).toContain(
+      'latest capacity sweep found too few',
+    );
+
+    project.implementationCapacitySnapshot = {
+      ...project.implementationCapacitySnapshot,
+      status: 'viable',
+      workableCandidates: 4,
+    };
+    const unlocked = buildSummary(project, [], []);
+    expect(unlocked.actions.canPay).toBe(true);
+    expect(unlocked.actions.payBlockedReason).toBeNull();
   });
 
   it('returns task allocations and approved earnings without requiring Stripe', async () => {

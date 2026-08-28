@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { AiService } from 'src/agents/ai.service';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
@@ -375,6 +375,7 @@ export class RoleAssignmentsService {
         ? await this.assignmentRepo.find({
             where: {
               freelancerProfileId: profile.id,
+              project: { deletedAt: IsNull() },
               ...(query.phase ? { phase: query.phase } : {}),
               ...(query.statuses?.length ? { status: In(query.statuses) } : {}),
             },
@@ -418,6 +419,7 @@ export class RoleAssignmentsService {
         ? await this.taskRepo.find({
             where: {
               assignedFreelancerProfileId: profile.id,
+              project: { deletedAt: IsNull() },
               status: In([
                 'todo',
                 'blocked',
@@ -524,6 +526,7 @@ export class RoleAssignmentsService {
     if (!profile) {
       throw new NotFoundException('Freelancer profile not found');
     }
+    await this.getProject(projectId);
 
     const assignments = await this.assignmentRepo.find({
       where: {
@@ -590,6 +593,7 @@ export class RoleAssignmentsService {
         description: project.description,
         status: project.status,
         planningStatus: project.planningStatus,
+        planningFundedAt: project.planningFundedAt,
         currency: project.currency,
         deadline: project.deadline,
         isDeadlineFlexible: project.isDeadlineFlexible,

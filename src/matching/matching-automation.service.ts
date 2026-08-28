@@ -40,6 +40,9 @@ export class MatchingAutomationService
       await this.matchingService.expirePendingInvitations();
       await this.matchingService.recoverRunsMissingFallbackInvitations();
       await this.matchingService.recoverPlanningRolesAfterReviewerAcceptance();
+      await this.matchingService.recoverPlanningFundingReadiness();
+      await this.matchingService.refreshUnavailableImplementationCapacity();
+      await this.matchingService.recoverImplementationFundingReadyNotifications();
       await this.matchingService.recoverFundedStageActivations();
       await this.matchingService.recoverReadyForFundingNotifications();
       await this.matchingService.recoverBlockedStaffing();

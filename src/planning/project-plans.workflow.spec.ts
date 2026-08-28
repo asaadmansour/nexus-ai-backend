@@ -85,7 +85,10 @@ describe('Sprint 5 task workflow', () => {
     });
     expect(taskRepo.findAndCount).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { assignedFreelancerProfileId: 'profile-1' },
+        where: expect.objectContaining({
+          assignedFreelancerProfileId: 'profile-1',
+          project: expect.objectContaining({ deletedAt: expect.anything() }),
+        }),
         relations: ['dependencies', 'project', 'milestone'],
       }),
     );

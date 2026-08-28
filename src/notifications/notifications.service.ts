@@ -110,6 +110,23 @@ export class NotificationsService {
     });
   }
 
+  async ensureImplementationFundingReadyNotification(
+    input: CreateNotificationInput & { projectId: string },
+  ) {
+    const existing = await this.notificationRepository.findOne({
+      where: {
+        userId: input.userId,
+        projectId: input.projectId,
+        type: 'implementation_funding_ready',
+      },
+    });
+    if (existing) return existing;
+    return this.createNotification({
+      ...input,
+      type: 'implementation_funding_ready',
+    });
+  }
+
   stream(userId: string): Observable<MessageEvent> {
     return new Observable<MessageEvent>((subscriber) => {
       const listeners = this.subscribers.get(userId) ?? new Set();
@@ -213,6 +230,14 @@ export class NotificationsService {
       staffing_update: {
         subject: 'Your project team has an update',
         actionLabel: 'View project team',
+      },
+      implementation_capacity_update: {
+        subject: 'Your project implementation capacity has an update',
+        actionLabel: 'Open planning payment',
+      },
+      implementation_funding_ready: {
+        subject: 'Your implementation team is ready to fund',
+        actionLabel: 'Fund implementation',
       },
       reviewer_attention: {
         subject: 'A project decision needs your review',

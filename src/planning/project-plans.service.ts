@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
 import { AiService } from 'src/agents/ai.service';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import type {
@@ -1267,6 +1267,7 @@ export class ProjectPlansService {
 
     const where: Record<string, unknown> = {
       assignedFreelancerProfileId: profile.id,
+      project: { deletedAt: IsNull() },
     };
     if (query.status) where.status = query.status;
 
