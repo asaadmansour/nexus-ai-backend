@@ -135,10 +135,16 @@ describe('MatchingService task assignment invariants', () => {
 
   it('limits a principal reviewer to the top three candidates', async () => {
     const inviteNextCandidate = jest.fn();
+    const assignmentExists = jest.fn().mockResolvedValue(false);
     const service = Object.assign(Object.create(MatchingService.prototype), {
+      dataSource: {
+        getRepository: jest.fn().mockReturnValue({ exists: assignmentExists }),
+      },
       runRepo: {
         findOne: jest.fn().mockResolvedValue({
           id: 'run-a',
+          projectId: 'project-a',
+          targetType: 'project_role',
           targetRoleKey: 'architect',
           status: 'completed',
         }),
@@ -174,10 +180,16 @@ describe('MatchingService task assignment invariants', () => {
       responseReason: null,
     };
     const inviteNextCandidate = jest.fn().mockResolvedValue(invitation);
+    const assignmentExists = jest.fn().mockResolvedValue(false);
     const service = Object.assign(Object.create(MatchingService.prototype), {
+      dataSource: {
+        getRepository: jest.fn().mockReturnValue({ exists: assignmentExists }),
+      },
       runRepo: {
         findOne: jest.fn().mockResolvedValue({
           id: 'run-a',
+          projectId: 'project-a',
+          targetType: 'project_role',
           targetRoleKey: 'ui_ux',
           status: 'completed',
         }),
@@ -210,6 +222,39 @@ describe('MatchingService task assignment invariants', () => {
       assignment: null,
       invitation: { id: 'invitation-a', status: 'pending' },
     });
+  });
+
+  it('does not let a reviewer select an already filled planning role again', async () => {
+    const candidateFindOne = jest.fn();
+    const inviteNextCandidate = jest.fn();
+    const service = Object.assign(Object.create(MatchingService.prototype), {
+      dataSource: {
+        getRepository: jest.fn().mockReturnValue({
+          exists: jest.fn().mockResolvedValue(true),
+        }),
+      },
+      runRepo: {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'run-a',
+          projectId: 'project-a',
+          targetType: 'project_role',
+          targetRoleKey: 'architect',
+          status: 'completed',
+        }),
+      },
+      candidateRepo: { findOne: candidateFindOne },
+      inviteNextCandidate,
+    }) as MatchingService;
+
+    await expect(
+      service.reviewRunWithInvitation(
+        'run-a',
+        { decision: 'approved', selectedCandidateId: 'candidate-one' },
+        'reviewer-a',
+      ),
+    ).rejects.toThrow('already been selected');
+    expect(candidateFindOne).not.toHaveBeenCalled();
+    expect(inviteNextCandidate).not.toHaveBeenCalled();
   });
 
   it('recovers materialized tasks when matching never created a run', async () => {

@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, In } from 'typeorm';
+import { DataSource, In, IsNull } from 'typeorm';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { DeliveryService } from 'src/delivery/delivery.service';
@@ -30,6 +30,12 @@ import { ProjectHandoff } from 'src/projects/entities/project-handoff.entity';
 import { Project } from 'src/projects/entities/project.entity';
 
 const ACTIVE_REVIEWER_STATUSES = ['accepted', 'in_progress', 'completed'];
+const FILLED_ROLE_STATUSES = [
+  'assigned',
+  'accepted',
+  'in_progress',
+  'completed',
+];
 
 @Injectable()
 export class ReviewerService {
@@ -117,6 +123,15 @@ export class ReviewerService {
               AND invitation.status IN ('pending', 'accepting', 'accepted')
           )`,
         )
+        .andWhere(
+          `(run.target_type = 'task' OR NOT EXISTS (
+            SELECT 1 FROM project_role_assignments assignment
+            WHERE assignment.project_id = run.project_id
+              AND assignment.role_key = run.target_role_key
+              AND assignment.status IN ('assigned', 'accepted', 'in_progress', 'completed')
+              AND assignment.ended_at IS NULL
+          ))`,
+        )
         .getCount(),
       this.dataSource.getRepository(ProjectSubmission).count({
         where: { projectId, status: In(['submitted', 'under_review']) },
@@ -177,7 +192,20 @@ export class ReviewerService {
 
   async listMatchingRuns(projectId: string, userId: string) {
     await this.assertReviewer(projectId, userId);
-    return this.matching.listRuns(projectId, { page: 1, limit: 100 });
+    const [runs, assignments] = await Promise.all([
+      this.matching.listRuns(projectId, { page: 1, limit: 100 }),
+      this.getFilledRoleAssignments(projectId),
+    ]);
+    return {
+      ...runs,
+      data: runs.data.map((run) => ({
+        ...run,
+        selectedAssignment:
+          run.targetType !== 'task' && run.targetRoleKey
+            ? this.assignmentSummary(assignments.get(run.targetRoleKey) ?? null)
+            : null,
+      })),
+    };
   }
 
   async getMatchingRun(id: string, userId: string) {
@@ -187,9 +215,16 @@ export class ReviewerService {
     });
     if (!item) throw new NotFoundException('Matching run not found');
     await this.assertReviewer(item.projectId, userId);
-    const run = await this.matching.getRun(id);
+    const [run, assignments] = await Promise.all([
+      this.matching.getRun(id),
+      this.getFilledRoleAssignments(item.projectId),
+    ]);
     return {
       ...run,
+      selectedAssignment:
+        run.targetType !== 'task' && run.targetRoleKey
+          ? this.assignmentSummary(assignments.get(run.targetRoleKey) ?? null)
+          : null,
       candidates: run.candidates.slice(0, 3),
     };
   }
@@ -326,6 +361,49 @@ export class ReviewerService {
         'You are not the active principal reviewer for this project',
       );
     }
+  }
+
+  private async getFilledRoleAssignments(projectId: string) {
+    const assignments = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .find({
+        where: {
+          projectId,
+          status: In(FILLED_ROLE_STATUSES),
+          endedAt: IsNull(),
+        },
+        relations: ['freelancerProfile', 'freelancerProfile.user'],
+        order: { updatedAt: 'DESC' },
+      });
+    const byRole = new Map<string, ProjectRoleAssignment>();
+    for (const assignment of assignments) {
+      if (!byRole.has(assignment.roleKey)) {
+        byRole.set(assignment.roleKey, assignment);
+      }
+    }
+    return byRole;
+  }
+
+  private assignmentSummary(assignment: ProjectRoleAssignment | null) {
+    if (!assignment) return null;
+    const user = assignment.freelancerProfile?.user;
+    return {
+      id: assignment.id,
+      roleKey: assignment.roleKey,
+      status: assignment.status,
+      freelancerProfileId: assignment.freelancerProfileId,
+      sourceMatchingRunId: assignment.sourceMatchingRunId,
+      sourceCandidateId: assignment.sourceCandidateId,
+      freelancer: assignment.freelancerProfile
+        ? {
+            id: assignment.freelancerProfile.id,
+            name:
+              [user?.firstName, user?.lastName].filter(Boolean).join(' ') ||
+              null,
+            githubUsername: assignment.freelancerProfile.githubUsername,
+          }
+        : null,
+    };
   }
 
   private adminIdentity(userId: string): JwtPayload {

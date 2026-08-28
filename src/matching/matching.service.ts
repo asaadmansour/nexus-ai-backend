@@ -2378,6 +2378,23 @@ export class MatchingService {
         'Candidate selection is available only after matching completes',
       );
     }
+    if (run.targetType !== 'task' && run.targetRoleKey) {
+      const filledAssignment = await this.dataSource
+        .getRepository(ProjectRoleAssignment)
+        .exists({
+          where: {
+            projectId: run.projectId,
+            roleKey: run.targetRoleKey,
+            status: In(ROLE_FILLED_STATUSES),
+            endedAt: IsNull(),
+          },
+        });
+      if (filledAssignment) {
+        throw new ConflictException(
+          'This project role has already been selected and cannot be selected again.',
+        );
+      }
+    }
 
     const candidate = await this.candidateRepo.findOne({
       where: {
