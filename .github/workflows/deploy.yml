@@ -59,6 +59,9 @@ jobs:
               docker login --username AWS --password-stdin "$ECR_REGISTRY"
             sed -i '/^BACKEND_TAG=/d' .env
             echo "BACKEND_TAG=$GITHUB_SHA" >> .env
+            # Compose prefers an exported shell value over the updated .env file.
+            # Refresh it here so migrations and the API use this commit's image.
+            export BACKEND_TAG="$GITHUB_SHA"
             docker compose pull backend migrate
             docker compose up -d
             # Drop images no longer referenced by a container so the disk
