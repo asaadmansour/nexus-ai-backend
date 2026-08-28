@@ -15,9 +15,12 @@ import { FreelancerSkillScore } from '../../freelancers/entities/freelancer-skil
 // customers, and briefed projects at various stages.
 //
 //   npm run seed:real -- --yes                 (local, ts-node)
+//   npm run seed:real -- --yes --freelancers-only
 //   node dist/database/seeds/seed-real-data.js --yes   (inside the image)
 //
-// The --yes flag is mandatory: this script is destructive.
+// The --yes flag is mandatory: both modes are destructive. The
+// --freelancers-only mode leaves no users or domain data except freelancer
+// users and their profiles, scores, and embeddings.
 
 const AI_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
 const EMBEDDING_MODEL = 'gemini-embedding-001';
@@ -790,6 +793,7 @@ async function run() {
   }
 
   await dataSource.initialize();
+  const freelancersOnly = process.argv.includes('--freelancers-only');
 
   const target = (process.env.DATABASE_URL ?? '').replace(/\/\/[^@]*@/, '//***@');
   console.log(`Target database: ${target}`);
@@ -797,7 +801,13 @@ async function run() {
   const cleared = await wipe();
   console.log(`Wiped ${cleared} tables.`);
 
-  await createUser({ ...ADMIN, role: UserRole.ADMIN, password: ADMIN.password });
+  if (!freelancersOnly) {
+    await createUser({
+      ...ADMIN,
+      role: UserRole.ADMIN,
+      password: ADMIN.password,
+    });
+  }
 
   for (const seed of TOP) {
     await createFreelancer(seed);
@@ -807,63 +817,71 @@ async function run() {
     await createFreelancer(seed);
   }
 
-  const projects = dataSource.getRepository(Project);
-  const briefs = dataSource.getRepository(Brief);
-  const customers: User[] = [];
-  for (const customer of ALL_CUSTOMERS) {
-    customers.push(
-      await createUser({
-        email: customer.email,
-        firstName: customer.firstName,
-        lastName: customer.lastName,
-        role: UserRole.CUSTOMER,
-        password: PASSWORD,
-      }),
-    );
-  }
+  if (!freelancersOnly) {
+    const projects = dataSource.getRepository(Project);
+    const briefs = dataSource.getRepository(Brief);
+    const customers: User[] = [];
+    for (const customer of ALL_CUSTOMERS) {
+      customers.push(
+        await createUser({
+          email: customer.email,
+          firstName: customer.firstName,
+          lastName: customer.lastName,
+          role: UserRole.CUSTOMER,
+          password: PASSWORD,
+        }),
+      );
+    }
 
-  for (const seed of ALL_PROJECTS) {
-    const project = await projects.save(
-      projects.create({
-        customerId: customers[seed.customerIndex].id,
-        title: seed.title,
-        description: seed.description,
-        budgetMin: seed.budgetMin,
-        budgetMax: seed.budgetMax,
-        currency: 'EGP',
-        deadline: new Date(Date.now() + seed.deadlineDays * 24 * 60 * 60 * 1000),
-        isDeadlineFlexible: seed.deadlineDays > 60,
-        status: seed.status,
-        planningStatus: seed.planningStatus,
-      }),
-    );
+    for (const seed of ALL_PROJECTS) {
+      const project = await projects.save(
+        projects.create({
+          customerId: customers[seed.customerIndex].id,
+          title: seed.title,
+          description: seed.description,
+          budgetMin: seed.budgetMin,
+          budgetMax: seed.budgetMax,
+          currency: 'EGP',
+          deadline: new Date(
+            Date.now() + seed.deadlineDays * 24 * 60 * 60 * 1000,
+          ),
+          isDeadlineFlexible: seed.deadlineDays > 60,
+          status: seed.status,
+          planningStatus: seed.planningStatus,
+        }),
+      );
 
-    await briefs.save(
-      briefs.create({
-        projectId: project.id,
-        isComplete: true,
-        completedAt: new Date(),
-        completionPercentage: 100,
-        missingFields: [],
-        summary: seed.description,
-        briefText: `${seed.description} Core features: ${seed.coreFeatures}.`,
-        projectType: seed.projectType,
-        domain: seed.domain,
-        mainGoal: seed.mainGoal,
-        targetUsers: seed.targetUsers,
-        coreFeatures: seed.coreFeatures,
-        platforms: seed.platforms,
-        requiredSkills: seed.requiredSkills.join(', '),
-      }),
-    );
+      await briefs.save(
+        briefs.create({
+          projectId: project.id,
+          isComplete: true,
+          completedAt: new Date(),
+          completionPercentage: 100,
+          missingFields: [],
+          summary: seed.description,
+          briefText: `${seed.description} Core features: ${seed.coreFeatures}.`,
+          projectType: seed.projectType,
+          domain: seed.domain,
+          mainGoal: seed.mainGoal,
+          targetUsers: seed.targetUsers,
+          coreFeatures: seed.coreFeatures,
+          platforms: seed.platforms,
+          requiredSkills: seed.requiredSkills.join(', '),
+        }),
+      );
+    }
   }
 
   const freelancerCount = TOP.length + pool.length;
   console.log('\nSeeded:');
-  console.log(`  1 admin        ${ADMIN.email} / ${ADMIN.password}`);
+  if (!freelancersOnly) {
+    console.log(`  1 admin        ${ADMIN.email} / ${ADMIN.password}`);
+  }
   console.log(`  ${freelancerCount} freelancers  (${TOP.length} top-rated, ${pool.length} supporting pool)`);
-  console.log(`  ${customers.length} customers`);
-  console.log(`  ${ALL_PROJECTS.length} projects with completed briefs`);
+  console.log(`  ${freelancersOnly ? 0 : ALL_CUSTOMERS.length} customers`);
+  console.log(
+    `  ${freelancersOnly ? 0 : ALL_PROJECTS.length} projects with completed briefs`,
+  );
   console.log(`\nAll seeded accounts use the password: ${PASSWORD}`);
   console.log('\nTop-rated freelancers:');
   for (const seed of TOP) {
