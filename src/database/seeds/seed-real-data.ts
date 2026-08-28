@@ -32,6 +32,10 @@ const ADMIN = {
 
 const PASSWORD = 'Nexus@123456';
 
+// Size of the supporting freelancer pool. Every one of them is capped below
+// the headline five on every scored axis.
+const POOL_SIZE = 140;
+
 // --- Skill vocabularies -----------------------------------------------------
 // Every brief below draws its requiredSkills from these lists, so the headline
 // freelancer for a role matches 100% of what their role's projects ask for.
@@ -233,29 +237,23 @@ type PoolTemplate = {
   discipline: 'architect' | 'backend' | 'frontend' | 'uiux' | 'reviewer';
 };
 
-const POOL: PoolTemplate[] = [
-  { first: 'Nour', last: 'Ahmed', discipline: 'architect' },
-  { first: 'Omar', last: 'Khaled', discipline: 'architect' },
-  { first: 'Yasmin', last: 'Fouad', discipline: 'architect' },
-  { first: 'Karim', last: 'Adel', discipline: 'architect' },
-  { first: 'Tarek', last: 'Selim', discipline: 'backend' },
-  { first: 'Salma', last: 'Hegazy', discipline: 'backend' },
-  { first: 'Youssef', last: 'Nabil', discipline: 'backend' },
-  { first: 'Dina', last: 'Rashad', discipline: 'backend' },
-  { first: 'Hassan', last: 'Gamal', discipline: 'backend' },
-  { first: 'Mariam', last: 'Ali', discipline: 'frontend' },
-  { first: 'Ziad', last: 'Anwar', discipline: 'frontend' },
-  { first: 'Farida', last: 'Sherif', discipline: 'frontend' },
-  { first: 'Amr', last: 'Sabry', discipline: 'frontend' },
-  { first: 'Hana', last: 'Youssef', discipline: 'uiux' },
-  { first: 'Laila', last: 'Ibrahim', discipline: 'uiux' },
-  { first: 'Nadia', last: 'Hamdy', discipline: 'uiux' },
-  { first: 'Rami', last: 'Zaki', discipline: 'uiux' },
-  { first: 'Sherif', last: 'Mahmoud', discipline: 'reviewer' },
-  { first: 'Aya', last: 'Mansour', discipline: 'reviewer' },
-  { first: 'Khaled', last: 'Fahmy', discipline: 'reviewer' },
-  { first: 'Menna', last: 'Sabbour', discipline: 'backend' },
-  { first: 'Bassel', last: 'Nagy', discipline: 'frontend' },
+const FIRST_NAMES = [
+  'Nour', 'Omar', 'Yasmin', 'Karim', 'Tarek', 'Salma', 'Youssef', 'Dina',
+  'Hassan', 'Mariam', 'Ziad', 'Farida', 'Amr', 'Hana', 'Laila', 'Nadia',
+  'Rami', 'Sherif', 'Aya', 'Khaled', 'Menna', 'Bassel', 'Habiba', 'Marwan',
+  'Nada', 'Seif', 'Rowan', 'Adham', 'Malak', 'Fady', 'Jana', 'Hazem',
+  'Sondos', 'Mostafa', 'Rana', 'Tamer', 'Alaa', 'Nourhan', 'Zeyad', 'Heba',
+];
+
+const LAST_NAMES = [
+  'Ahmed', 'Khaled', 'Fouad', 'Adel', 'Selim', 'Hegazy', 'Nabil', 'Rashad',
+  'Gamal', 'Ali', 'Anwar', 'Sherif', 'Sabry', 'Youssef', 'Ibrahim', 'Hamdy',
+  'Zaki', 'Mahmoud', 'Mansour', 'Fahmy', 'Sabbour', 'Nagy', 'Shaker', 'Ramzy',
+  'Helmy', 'Farouk', 'Kamel', 'Refaat', 'Bakr', 'Wahba',
+];
+
+const DISCIPLINES: PoolTemplate['discipline'][] = [
+  'architect', 'backend', 'frontend', 'uiux', 'reviewer',
 ];
 
 const DISCIPLINE_SKILLS: Record<PoolTemplate['discipline'], string[]> = {
@@ -280,38 +278,42 @@ function spread(index: number, min: number, max: number): number {
   return min + ((index * 7) % (steps + 1));
 }
 
-function buildPool(): FreelancerSeed[] {
-  return POOL.map((person, index) => {
-    const all = DISCIPLINE_SKILLS[person.discipline];
+function buildPool(count: number): FreelancerSeed[] {
+  return Array.from({ length: count }, (_, index) => {
+    const discipline = DISCIPLINES[index % DISCIPLINES.length];
+    const first = FIRST_NAMES[index % FIRST_NAMES.length];
+    const last = LAST_NAMES[(index * 3) % LAST_NAMES.length];
+    const all = DISCIPLINE_SKILLS[discipline];
     // 6-10 of the discipline's skills, never the full set.
     const take = 6 + (index % 5);
     const skills = all.slice(0, Math.min(take, all.length - 2));
-    const approved = spread(index, 6, 40);
-    const onTime = spread(index, 5, 38);
-    const handle = `${person.first}${person.last}`.toLowerCase();
+    const handle = `${first}${last}`.toLowerCase();
+    const years = spread(index, 3, 9);
 
     return {
-      email: `${person.first}.${person.last}@nexus-ai.dev`.toLowerCase(),
-      firstName: person.first,
-      lastName: person.last,
-      githubUsername: `${handle}-dev`,
-      headline: `${DISCIPLINE_HEADLINE[person.discipline]} with ${spread(index, 3, 9)} years of delivery experience`,
-      bio: `${DISCIPLINE_HEADLINE[person.discipline]} working across ${skills.slice(0, 4).join(', ')} on product teams.`,
+      // The index keeps the email and GitHub handle unique even where a name
+      // combination repeats; github_username carries a unique index.
+      email: `${handle}${index}@nexus-ai.dev`,
+      firstName: first,
+      lastName: last,
+      githubUsername: `${handle}-${index}`,
+      headline: `${DISCIPLINE_HEADLINE[discipline]} with ${years} years of delivery experience`,
+      bio: `${DISCIPLINE_HEADLINE[discipline]} working across ${skills.slice(0, 4).join(', ')} on product teams, shipping features end to end alongside the rest of the squad.`,
       skills,
       skillScore: 3.2 + ((index * 3) % 11) / 10,
-      yearsExperience: spread(index, 3, 9),
+      yearsExperience: years,
       hourlyRate: `${spread(index, 22, 58)}.00`,
       availabilityHoursPerWeek: spread(index, 8, 32),
       assessmentScore: `${spread(index, 62, 88)}.00`,
       performanceScore: `${spread(index, 66, 92)}.00`,
-      approvedSubmissions: approved,
+      approvedSubmissions: spread(index, 6, 40),
       rejectedSubmissions: spread(index, 1, 7),
-      onTimeDeliveries: onTime,
+      onTimeDeliveries: spread(index, 5, 38),
       lateDeliveries: spread(index, 1, 9),
       missedDeadlines: index % 4,
       avgRating: `${(3.4 + ((index * 2) % 12) / 10).toFixed(2)}`,
       ratingsCount: spread(index, 4, 33),
-      principalReviewer: person.discipline === 'reviewer',
+      principalReviewer: discipline === 'reviewer',
     };
   });
 }
@@ -330,6 +332,36 @@ const CUSTOMERS = [
   { email: 'support@brewhousecoffee.com', firstName: 'Sara', lastName: 'Lotfy', company: 'Brewhouse Coffee' },
   { email: 'projects@vertexinsurance.com', firstName: 'Ahmed', lastName: 'Roushdy', company: 'Vertex Insurance' },
 ];
+
+const COMPANY_BANK = [
+  ['Cairo Dental Group', 'healthcare'], ['Nile Freight', 'logistics'],
+  ['Bright Steps Nursery', 'education'], ['Urban Threads', 'retail'],
+  ['Sunset Travel', 'travel'], ['Delta Pharma', 'healthcare'],
+  ['Cedar Legal', 'professional services'], ['Prime Auto Care', 'automotive'],
+  ['Harvest Grocers', 'retail'], ['Lumen Photography', 'creative services'],
+  ['Metro Dry Cleaning', 'services'], ['Pixel Print House', 'printing'],
+  ['Oasis Spa', 'wellness'], ['Skyline Events', 'events'],
+  ['Verde Landscaping', 'home services'], ['Bluewave Swimming', 'sports'],
+  ['Copper Kitchen', 'food and beverage'], ['Studio Nine Architects', 'architecture'],
+  ['Trailhead Outdoors', 'retail'], ['Nova Language School', 'education'],
+  ['Anchor Marine', 'marine'], ['Rosewood Interiors', 'interior design'],
+  ['Summit Accounting', 'finance'], ['Cobalt Security', 'security'],
+  ['Fairview Vet Clinic', 'veterinary'], ['Ironclad Fitness', 'fitness'],
+  ['Paperbark Books', 'retail'], ['Solstice Solar', 'energy'],
+  ['Amber Catering', 'food and beverage'], ['Quill Publishing', 'publishing'],
+];
+
+// The ten named customers above own the hand-written flagship projects; these
+// fill the marketplace out so the admin views are not a ten-row list.
+const GENERATED_CUSTOMERS = COMPANY_BANK.map(([company, domain], index) => ({
+  email: `contact${index}@${company.toLowerCase().replace(/[^a-z]/g, '')}.com`,
+  firstName: FIRST_NAMES[(index * 5) % FIRST_NAMES.length],
+  lastName: LAST_NAMES[(index * 7) % LAST_NAMES.length],
+  company,
+  domain,
+}));
+
+const ALL_CUSTOMERS = [...CUSTOMERS, ...GENERATED_CUSTOMERS];
 
 type ProjectSeed = {
   customerIndex: number;
@@ -523,13 +555,83 @@ const PROJECTS: ProjectSeed[] = [
   },
 ];
 
+// One project per generated customer. requiredSkills rotate through the same
+// four discipline-exclusive pools the flagship briefs use, so no specialist can
+// out-match another on the shared list and role fit stays the decider.
+const ARCHITECT_ONLY = ['Solution Architecture', 'Microservices', 'Event-Driven Architecture',
+  'Domain-Driven Design', 'AWS', 'Kubernetes', 'Scalability', 'API Design', 'Technical Leadership'];
+const UIUX_ONLY = ['Figma', 'Design Systems', 'User Flows', 'Wireframing', 'Prototyping',
+  'UI Design', 'UX Research', 'Interaction Design', 'Usability Testing', 'Design Tokens'];
+const BACKEND_ONLY = ['Node.js', 'TypeORM', 'REST APIs', 'GraphQL', 'Redis', 'BullMQ',
+  'Authentication', 'Stripe Integration', 'Performance Optimization', 'Testing'];
+const FRONTEND_ONLY = ['React', 'Next.js', 'Tailwind CSS', 'Redux', 'React Query',
+  'Web Performance', 'Component Libraries', 'Jest', 'Testing Library'];
+
+const pick = (list: string[], index: number, n: number) =>
+  Array.from({ length: n }, (_, k) => list[(index * 3 + k) % list.length]);
+
+const PROJECT_SHAPES = [
+  ['customer portal', 'Give customers a self-service account area', 'account portal, profile management, document uploads, support requests'],
+  ['booking platform', 'Take bookings online instead of by phone', 'availability calendar, online booking, reminders, staff schedule'],
+  ['ecommerce storefront', 'Sell the full catalogue online', 'product catalog, cart, checkout, order tracking'],
+  ['internal dashboard', 'Replace the spreadsheets the team runs on', 'reporting dashboard, data import, user roles, audit trail'],
+  ['mobile companion app', 'Put the service in customers pockets', 'mobile ordering, notifications, loyalty points, account history'],
+  ['inventory system', 'Know what is in stock without counting it', 'stock levels, purchase orders, supplier records, low stock alerts'],
+];
+
+const STATUS_CYCLE: [ProjectStatus, string][] = [
+  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
+  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
+  [ProjectStatus.PLANNING_MATCHING, 'matching'],
+  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
+  [ProjectStatus.PLANNING_ASSIGNED, 'assigned'],
+  [ProjectStatus.ACTIVE, 'completed'],
+  [ProjectStatus.BRIEF_COMPLETE, 'not_started'],
+  [ProjectStatus.COMPLETED, 'completed'],
+];
+
+const GENERATED_PROJECTS: ProjectSeed[] = GENERATED_CUSTOMERS.map((customer, index) => {
+  const [shape, goal, features] = PROJECT_SHAPES[index % PROJECT_SHAPES.length];
+  const [status, planningStatus] = STATUS_CYCLE[index % STATUS_CYCLE.length];
+  const budget = 6000 + (index % 9) * 3000;
+  return {
+    customerIndex: CUSTOMERS.length + index,
+    title: `${customer.company} ${shape}`,
+    description: `${goal} for ${customer.company}, a ${customer.domain} business. Core scope covers ${features}.`,
+    budgetMin: `${budget}.00`,
+    budgetMax: `${budget * 2}.00`,
+    status,
+    planningStatus,
+    projectType: shape,
+    domain: customer.domain,
+    mainGoal: goal + '.',
+    targetUsers: `${customer.company} customers and the team running the service.`,
+    coreFeatures: features,
+    platforms: index % 3 === 0 ? 'web' : 'web, mobile',
+    requiredSkills: [
+      ...pick(ARCHITECT_ONLY, index, 3),
+      ...pick(UIUX_ONLY, index, 3),
+      ...pick(BACKEND_ONLY, index, 3),
+      ...pick(FRONTEND_ONLY, index, 3),
+    ],
+    deadlineDays: 30 + (index % 10) * 12,
+  };
+});
+
+const ALL_PROJECTS = [...PROJECTS, ...GENERATED_PROJECTS];
+
 // Every top freelancer carries the platform's full domain vocabulary, taken
 // from the project list itself. projectFit is a BM25 rank over the brief text
 // with required skills deliberately excluded, so without this a specialist can
 // score a literal zero on a brief that simply does not use their words.
 const DOMAIN_VOCAB = Array.from(
-  new Set(PROJECTS.flatMap((p) => [p.projectType, p.domain, p.coreFeatures])),
-).join('; ');
+  new Set(
+    ALL_PROJECTS.flatMap((p) => `${p.projectType} ${p.domain} ${p.coreFeatures}`
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((word) => word.length > 1)),
+  ),
+).join(', ');
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -697,7 +799,7 @@ async function run() {
   for (const seed of TOP) {
     await createFreelancer(seed);
   }
-  const pool = buildPool();
+  const pool = buildPool(POOL_SIZE);
   for (const seed of pool) {
     await createFreelancer(seed);
   }
@@ -705,7 +807,7 @@ async function run() {
   const projects = dataSource.getRepository(Project);
   const briefs = dataSource.getRepository(Brief);
   const customers: User[] = [];
-  for (const customer of CUSTOMERS) {
+  for (const customer of ALL_CUSTOMERS) {
     customers.push(
       await createUser({
         email: customer.email,
@@ -717,7 +819,7 @@ async function run() {
     );
   }
 
-  for (const seed of PROJECTS) {
+  for (const seed of ALL_PROJECTS) {
     const project = await projects.save(
       projects.create({
         customerId: customers[seed.customerIndex].id,
@@ -758,7 +860,7 @@ async function run() {
   console.log(`  1 admin        ${ADMIN.email} / ${ADMIN.password}`);
   console.log(`  ${freelancerCount} freelancers  (${TOP.length} top-rated, ${pool.length} supporting pool)`);
   console.log(`  ${customers.length} customers`);
-  console.log(`  ${PROJECTS.length} projects with completed briefs`);
+  console.log(`  ${ALL_PROJECTS.length} projects with completed briefs`);
   console.log(`\nAll seeded accounts use the password: ${PASSWORD}`);
   console.log('\nTop-rated freelancers:');
   for (const seed of TOP) {
