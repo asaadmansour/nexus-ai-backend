@@ -149,6 +149,10 @@ const MATCH_START_ALLOWED_STATUSES = new Set<ProjectStatus>([
   ProjectStatus.PLANNING_MATCHING,
 ]);
 const ASSIGNMENT_ACTIVE_STATUSES = ['assigned', 'accepted', 'in_progress'];
+export const ROLE_FILLED_STATUSES = [
+  ...ASSIGNMENT_ACTIVE_STATUSES,
+  'completed',
+];
 
 // --- Implementation-task matching -------------------------------------------
 
@@ -163,15 +167,14 @@ const ACTIVE_TASK_STATUSES = [
   'review',
   'changes_requested',
 ];
-export const MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER = 3;
+export const MAX_ACTIVE_TASKS_PER_FREELANCER = 3;
 
-export function hasProjectTaskCapacity(
+export function hasTaskCapacity(
   activeTaskCount: number,
   activeInvitationCount: number,
 ): boolean {
   return (
-    activeTaskCount + activeInvitationCount <
-    MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER
+    activeTaskCount + activeInvitationCount < MAX_ACTIVE_TASKS_PER_FREELANCER
   );
 }
 
@@ -1669,7 +1672,6 @@ export class MatchingService {
       const [activeTaskCount, activeInvitationCount] = await Promise.all([
         manager.count(ProjectTask, {
           where: {
-            projectId: task.projectId,
             assignedFreelancerProfileId: freelancerProfileId,
             status: In(ACTIVE_TASK_STATUSES),
           },
@@ -1677,10 +1679,7 @@ export class MatchingService {
         manager
           .getRepository(ProjectInvitation)
           .createQueryBuilder('invitation')
-          .where('invitation.projectId = :projectId', {
-            projectId: task.projectId,
-          })
-          .andWhere('invitation.freelancerProfileId = :profileId', {
+          .where('invitation.freelancerProfileId = :profileId', {
             profileId: freelancerProfileId,
           })
           .andWhere('invitation.taskId IS NOT NULL')
@@ -1690,9 +1689,9 @@ export class MatchingService {
           })
           .getCount(),
       ]);
-      if (!hasProjectTaskCapacity(activeTaskCount, activeInvitationCount)) {
+      if (!hasTaskCapacity(activeTaskCount, activeInvitationCount)) {
         throw new ConflictException(
-          `A freelancer can hold at most ${MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER} active tasks in the same project`,
+          `A freelancer can hold at most ${MAX_ACTIVE_TASKS_PER_FREELANCER} active implementation tasks across projects`,
         );
       }
       this.assertTaskCompensationCoverage(task);
@@ -3332,7 +3331,7 @@ export class MatchingService {
           where: {
             projectId: run.projectId,
             roleKey,
-            status: In(ASSIGNMENT_ACTIVE_STATUSES),
+            status: In(ROLE_FILLED_STATUSES),
           },
         });
       if (roleAlreadyAssigned) return null;
@@ -3409,9 +3408,10 @@ export class MatchingService {
         ? this.taskRepo.find({
             select: { assignedFreelancerProfileId: true },
             where: {
-              projectId: run.projectId,
               assignedFreelancerProfileId: In(candidateIds),
-              ...(run.targetTaskId ? { status: In(ACTIVE_TASK_STATUSES) } : {}),
+              ...(run.targetTaskId
+                ? { status: In(ACTIVE_TASK_STATUSES) }
+                : { projectId: run.projectId }),
             },
           })
         : Promise.resolve([]);
@@ -3451,31 +3451,26 @@ export class MatchingService {
     const unavailableProfileIds = new Set(
       activeProjectAssignments.map((entry) => entry.freelancerProfileId),
     );
-    const projectTaskLoadByProfile = new Map<string, number>();
+    const taskLoadByProfile = new Map<string, number>();
     for (const entry of activeProjectTasks) {
       if (!entry.assignedFreelancerProfileId) continue;
       if (!run.targetTaskId) {
         unavailableProfileIds.add(entry.assignedFreelancerProfileId);
         continue;
       }
-      projectTaskLoadByProfile.set(
+      taskLoadByProfile.set(
         entry.assignedFreelancerProfileId,
-        (projectTaskLoadByProfile.get(entry.assignedFreelancerProfileId) ?? 0) +
-          1,
+        (taskLoadByProfile.get(entry.assignedFreelancerProfileId) ?? 0) + 1,
       );
     }
     for (const entry of pendingInvitations) {
-      if (
-        !run.targetTaskId ||
-        entry.projectId !== run.projectId ||
-        !entry.taskId
-      ) {
+      if (!run.targetTaskId || !entry.taskId) {
         unavailableProfileIds.add(entry.freelancerProfileId);
         continue;
       }
-      projectTaskLoadByProfile.set(
+      taskLoadByProfile.set(
         entry.freelancerProfileId,
-        (projectTaskLoadByProfile.get(entry.freelancerProfileId) ?? 0) + 1,
+        (taskLoadByProfile.get(entry.freelancerProfileId) ?? 0) + 1,
       );
     }
     const reviewerLoadByProfile = new Map<string, number>(
@@ -3494,8 +3489,8 @@ export class MatchingService {
       }
       if (
         run.targetTaskId &&
-        !hasProjectTaskCapacity(
-          projectTaskLoadByProfile.get(option.freelancerProfileId) ?? 0,
+        !hasTaskCapacity(
+          taskLoadByProfile.get(option.freelancerProfileId) ?? 0,
           0,
         )
       ) {
@@ -3533,13 +3528,10 @@ export class MatchingService {
         if (
           run.targetTaskId &&
           preferredProfileId &&
-          !hasProjectTaskCapacity(
-            projectTaskLoadByProfile.get(preferredProfileId) ?? 0,
-            0,
-          )
+          !hasTaskCapacity(taskLoadByProfile.get(preferredProfileId) ?? 0, 0)
         ) {
           throw new ConflictException(
-            `A freelancer can hold at most ${MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER} active tasks in the same project`,
+            `A freelancer can hold at most ${MAX_ACTIVE_TASKS_PER_FREELANCER} active implementation tasks across projects`,
           );
         }
         throw new ConflictException(
@@ -3633,31 +3625,22 @@ export class MatchingService {
           const conflictingInvitation = await manager.exists(
             ProjectInvitation,
             {
-              where: [
-                {
-                  freelancerProfileId: lockedProfile.id,
-                  projectId: Not(run.projectId),
-                  status: In(['pending', 'accepting']),
-                },
-                {
-                  freelancerProfileId: lockedProfile.id,
-                  taskId: IsNull(),
-                  status: In(['pending', 'accepting']),
-                },
-              ],
+              where: {
+                freelancerProfileId: lockedProfile.id,
+                taskId: IsNull(),
+                status: In(['pending', 'accepting']),
+              },
             },
           );
           const [activeTaskCount, activeInvitationCount] = await Promise.all([
             manager.count(ProjectTask, {
               where: {
-                projectId: run.projectId,
                 assignedFreelancerProfileId: lockedProfile.id,
                 status: In(ACTIVE_TASK_STATUSES),
               },
             }),
             manager.count(ProjectInvitation, {
               where: {
-                projectId: run.projectId,
                 freelancerProfileId: lockedProfile.id,
                 taskId: Not(IsNull()),
                 status: In(['pending', 'accepting']),
@@ -3666,10 +3649,10 @@ export class MatchingService {
           ]);
           if (
             conflictingInvitation ||
-            !hasProjectTaskCapacity(activeTaskCount, activeInvitationCount)
+            !hasTaskCapacity(activeTaskCount, activeInvitationCount)
           ) {
             throw new ConflictException(
-              `A freelancer can hold at most ${MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER} active tasks in the same project`,
+              `A freelancer can hold at most ${MAX_ACTIVE_TASKS_PER_FREELANCER} active implementation tasks across projects`,
             );
           }
         } else {

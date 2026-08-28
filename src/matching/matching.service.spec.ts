@@ -3,8 +3,9 @@ import {
   assertTaskMatchingRunInvariant,
   MatchingService,
   completedEmptyRunIsCoolingDown,
-  hasProjectTaskCapacity,
-  MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER,
+  hasTaskCapacity,
+  MAX_ACTIVE_TASKS_PER_FREELANCER,
+  ROLE_FILLED_STATUSES,
   requiresReviewerCandidateSelection,
   resolveInvitationTtlHours,
   staffingFailureIsCoolingDown,
@@ -72,13 +73,22 @@ describe('MatchingService task assignment invariants', () => {
     expect(resolveInvitationTtlHours('6')).toBe(6);
   });
 
-  it('allows up to three active tasks or reservations in one project', () => {
-    expect(MAX_ACTIVE_PROJECT_TASKS_PER_FREELANCER).toBe(3);
-    expect(hasProjectTaskCapacity(0, 0)).toBe(true);
-    expect(hasProjectTaskCapacity(2, 0)).toBe(true);
-    expect(hasProjectTaskCapacity(1, 1)).toBe(true);
-    expect(hasProjectTaskCapacity(2, 1)).toBe(false);
-    expect(hasProjectTaskCapacity(3, 0)).toBe(false);
+  it('allows up to three active implementation tasks or reservations globally', () => {
+    expect(MAX_ACTIVE_TASKS_PER_FREELANCER).toBe(3);
+    expect(hasTaskCapacity(0, 0)).toBe(true);
+    expect(hasTaskCapacity(2, 0)).toBe(true);
+    expect(hasTaskCapacity(1, 1)).toBe(true);
+    expect(hasTaskCapacity(2, 1)).toBe(false);
+    expect(hasTaskCapacity(3, 0)).toBe(false);
+  });
+
+  it('does not reopen staffing for a completed project role', () => {
+    expect(ROLE_FILLED_STATUSES).toEqual([
+      'assigned',
+      'accepted',
+      'in_progress',
+      'completed',
+    ]);
   });
 
   it('backs off briefly before retrying an empty completed shortlist', () => {
