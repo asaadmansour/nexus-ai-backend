@@ -114,6 +114,31 @@ describe('DeliveryService task/submission invariants', () => {
     ).not.toThrow();
   });
 
+  it('allows only an explicit principal-reviewer override of requested changes', () => {
+    const submission = {
+      submissionType: 'pull_request',
+      commitSha: 'a'.repeat(40),
+    };
+    const evaluation = {
+      id: 'run',
+      status: 'completed',
+      recommendation: 'changes_requested',
+      evaluatedCommitSha: 'a'.repeat(40),
+    };
+
+    expect(() =>
+      assertSubmissionApprovalEvaluation(
+        submission,
+        evaluation,
+        {
+          manualReviewAcknowledged: true,
+          feedback: 'I verified the extra scope is required for this task.',
+        },
+        { allowChangesRequestedOverride: true },
+      ),
+    ).not.toThrow();
+  });
+
   it('allows a reviewer to resolve a legacy observability-only bounce', () => {
     const evaluation = {
       id: 'run',

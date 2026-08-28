@@ -104,6 +104,7 @@ export function assertSubmissionApprovalEvaluation(
         Partial<Pick<EvaluationRun, 'acceptanceCoverage'>>)
     | null,
   input: Pick<ReviewSubmissionDto, 'manualReviewAcknowledged' | 'feedback'>,
+  options: { allowChangesRequestedOverride?: boolean } = {},
 ) {
   if (!evaluation || evaluation.status !== 'completed') {
     throw new ConflictException(
@@ -124,7 +125,8 @@ export function assertSubmissionApprovalEvaluation(
   const manualReviewRequired =
     evaluation.recommendation === 'manual_review' ||
     (evaluation.recommendation === 'changes_requested' &&
-      hasOnlyEvaluatorVisibilityGaps(evaluation));
+      (hasOnlyEvaluatorVisibilityGaps(evaluation) ||
+        options.allowChangesRequestedOverride === true));
   if (
     evaluation.recommendation === 'changes_requested' &&
     !manualReviewRequired
@@ -617,7 +619,10 @@ export class DeliveryService {
         .orderBy('evaluation.createdAt', 'DESC')
         .getOne();
       if (dto.decision === 'approved') {
-        assertSubmissionApprovalEvaluation(submission, latestEvaluation, dto);
+        assertSubmissionApprovalEvaluation(submission, latestEvaluation, dto, {
+          allowChangesRequestedOverride:
+            reviewerRoleOverride === 'principal_reviewer',
+        });
         if (
           pullRequestAtReview &&
           latestEvaluation?.evidenceBundle?.baseCommitSha !==
