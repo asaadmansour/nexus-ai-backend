@@ -34,7 +34,10 @@ const PASSWORD = 'Nexus@123456';
 
 // Size of the supporting freelancer pool. Every one of them is capped below
 // the headline five on every scored axis.
-const POOL_SIZE = 140;
+// Five hand-tuned specialists below plus this supporting pool produce exactly
+// 50 freelancers: broad enough for realistic matching without making a clean
+// dev reset unnecessarily slow.
+const POOL_SIZE = 45;
 
 // --- Skill vocabularies -----------------------------------------------------
 // Every brief below draws its requiredSkills from these lists, so the headline
