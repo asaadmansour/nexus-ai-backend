@@ -22,6 +22,7 @@
     "seed:admin": "ts-node -r tsconfig-paths/register src/database/seeds/seed-admin.ts",
     "seed:demo": "ts-node -r tsconfig-paths/register src/database/seeds/seed-demo.ts",
     "demo:clinic:validate": "node demo/project_clinic_booking/scripts/validate-kit.mjs",
+    "demo:clinic:answers": "node demo/project_clinic_booking/scripts/00-ready-planning-answers.mjs",
     "demo:clinic:intake": "node demo/project_clinic_booking/scripts/01-client-intake.mjs",
     "demo:clinic:planning": "node demo/project_clinic_booking/scripts/02-planning-submissions.mjs",
     "demo:clinic:implementation": "node demo/project_clinic_booking/scripts/03-implementation-submissions.mjs",

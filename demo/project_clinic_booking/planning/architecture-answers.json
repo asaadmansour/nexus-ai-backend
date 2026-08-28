@@ -1,0 +1,38 @@
+{
+  "system_context": {
+    "summary": "QuickClinic serves patients, reception staff, and clinic managers at one location. The browser, Next.js client, NestJS API, PostgreSQL scheduling database, Redis-backed email worker, and deployment configuration are inside the solution; the email provider is external. TLS/authentication protects the public boundary, role guards protect staff operations, and the worker reads only committed outbox events. Medical records, diagnoses, insurance, payments, SMS, EHR, native apps, multiple locations, and microservices are explicitly outside release one."
+  },
+  "architecture_diagram": {
+    "summary": "The diagram shows patient and staff browsers reaching one responsive Next.js client over HTTPS, the client calling one role-protected NestJS REST API, and the API owning transactional scheduling data in PostgreSQL. The API publishes only committed notification jobs to Redis; an independent worker sends idempotent HTTPS requests to the email provider and records delivery state. Scheduling never depends synchronously on email availability.",
+    "artifacts": ["planning/architecture-diagram.mmd"]
+  },
+  "technology_stack": {
+    "summary": "Use TypeScript Next.js for the responsive web client, NestJS for the modular-monolith REST API, PostgreSQL for relational scheduling and overlap constraints, Redis/BullMQ only for notification retries, and an email-provider adapter with a fake local transport. Docker and GitHub Actions support reproducible staging and production. This single-clinic workload does not justify GraphQL, microservices, event streaming, or Kubernetes; one deployable API preserves transactions and reduces operating cost."
+  },
+  "module_boundaries": {
+    "summary": "Identity owns users/sessions/roles; Directory owns doctors/services; Availability owns weekly rules, exceptions, and slot calculation; Appointments owns booking/reschedule/cancel and slot locks; Queue owns today's operational state; Reporting owns manager-only aggregates; Notifications owns outbox rows, templates, retries, and provider calls. Modules expose application services and REST DTOs rather than repositories. Backend, patient web, staff web, and integration/quality have separate owned paths so four freelancers can work without network-service boundaries."
+  },
+  "api_contract": {
+    "summary": "The contract defines login, doctor/slot reads, patient appointment create/list/reschedule/cancel, reception calendar/queue/status and availability operations, and manager summary reads with roles, input fields, responses, and errors. Validation is 400 with field details, unauthorized scope is 403, missing records are 404, and a concurrent/stale slot is 409 SLOT_UNAVAILABLE. Mutations accept idempotency keys; internal notification events carry appointment ID, template type, recipient, and unique occurrence ID.",
+    "artifacts": ["planning/architecture-submission.md"]
+  },
+  "data_model": {
+    "summary": "Persistent entities are users, doctors, services, doctor-services, weekly availability rules, dated exceptions, appointments, and notification outbox rows. Keys and indexes cover unique email, doctor-service membership, doctor/date slot lookup, patient/upcoming appointments, daily queue status, and due jobs. A PostgreSQL exclusion constraint prevents overlapping active appointments for a doctor; rescheduling locks the appointment and target range atomically. Schema changes use additive, backward-compatible migrations before cleanup.",
+    "artifacts": ["planning/architecture-submission.md"]
+  },
+  "integrations": {
+    "summary": "Transactional email is the only external integration. A worker claims committed outbox rows, passes the occurrence ID as the provider idempotency key, times out after 10 seconds, and retries network, 429, and 5xx failures after 1, 5, and 20 minutes. Permanent address errors are recorded and visible to staff but never reverse a booking. Provider downtime cannot block scheduling. Payments, SMS, maps, insurance, social login, and EHR are prohibited in release one."
+  },
+  "non_functional": {
+    "summary": "Slot/calendar reads must have p95 below 500 ms and mutations below 800 ms at 50 concurrent users, excluding asynchronous email. A 20-request race test must produce zero double bookings. Target 99.5% monthly availability, WCAG 2.1 AA, keyboard-complete flows, 44px controls, and a 320px viewport. Store instants in UTC and render Africa/Cairo. No patient data may enter logs; staff mutations are audited. Support current and previous Chrome, Edge, Firefox, and Safari."
+  },
+  "deployment_observability": {
+    "summary": "Local, staging, and production use validated database, Redis, session, public-URL, and email configuration. CI runs format, lint, type, unit/integration, migration, and end-to-end checks. Deploy backward-compatible migrations before API, worker, and web, then smoke-test health, login, slots, and a fake-provider booking. Structured logs carry correlation IDs without PII. Alert on health failure, 5xx rate, queue backlog, and repeated email failures. Back up daily for 14 days; rollback uses the previous image."
+  },
+  "implementation_handoff": {
+    "summary": "Use apps/api, apps/web, packages/contracts, tests, deploy, and docs/runbooks. The architect owns shared schemas; contract changes require focused review. Implement contracts/schema first, then backend scheduling and patient/staff clients in parallel against fixtures, followed by integration/release. Require TypeScript strict mode, migration-per-schema-change, and no cross-module repository imports. Integration gates are contract tests, slot-race tests, role matrix, responsive/accessibility checks, complete user journeys, then staging smoke and rollback tests."
+  },
+  "project_feature_coverage": {
+    "summary": "Appointment booking uses Directory and Availability to expose slots, Appointments to reserve atomically, and Notifications to confirm. Rescheduling authorizes ownership and swaps slots in one transaction. Daily queue management projects today's appointments and permits only valid reception transitions. Appointment activity review exposes manager-only date-range totals and cancellation rates. Identity, availability, directory, and email exist only to support these four confirmed features; no additional healthcare functionality is introduced."
+  }
+}

@@ -1,0 +1,26 @@
+flowchart LR
+  subgraph Public[Public trust boundary]
+    Patient[Patient browser]
+  end
+  subgraph Staff[Authenticated staff boundary]
+    Reception[Reception browser]
+    Manager[Manager browser]
+  end
+  subgraph QuickClinic[QuickClinic deployment]
+    Web[Next.js responsive web]
+    API[NestJS modular-monolith API]
+    DB[(PostgreSQL scheduling data)]
+    Queue[(Redis notification queue)]
+    Worker[Email worker]
+  end
+  Email[Transactional email provider]
+
+  Patient -->|HTTPS| Web
+  Reception -->|HTTPS + reception role| Web
+  Manager -->|HTTPS + manager role| Web
+  Web -->|REST JSON + authenticated session| API
+  API -->|transactions and slot locks| DB
+  API -->|committed outbox job| Queue
+  Queue --> Worker
+  Worker -->|idempotent HTTPS request| Email
+  Worker -->|delivery state| DB
