@@ -342,6 +342,46 @@ export class GithubService {
     };
   }
 
+  async updatePullRequestBase(input: {
+    owner: string;
+    repoName: string;
+    number: number;
+    baseRef: string;
+    expectedHeadSha: string;
+  }): Promise<GithubPullRequestTarget> {
+    const current = await this.getPullRequest(input);
+    if (current.headSha !== input.expectedHeadSha.toLowerCase()) {
+      throw new ServiceUnavailableException(
+        'GitHub pull-request head changed before its base could be updated',
+      );
+    }
+    if (current.baseRef === input.baseRef) return current;
+    if (current.state !== 'open' || current.draft) {
+      throw new ServiceUnavailableException(
+        'Only an open, ready pull request can be retargeted',
+      );
+    }
+
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}/pulls/${input.number}`,
+      { method: 'PATCH', body: { base: input.baseRef } },
+    );
+    await this.parse<GithubPullRequestResponse>(
+      response,
+      `retarget pull request ${input.owner}/${input.repoName}#${input.number}`,
+    );
+    const updated = await this.getPullRequest(input);
+    if (
+      updated.headSha !== input.expectedHeadSha.toLowerCase() ||
+      updated.baseRef !== input.baseRef
+    ) {
+      throw new ServiceUnavailableException(
+        'GitHub did not preserve the evaluated head while updating the pull-request base',
+      );
+    }
+    return updated;
+  }
+
   async mergePullRequest(input: {
     owner: string;
     repoName: string;

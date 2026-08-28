@@ -311,6 +311,58 @@ describe('GithubService read-only inspection', () => {
     }
   });
 
+  it('retargets a pull request only while preserving its submitted head', async () => {
+    const headSha = 'a'.repeat(40);
+    const oldBaseSha = 'b'.repeat(40);
+    const newBaseSha = 'c'.repeat(40);
+    let reads = 0;
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation((_input, init) => {
+        if (init?.method === 'PATCH') {
+          expect(
+            typeof init.body === 'string' ? JSON.parse(init.body) : null,
+          ).toEqual({
+            base: 'main',
+          });
+          return Promise.resolve(Response.json({ number: 7 }));
+        }
+        reads += 1;
+        return Promise.resolve(
+          Response.json({
+            number: 7,
+            state: 'open',
+            draft: false,
+            merged: false,
+            head: { sha: headSha, ref: 'feat/reporting' },
+            base: {
+              sha: reads === 1 ? oldBaseSha : newBaseSha,
+              ref: reads === 1 ? 'feat/database' : 'main',
+            },
+          }),
+        );
+      });
+
+    try {
+      await expect(
+        service().updatePullRequestBase({
+          owner: 'nexus-ai',
+          repoName: 'app',
+          number: 7,
+          baseRef: 'main',
+          expectedHeadSha: headSha,
+        }),
+      ).resolves.toMatchObject({
+        number: 7,
+        headSha,
+        baseRef: 'main',
+        baseSha: newBaseSha,
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('returns null when the deterministic repository does not exist', async () => {
     const fetchMock = jest
       .spyOn(global, 'fetch')

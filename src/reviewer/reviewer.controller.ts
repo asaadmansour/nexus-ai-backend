@@ -231,6 +231,17 @@ export class ReviewerController {
     };
   }
 
+  @Post('submissions/:id/pull-request/retarget')
+  async retargetSubmissionPullRequest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.reviewer.retargetSubmissionPullRequest(id, user.sub),
+    };
+  }
+
   @Get('submissions/:id')
   async submission(
     @Param('id', ParseUUIDPipe) id: string,

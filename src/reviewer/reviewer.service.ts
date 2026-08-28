@@ -369,6 +369,18 @@ export class ReviewerService {
     );
   }
 
+  async retargetSubmissionPullRequest(id: string, userId: string) {
+    const item = await this.dataSource
+      .getRepository(ProjectSubmission)
+      .findOne({ where: { id }, select: { id: true, projectId: true } });
+    if (!item) throw new NotFoundException('Submission not found');
+    await this.assertReviewer(item.projectId, userId);
+    return this.delivery.retargetSubmissionPullRequest(
+      id,
+      this.adminIdentity(userId),
+    );
+  }
+
   async reviewReleaseRequest(
     id: string,
     dto: ReviewPaymentReleaseRequestDto,

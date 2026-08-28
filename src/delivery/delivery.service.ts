@@ -55,6 +55,24 @@ type SubmissionWriteResult = {
   alreadySubmitted?: boolean;
 };
 
+type PullRequestReviewReadiness = {
+  number: number;
+  headRef: string | null;
+  baseRef: string | null;
+  requiredBaseRef: string;
+  targetReady: boolean;
+  evaluationCurrent: boolean;
+  canRetarget: boolean;
+  blocker: string | null;
+  error: string | null;
+  prerequisiteSubmission: {
+    id: string;
+    title: string | null;
+    status: string;
+    integrationStatus: string | null;
+  } | null;
+};
+
 export function assertTaskAcceptsDraft(task: Pick<ProjectTask, 'status'>) {
   if (['done', 'cancelled', 'review'].includes(task.status)) {
     throw new ConflictException(
@@ -242,13 +260,31 @@ export function validateSubmissionCriterionReviews(
     }
     return { reviews: [], score: null };
   }
-  if (!input || input.length !== expected.length) {
+  if (!input) {
     throw new BadRequestException(
       `Rate every applicable review criterion from 1 to 5 (${expected.length} required)`,
     );
   }
 
   const byKey = new Map(input.map((review) => [review.criterionKey, review]));
+  if (byKey.size !== input.length) {
+    throw new BadRequestException(
+      'Each review criterion may be rated only once',
+    );
+  }
+  const expectedKeys = new Set(
+    expected.map((criterion) => criterion.criterionKey),
+  );
+  if (expected.some((criterion) => !byKey.has(criterion.criterionKey))) {
+    throw new BadRequestException(
+      `Rate every applicable review criterion from 1 to 5 (${expected.length} required)`,
+    );
+  }
+  if (input.some((review) => !expectedKeys.has(review.criterionKey))) {
+    throw new BadRequestException(
+      'Criterion ratings do not match the latest evaluation rubric',
+    );
+  }
   const reviews = expected.map((criterion) => {
     const review = byKey.get(criterion.criterionKey);
     if (
@@ -374,6 +410,7 @@ export class DeliveryService {
     const evaluationRuns = [...(submission.evaluationRuns ?? [])].sort(
       (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
     );
+    const latestEvaluation = evaluationRuns[0] ?? null;
 
     return {
       submission: {
@@ -384,13 +421,103 @@ export class DeliveryService {
       task: submission.task,
       milestone: submission.milestone,
       repository: submission.repository,
-      latestEvaluationRun: evaluationRuns[0]
-        ? this.toSubmissionEvaluationView(evaluationRuns[0], requester)
+      latestEvaluationRun: latestEvaluation
+        ? this.toSubmissionEvaluationView(latestEvaluation, requester)
         : null,
+      reviewRequirements: {
+        criteria: resolveSubmissionReviewCriteria(latestEvaluation),
+        pullRequest: await this.pullRequestReviewReadiness(
+          submission,
+          latestEvaluation,
+        ),
+      },
       reviews: [...(submission.reviews ?? [])].sort(
         (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
       ),
       openRevisionRequests,
+    };
+  }
+
+  async retargetSubmissionPullRequest(
+    submissionId: string,
+    requester: JwtPayload,
+  ) {
+    const submission = await this.submissionsRepository.findOne({
+      where: { id: submissionId },
+      relations: { repository: true, project: true, task: true },
+    });
+    if (!submission) throw new NotFoundException('Submission not found');
+    this.assertReviewerAccess(submission.project, requester);
+    assertSubmissionCanBeReviewed(submission);
+    if (
+      submission.submissionType !== 'pull_request' ||
+      !submission.repository ||
+      !submission.pullRequestUrl ||
+      !submission.commitSha
+    ) {
+      throw new ConflictException(
+        'This submission does not have a complete pull request to retarget',
+      );
+    }
+
+    const pullRequestNumber = this.pullRequestNumber(submission.pullRequestUrl);
+    const current = await this.githubService.getPullRequest({
+      owner: submission.repository.owner,
+      repoName: submission.repository.repoName,
+      number: pullRequestNumber,
+    });
+    if (current.baseRef === submission.repository.defaultBranch) {
+      return {
+        pullRequest: current,
+        evaluationDispatch: null,
+        alreadyTargeted: true,
+      };
+    }
+    if (current.headSha !== submission.commitSha.toLowerCase()) {
+      throw new ConflictException(
+        'Retargeting is blocked because the pull request advanced after submission',
+      );
+    }
+
+    const prerequisite = await this.findRetargetPrerequisite(
+      submission,
+      current.baseRef,
+      current.baseSha,
+    );
+    if (!prerequisite || !this.prerequisiteIsIntegrated(prerequisite)) {
+      throw new ConflictException(
+        prerequisite
+          ? `Retargeting is available after ${prerequisite.title ?? 'the prerequisite submission'} is approved and integrated into ${submission.repository.defaultBranch}`
+          : `Retargeting is blocked because ${current.baseRef ?? 'the current base branch'} is not a verified, integrated project submission`,
+      );
+    }
+
+    const updated = await this.githubService.updatePullRequestBase({
+      owner: submission.repository.owner,
+      repoName: submission.repository.repoName,
+      number: pullRequestNumber,
+      baseRef: submission.repository.defaultBranch,
+      expectedHeadSha: submission.commitSha,
+    });
+    submission.metadata = {
+      ...(submission.metadata ?? {}),
+      pullRequestRetarget: {
+        from: current.baseRef,
+        to: updated.baseRef,
+        prerequisiteSubmissionId: prerequisite.id,
+        retargetedAt: new Date().toISOString(),
+        retargetedBy: requester.sub,
+      },
+    };
+    await this.submissionsRepository.save(submission);
+    const evaluationDispatch = await this.dispatchEvaluation(
+      submission,
+      requester.sub,
+    );
+    return {
+      pullRequest: updated,
+      evaluationDispatch,
+      alreadyTargeted: false,
     };
   }
 
@@ -900,6 +1027,131 @@ export class DeliveryService {
       );
     }
     return pullRequest;
+  }
+
+  private pullRequestNumber(pullRequestUrl: string) {
+    let parts: string[] = [];
+    try {
+      parts = new URL(pullRequestUrl).pathname.split('/').filter(Boolean);
+    } catch {
+      throw new ConflictException('The pull-request URL is invalid');
+    }
+    const number = Number(parts[3]);
+    if (!Number.isSafeInteger(number) || number <= 0) {
+      throw new ConflictException('The pull-request URL is invalid');
+    }
+    return number;
+  }
+
+  private async pullRequestReviewReadiness(
+    submission: ProjectSubmission,
+    evaluation: EvaluationRun | null,
+  ): Promise<PullRequestReviewReadiness | null> {
+    if (
+      submission.submissionType !== 'pull_request' ||
+      !submission.repository ||
+      !submission.pullRequestUrl
+    ) {
+      return null;
+    }
+    const requiredBaseRef = submission.repository.defaultBranch;
+    let number = 0;
+    try {
+      number = this.pullRequestNumber(submission.pullRequestUrl);
+      const pullRequest = await this.githubService.getPullRequest({
+        owner: submission.repository.owner,
+        repoName: submission.repository.repoName,
+        number,
+      });
+      const targetReady = pullRequest.baseRef === requiredBaseRef;
+      const evaluationCurrent =
+        targetReady &&
+        evaluation?.evidenceBundle?.baseCommitSha === pullRequest.baseSha;
+      const prerequisite = targetReady
+        ? null
+        : await this.findRetargetPrerequisite(
+            submission,
+            pullRequest.baseRef,
+            pullRequest.baseSha,
+          );
+      const canRetarget = Boolean(
+        prerequisite && this.prerequisiteIsIntegrated(prerequisite),
+      );
+      let blocker: string | null = null;
+      if (!targetReady) {
+        blocker = canRetarget
+          ? `Retarget this pull request to ${requiredBaseRef} and run a fresh evaluation before approval.`
+          : prerequisite
+            ? `Approve and integrate ${prerequisite.title ?? 'the prerequisite submission'} before retargeting this pull request to ${requiredBaseRef}.`
+            : `This pull request targets ${pullRequest.baseRef ?? 'an unknown branch'}. Its base must be verified before it can be retargeted to ${requiredBaseRef}.`;
+      } else if (!evaluationCurrent) {
+        blocker = `The ${requiredBaseRef} branch changed after this evaluation. Run a fresh evaluation before approval.`;
+      }
+      return {
+        number,
+        headRef: pullRequest.headRef,
+        baseRef: pullRequest.baseRef,
+        requiredBaseRef,
+        targetReady,
+        evaluationCurrent,
+        canRetarget,
+        blocker,
+        error: null,
+        prerequisiteSubmission: prerequisite
+          ? {
+              id: prerequisite.id,
+              title: prerequisite.title,
+              status: prerequisite.status,
+              integrationStatus: this.integrationStatus(prerequisite),
+            }
+          : null,
+      };
+    } catch (error) {
+      return {
+        number,
+        headRef: submission.branchName,
+        baseRef: null,
+        requiredBaseRef,
+        targetReady: false,
+        evaluationCurrent: false,
+        canRetarget: false,
+        blocker: 'Pull-request readiness could not be verified.',
+        error: error instanceof Error ? error.message : 'GitHub check failed',
+        prerequisiteSubmission: null,
+      };
+    }
+  }
+
+  private async findRetargetPrerequisite(
+    submission: ProjectSubmission,
+    baseRef: string | null,
+    baseSha: string,
+  ) {
+    if (!baseRef) return null;
+    return this.submissionsRepository.findOne({
+      where: {
+        projectId: submission.projectId,
+        branchName: baseRef,
+        commitSha: baseSha,
+      },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  private integrationStatus(submission: ProjectSubmission) {
+    const integration = submission.metadata?.integration;
+    if (!integration || typeof integration !== 'object') return null;
+    const status = (integration as Record<string, unknown>).status;
+    return typeof status === 'string' ? status : null;
+  }
+
+  private prerequisiteIsIntegrated(submission: ProjectSubmission) {
+    return (
+      submission.status === 'approved' &&
+      ['merged', 'default_branch_verified'].includes(
+        this.integrationStatus(submission) ?? '',
+      )
+    );
   }
 
   async createRevisionRequest(

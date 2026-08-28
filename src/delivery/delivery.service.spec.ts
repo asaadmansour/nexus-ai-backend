@@ -274,5 +274,18 @@ describe('DeliveryService task/submission invariants', () => {
       ],
       score: 90,
     });
+
+    expect(() =>
+      validateSubmissionCriterionReviews(evaluation, [
+        { criterionKey: 'acceptance_1', rating: 5 },
+        { criterionKey: 'acceptance_1', rating: 4 },
+      ]),
+    ).toThrow('may be rated only once');
+    expect(() =>
+      validateSubmissionCriterionReviews(evaluation, [
+        { criterionKey: 'acceptance_1', rating: 5 },
+        { criterionKey: 'outdated_key', rating: 4 },
+      ]),
+    ).toThrow('Rate every applicable review criterion');
   });
 });
