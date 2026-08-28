@@ -1707,9 +1707,14 @@ export class BriefService {
       sanitized.platforms = ['website'];
     }
 
+    const answeredDifferentField = Object.keys(sanitized).some(
+      (field) => field !== pendingField,
+    );
+
     if (
       !guidanceRequest &&
       pendingField &&
+      !answeredDifferentField &&
       !this.hasFieldValue(sanitized[pendingField])
     ) {
       const deterministicValue = this.extractPendingFieldAnswer(

@@ -1,0 +1,15 @@
+Business domain: Outpatient clinic operations and appointment scheduling.
+Main goal: Reduce phone-based booking work and let patients book, reschedule, or cancel appointments without calling reception.
+Target users: Patients book and manage appointments; reception staff manage doctor availability and the daily queue; clinic managers review appointment activity.
+Core features: Email and password sign-in; doctor and service directory; available-slot search; appointment booking, rescheduling, and cancellation; email confirmations and reminders; reception queue board; manager appointment summary.
+Platforms: Responsive website for desktop and mobile browsers.
+Solution type: Web application with patient, reception, and manager role-based areas.
+Scope details: About 12 screens covering sign-in, doctor browsing, slot selection, booking confirmation, patient appointments, reception calendar and queue, doctor availability, and a manager summary. The primary journey is browse doctor, choose a slot, confirm, receive email, then reschedule or cancel if needed.
+Integrations: Transactional email for confirmations and reminders. No payments, maps, insurance, EHR, SMS, social login, or native mobile integration in the first release.
+Admin needs: A private staff area to manage doctors, services, weekly availability, appointment status, and the current-day queue; managers can view appointment counts and cancellation rates.
+Deliverables: Approved architecture and UI/UX handoffs, working responsive web app, source repository, automated tests, deployment configuration, live staging link, and setup/runbook documentation.
+Constraints and preferences: English first; accessible keyboard navigation and WCAG AA contrast; calm clinical visual style; store no medical notes or diagnoses; one clinic location; Cairo time zone; avoid native apps and microservices.
+Client background: Non-technical clinic operations manager.
+Suggested team size: 4
+Experience level: Mid-to-senior freelancers with senior architecture review.
+Minimum years: 3

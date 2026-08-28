@@ -1,0 +1,9 @@
+{
+  "title": "QuickClinic appointment and queue portal",
+  "description": "A responsive clinic web application where patients book or reschedule appointments, reception staff manage the daily queue, and clinic managers review appointment activity across one location. The first release deliberately excludes medical records, insurance claims, native mobile apps, and online payments.",
+  "budgetMin": 9000,
+  "budgetMax": 18000,
+  "currency": "EGP",
+  "deadlineDays": 42,
+  "isDeadlineFlexible": true
+}
