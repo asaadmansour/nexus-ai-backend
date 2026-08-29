@@ -49,6 +49,19 @@ describe('ProjectHandoffsService', () => {
     const evaluations = {
       requeueForRepositoryUpdate: jest.fn(),
     };
+    const submissionQuery = {
+      leftJoinAndSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue([]),
+    };
+    const submissions = {
+      find: jest.fn().mockResolvedValue([]),
+      createQueryBuilder: jest.fn().mockReturnValue(submissionQuery),
+      save: jest.fn(),
+    };
     const service = new ProjectHandoffsService(
       dataSource as never,
       { get: jest.fn() } as never,
@@ -62,7 +75,7 @@ describe('ProjectHandoffsService', () => {
       { find: jest.fn().mockResolvedValue([]) } as never,
       projects as never,
       {} as never,
-      { find: jest.fn().mockResolvedValue([]) } as never,
+      submissions as never,
       {} as never,
     );
     return {
@@ -74,6 +87,8 @@ describe('ProjectHandoffsService', () => {
       notifications,
       github,
       evaluations,
+      submissions,
+      submissionQuery,
     };
   }
 
@@ -116,6 +131,58 @@ describe('ProjectHandoffsService', () => {
       reason: 'integration_reconciler_pull_request_update',
       allowApprovedIntegrationRecovery: true,
     });
+  });
+
+  it('keeps polling an integration failure after its notification was sent', async () => {
+    const {
+      service,
+      github,
+      evaluations,
+      submissions,
+      submissionQuery,
+      notifications,
+    } = setup();
+    const previousCommitSha = 'a'.repeat(40);
+    const updatedCommitSha = 'b'.repeat(40);
+    submissionQuery.getMany.mockResolvedValue([
+      {
+        id: 'submission-id',
+        projectId: 'project-1',
+        status: 'approved',
+        commitSha: previousCommitSha,
+        pullRequestUrl: 'https://github.com/nexus-ai/project/pull/2',
+        metadata: {
+          integration: {
+            status: 'failed',
+            freelancerNotifiedAt: '2026-08-29T13:00:00.000Z',
+          },
+        },
+        repository: {
+          owner: 'nexus-ai',
+          repoName: 'project',
+        },
+      },
+    ]);
+    github.getPullRequest.mockResolvedValue({ headSha: updatedCommitSha });
+    github.isCommitAncestor.mockResolvedValue(true);
+    evaluations.requeueForRepositoryUpdate.mockResolvedValue({
+      evaluationRunId: 'run-id',
+    });
+    const reconcile = Reflect.get(
+      service,
+      'reconcileSubmissionIntegrationFailures',
+    ) as () => Promise<void>;
+
+    await reconcile.call(service);
+
+    expect(evaluations.requeueForRepositoryUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        submissionId: 'submission-id',
+        commitSha: updatedCommitSha,
+      }),
+    );
+    expect(notifications.createNotification).not.toHaveBeenCalled();
+    expect(submissions.save).not.toHaveBeenCalled();
   });
 
   it('does not mark the handoff accepted when escrow finalization fails', async () => {

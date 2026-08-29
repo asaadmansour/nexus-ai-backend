@@ -500,9 +500,6 @@ export class ProjectHandoffsService
       .leftJoinAndSelect('submission.repository', 'repository')
       .where("submission.status = 'approved'")
       .andWhere("submission.metadata -> 'integration' ->> 'status' = 'failed'")
-      .andWhere(
-        "submission.metadata -> 'integration' ->> 'freelancerNotifiedAt' IS NULL",
-      )
       .orderBy('submission.updatedAt', 'ASC')
       .take(20)
       .getMany();
@@ -518,6 +515,7 @@ export class ProjectHandoffsService
             this.error(error),
         );
       }
+      if (this.text(integration.freelancerNotifiedAt)) continue;
       try {
         await this.notifySubmissionOwnerOfIntegrationFailure(
           submission,
