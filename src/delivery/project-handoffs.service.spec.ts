@@ -99,6 +99,41 @@ describe('ProjectHandoffsService', () => {
     };
   }
 
+  it('normalizes nullable legacy brief criteria for final verification', () => {
+    const { service } = setup();
+    type FinalEvaluationDtoBuilder = (
+      handoff: Record<string, unknown>,
+      tasks: Record<string, unknown>[],
+      commitSha: string,
+      brief: Record<string, unknown>,
+      spec: null,
+    ) => {
+      task: { acceptanceCriteria: unknown };
+      brief: { acceptanceCriteria: unknown };
+    };
+    const typedService = service as unknown as {
+      finalEvaluationDto: FinalEvaluationDtoBuilder;
+    };
+
+    const dto = typedService.finalEvaluationDto(
+      {
+        id: 'handoff-1',
+        projectId: 'project-1',
+        project: { title: 'Legacy brief project' },
+        repositoryId: 'repository-1',
+        repository: null,
+        summary: 'Integrated delivery',
+      },
+      [],
+      'a'.repeat(40),
+      { acceptanceCriteria: null },
+      null,
+    );
+
+    expect(dto.task.acceptanceCriteria).toEqual([]);
+    expect(dto.brief.acceptanceCriteria).toEqual([]);
+  });
+
   it('recovers a conflict-resolution commit without restarting the task flow', async () => {
     const { service, github, evaluations } = setup();
     const previousCommitSha = 'a'.repeat(40);

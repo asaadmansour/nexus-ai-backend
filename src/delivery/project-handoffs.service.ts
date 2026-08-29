@@ -1142,7 +1142,7 @@ export class ProjectHandoffsService
             platforms: brief.platforms,
             constraintsPreferences: brief.constraintsPreferences,
             nonFunctional: brief.nonFunctional,
-            acceptanceCriteria: brief.acceptanceCriteria,
+            acceptanceCriteria: this.strings(brief.acceptanceCriteria),
             confirmedAt: brief.confirmedAt,
           }
         : null,
