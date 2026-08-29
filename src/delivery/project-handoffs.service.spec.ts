@@ -185,6 +185,41 @@ describe('ProjectHandoffsService', () => {
     expect(submissions.save).not.toHaveBeenCalled();
   });
 
+  it('polls an in-review pull request when its webhook is unavailable', async () => {
+    const { service, github, evaluations, submissionQuery } = setup();
+    const previousCommitSha = 'a'.repeat(40);
+    const updatedCommitSha = 'b'.repeat(40);
+    submissionQuery.getMany.mockResolvedValue([
+      {
+        id: 'submission-id',
+        status: 'under_review',
+        submissionType: 'pull_request',
+        commitSha: previousCommitSha,
+        pullRequestUrl: 'https://github.com/nexus-ai/project/pull/3',
+        repository: {
+          owner: 'nexus-ai',
+          repoName: 'project',
+        },
+      },
+    ]);
+    github.getPullRequest.mockResolvedValue({ headSha: updatedCommitSha });
+    evaluations.requeueForRepositoryUpdate.mockResolvedValue({
+      evaluationRunId: 'run-id',
+    });
+    const reconcile = Reflect.get(
+      service,
+      'reconcileActivePullRequestUpdates',
+    ) as () => Promise<void>;
+
+    await reconcile.call(service);
+
+    expect(evaluations.requeueForRepositoryUpdate).toHaveBeenCalledWith({
+      submissionId: 'submission-id',
+      commitSha: updatedCommitSha,
+      reason: 'evaluation_reconciler_pull_request_update',
+    });
+  });
+
   it('does not mark the handoff accepted when escrow finalization fails', async () => {
     const { service, handoff, handoffs, payments } = setup();
     payments.completeProjectDelivery.mockRejectedValueOnce(

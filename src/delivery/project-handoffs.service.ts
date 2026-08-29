@@ -472,6 +472,7 @@ export class ProjectHandoffsService
   }
 
   async reconcile() {
+    await this.reconcileActivePullRequestUpdates();
     await this.reconcileSubmissionIntegrationFailures();
     const due = await this.handoffs.find({
       where: {
@@ -492,6 +493,50 @@ export class ProjectHandoffsService
       }
     }
     await this.reconcileClientReviewDeadlines();
+  }
+
+  private async reconcileActivePullRequestUpdates() {
+    const active = await this.submissions
+      .createQueryBuilder('submission')
+      .leftJoinAndSelect('submission.repository', 'repository')
+      .where("submission.status IN ('submitted', 'under_review')")
+      .andWhere("submission.submission_type = 'pull_request'")
+      .andWhere('submission.pull_request_url IS NOT NULL')
+      .orderBy('submission.updatedAt', 'ASC')
+      .take(20)
+      .getMany();
+    for (const submission of active) {
+      if (
+        !submission.repository ||
+        !submission.pullRequestUrl ||
+        !submission.commitSha
+      ) {
+        continue;
+      }
+      try {
+        const number = this.pullRequestNumber(submission.pullRequestUrl);
+        const pullRequest = await this.github.getPullRequest({
+          owner: submission.repository.owner,
+          repoName: submission.repository.repoName,
+          number,
+        });
+        if (pullRequest.headSha === submission.commitSha.toLowerCase()) {
+          continue;
+        }
+        await this.evaluations.requeueForRepositoryUpdate({
+          submissionId: submission.id,
+          commitSha: pullRequest.headSha,
+          reason: 'evaluation_reconciler_pull_request_update',
+        });
+      } catch (error) {
+        this.logger.warn(
+          'Could not inspect the active pull request for submission ' +
+            submission.id +
+            ': ' +
+            this.error(error),
+        );
+      }
+    }
   }
 
   private async reconcileSubmissionIntegrationFailures() {
