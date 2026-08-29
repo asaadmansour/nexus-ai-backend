@@ -25,6 +25,7 @@ import { NotificationsService } from 'src/notifications/notifications.service';
 import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requests.service';
 import { Brief } from 'src/projects/entities/brief.entity';
 import { ProjectHandoff } from 'src/projects/entities/project-handoff.entity';
+import { ProjectMilestone } from 'src/projects/entities/project-milestone.entity';
 import { ProjectRating } from 'src/projects/entities/project-rating.entity';
 import { ProjectRepository } from 'src/projects/entities/project-repository.entity';
 import { ProjectRevisionRequest } from 'src/projects/entities/project-revision-request.entity';
@@ -710,6 +711,7 @@ export class ProjectHandoffsService
         this.text(prior.status),
       )
     ) {
+      await this.markSubmissionTaskIntegrated(submission);
       return prior;
     }
     const now = new Date().toISOString();
@@ -773,6 +775,7 @@ export class ProjectHandoffsService
       }
       submission.metadata = { ...(submission.metadata ?? {}), integration };
       await this.submissions.save(submission);
+      await this.markSubmissionTaskIntegrated(submission);
       return integration;
     } catch (error) {
       const message = this.error(error);
@@ -812,6 +815,32 @@ export class ProjectHandoffsService
         );
       }
       return integration;
+    }
+  }
+
+  private async markSubmissionTaskIntegrated(submission: ProjectSubmission) {
+    if (!submission.taskId) return;
+    await this.tasks.update(submission.taskId, {
+      status: 'done',
+      assignmentStatus: 'completed',
+    });
+    if (!submission.milestoneId) return;
+    const remainingTasks = await this.tasks.count({
+      where: {
+        milestoneId: submission.milestoneId,
+        status: In([
+          'todo',
+          'blocked',
+          'in_progress',
+          'review',
+          'changes_requested',
+        ]),
+      },
+    });
+    if (remainingTasks === 0) {
+      await this.dataSource
+        .getRepository(ProjectMilestone)
+        .update(submission.milestoneId, { status: 'approved' });
     }
   }
 

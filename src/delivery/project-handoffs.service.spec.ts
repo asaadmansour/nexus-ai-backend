@@ -63,6 +63,11 @@ describe('ProjectHandoffsService', () => {
       createQueryBuilder: jest.fn().mockReturnValue(submissionQuery),
       save: jest.fn(),
     };
+    const tasks = {
+      find: jest.fn().mockResolvedValue([]),
+      update: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
+    };
     const service = new ProjectHandoffsService(
       dataSource as never,
       { get: jest.fn() } as never,
@@ -75,7 +80,7 @@ describe('ProjectHandoffsService', () => {
       handoffs as never,
       { find: jest.fn().mockResolvedValue([]) } as never,
       projects as never,
-      {} as never,
+      tasks as never,
       submissions as never,
       {} as never,
     );
@@ -90,6 +95,7 @@ describe('ProjectHandoffsService', () => {
       evaluations,
       submissions,
       submissionQuery,
+      tasks,
     };
   }
 
@@ -131,6 +137,24 @@ describe('ProjectHandoffsService', () => {
       commitSha: updatedCommitSha,
       reason: 'integration_reconciler_pull_request_update',
       allowApprovedIntegrationRecovery: true,
+    });
+  });
+
+  it('closes a task only after its approved submission is integrated', async () => {
+    const { service, tasks } = setup();
+    const markIntegrated = Reflect.get(
+      service,
+      'markSubmissionTaskIntegrated',
+    ) as (submission: Record<string, unknown>) => Promise<void>;
+
+    await markIntegrated.call(service, {
+      taskId: 'task-id',
+      milestoneId: null,
+    });
+
+    expect(tasks.update).toHaveBeenCalledWith('task-id', {
+      status: 'done',
+      assignmentStatus: 'completed',
     });
   });
 

@@ -865,9 +865,9 @@ export class DeliveryService {
 
       if (submission.taskId) {
         await manager.getRepository(ProjectTask).update(submission.taskId, {
-          status: dto.decision === 'approved' ? 'done' : 'changes_requested',
+          status: dto.decision === 'approved' ? 'review' : 'changes_requested',
           assignmentStatus:
-            dto.decision === 'approved' ? 'completed' : 'changes_requested',
+            dto.decision === 'approved' ? 'in_review' : 'changes_requested',
         });
       }
 
