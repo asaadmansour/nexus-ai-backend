@@ -21,6 +21,7 @@ import { PaymentReleaseRequestsService } from 'src/payments/payment-release-requ
 import { MaterializePlanDto } from 'src/planning/dtos/materialize-plan.dto';
 import { ReviewPlanDto } from 'src/planning/dtos/review-plan.dto';
 import { ReviewPlanningSubmissionDto } from 'src/planning/dtos/review-planning-submission.dto';
+import { PlanningEvaluationsService } from 'src/planning/planning-evaluations.service';
 import { PlanningSubmissionsService } from 'src/planning/planning-submissions.service';
 import { ProjectPlansService } from 'src/planning/project-plans.service';
 import { ProjectPlan } from 'src/projects/entities/project-plan.entity';
@@ -45,6 +46,7 @@ export class ReviewerService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly planningSubmissions: PlanningSubmissionsService,
+    private readonly planningEvaluations: PlanningEvaluationsService,
     private readonly plans: ProjectPlansService,
     private readonly matching: MatchingService,
     private readonly delivery: DeliveryService,
@@ -328,6 +330,15 @@ export class ReviewerService {
     if (!item) throw new NotFoundException('Submission not found');
     await this.assertReviewer(item.projectId, userId);
     return this.planningSubmissions.review(id, dto, userId);
+  }
+
+  async retryPlanningSubmissionEvaluation(id: string, userId: string) {
+    const item = await this.dataSource
+      .getRepository(ProjectPlanningSubmission)
+      .findOne({ where: { id }, select: { id: true, projectId: true } });
+    if (!item) throw new NotFoundException('Submission not found');
+    await this.assertReviewer(item.projectId, userId);
+    return this.planningEvaluations.retry(id, userId);
   }
 
   async reviewPlan(id: string, dto: ReviewPlanDto, userId: string) {
