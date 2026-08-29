@@ -155,9 +155,15 @@ export class PaymentReleaseRequestsService {
       if (existing) return { request: existing, created: false };
 
       const amount = this.toCents(dto.amount);
-      const entitledAmount = Math.max(
-        this.toCents(task.budgetAmount) - this.toCents(task.penaltyAmount ?? 0),
-        0,
+      const entitledAmount = this.toCents(
+        calculateTaskCompensation({
+          budgetAmount: task.budgetAmount,
+          penaltyAmount: task.penaltyAmount,
+          estimatedHours: task.estimatedHours,
+          hourlyRateSnapshot: task.hourlyRateSnapshot,
+          hourlyRateCurrencySnapshot: task.hourlyRateCurrencySnapshot,
+          payoutCurrency: task.currency ?? currency,
+        }).amount,
       );
       if (amount !== entitledAmount) {
         throw new BadRequestException(
