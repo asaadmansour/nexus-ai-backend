@@ -12,6 +12,12 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+import {
+  PROFESSIONAL_ROLES,
+  SENIORITY_LEVELS,
+  type ProfessionalRole,
+  type SeniorityLevel,
+} from '../../freelancers/professional-classification';
 
 export class MatchCandidateInputDto {
   @IsUUID()
@@ -24,6 +30,14 @@ export class MatchCandidateInputDto {
   @IsOptional()
   @IsString()
   headline?: string;
+
+  @IsOptional()
+  @IsIn(PROFESSIONAL_ROLES)
+  professionalRole?: ProfessionalRole;
+
+  @IsOptional()
+  @IsIn(SENIORITY_LEVELS)
+  seniorityLevel?: SeniorityLevel;
 
   @IsOptional()
   @IsString()

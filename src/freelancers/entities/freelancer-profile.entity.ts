@@ -14,6 +14,11 @@ import { User } from '../../users/entities/user.entity';
 import { FreelancerProfileEmbedding } from './freelancer-profile-embedding.entity';
 import { FreelancerSkillScore } from './freelancer-skill-score.entity';
 import type { PrincipalReviewerStatus } from '../principal-reviewer-qualification';
+import type {
+  ClassificationSource,
+  ProfessionalRole,
+  SeniorityLevel,
+} from '../professional-classification';
 
 @Entity('freelancer_profiles')
 @Index('freelancer_profiles_stripe_account_id_uidx', ['stripeAccountId'], {
@@ -135,6 +140,51 @@ export class FreelancerProfile {
 
   @Column({ name: 'years_experience', type: 'int', nullable: true })
   yearsExperience: number | null;
+
+  @Index('freelancer_profiles_professional_role_idx')
+  @Column({
+    name: 'professional_role',
+    type: 'varchar',
+    length: 40,
+    nullable: true,
+  })
+  professionalRole: ProfessionalRole | null;
+
+  @Index('freelancer_profiles_seniority_level_idx')
+  @Column({
+    name: 'seniority_level',
+    type: 'varchar',
+    length: 20,
+    nullable: true,
+  })
+  seniorityLevel: SeniorityLevel | null;
+
+  @Column({
+    name: 'assessment_target_role',
+    type: 'varchar',
+    length: 40,
+    nullable: true,
+  })
+  assessmentTargetRole: ProfessionalRole | null;
+
+  @Column({
+    name: 'assessment_target_seniority',
+    type: 'varchar',
+    length: 20,
+    nullable: true,
+  })
+  assessmentTargetSeniority: SeniorityLevel | null;
+
+  @Column({
+    name: 'classification_source',
+    type: 'varchar',
+    length: 20,
+    nullable: true,
+  })
+  classificationSource: ClassificationSource | null;
+
+  @Column({ name: 'classified_at', type: 'timestamptz', nullable: true })
+  classifiedAt: Date | null;
 
   @Column({ type: 'jsonb', nullable: true })
   summary: Record<string, unknown> | null;

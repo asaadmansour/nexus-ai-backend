@@ -29,6 +29,11 @@ import {
   describeMissingPrerequisites,
   missingMatchingPrerequisites,
 } from './matching-prerequisites';
+import {
+  formatProfessionalTitle,
+  inferProfessionalRole,
+  seniorityFromAssessmentScore,
+} from './professional-classification';
 
 const MAX_WARNING_COUNT = 3;
 const ACTIVE_STATUS = 'in_progress';
@@ -814,6 +819,22 @@ export class FreelancerAssessmentsService {
 
         profile.assessmentScore = score;
         profile.assessmentSubmittedAt = submittedAt;
+        if (Number.isFinite(numericScore)) {
+          locked.resultRole =
+            locked.targetRole ??
+            profile.assessmentTargetRole ??
+            inferProfessionalRole({
+              headline: profile.headline,
+              skills: profile.skills,
+            });
+          locked.resultSeniority = seniorityFromAssessmentScore(numericScore);
+          if (locked.resultRole) {
+            profile.professionalRole = locked.resultRole;
+            profile.seniorityLevel = locked.resultSeniority;
+            profile.classificationSource = 'assessment';
+            profile.classifiedAt = submittedAt;
+          }
+        }
         // A profile matching can never select must not be auto-approved — it
         // would leave the freelancer approved but permanently unstaffable. Route
         // it to manual admin review instead of rejecting anyone. ISSUES.md #21.
@@ -885,6 +906,8 @@ export class FreelancerAssessmentsService {
             assessmentId: locked.id,
             score,
             recommendation: grade.recommendation ?? null,
+            professionalRole: profile.professionalRole,
+            seniorityLevel: profile.seniorityLevel,
             graderConfidence: confidence,
             integrityWarningCount: warningCount,
             automationDecision: autoDecision,
@@ -900,6 +923,10 @@ export class FreelancerAssessmentsService {
 
     if (claimed) {
       const decision = claimed.aiFeedback?.automationDecision;
+      const assessedTitle = formatProfessionalTitle(
+        claimed.resultRole,
+        claimed.resultSeniority,
+      );
       await this.notificationsService.createNotification({
         userId,
         type: 'freelancer_verification',
@@ -911,10 +938,10 @@ export class FreelancerAssessmentsService {
               : 'Assessment needs review',
         body:
           decision === 'approved'
-            ? 'Your assessment passed and your platform hourly rate was calculated automatically. You can now receive project invitations.'
+            ? `${assessedTitle ? `You were ranked as ${assessedTitle}. ` : ''}Your assessment passed and your platform hourly rate was calculated automatically. You can now receive project invitations.`
             : decision === 'rejected'
-              ? 'Your assessment did not meet the approval threshold. The decision and evidence were recorded for review or retry policy.'
-              : 'Your assessment was graded, but confidence, integrity, or provider signals require an admin exception review.',
+              ? `${assessedTitle ? `You were ranked as ${assessedTitle}. ` : ''}Your assessment did not meet the approval threshold. The decision and evidence were recorded for review or retry policy.`
+              : `${assessedTitle ? `You were ranked as ${assessedTitle}. ` : ''}Your assessment was graded, but confidence, integrity, or provider signals require an admin exception review.`,
         actionUrl: '/freelancer/verification',
       });
     }
@@ -963,6 +990,10 @@ export class FreelancerAssessmentsService {
       generationError: assessment.generationError,
       startedAt: assessment.startedAt,
       submittedAt: assessment.submittedAt,
+      targetRole: assessment.targetRole,
+      targetSeniority: assessment.targetSeniority,
+      resultRole: assessment.resultRole,
+      resultSeniority: assessment.resultSeniority,
       warningsCount: warningCounts.get(assessment.id) ?? 0,
       createdAt: assessment.createdAt,
     }));
@@ -1495,6 +1526,10 @@ export class FreelancerAssessmentsService {
       startedAt: assessment.startedAt,
       expiresAt: assessment.expiresAt,
       submittedAt: assessment.submittedAt,
+      targetRole: assessment.targetRole,
+      targetSeniority: assessment.targetSeniority,
+      resultRole: assessment.resultRole,
+      resultSeniority: assessment.resultSeniority,
     };
   }
 
@@ -1526,6 +1561,10 @@ export class FreelancerAssessmentsService {
         startedAt: assessment.startedAt,
         expiresAt: assessment.expiresAt,
         submittedAt: assessment.submittedAt,
+        targetRole: assessment.targetRole,
+        targetSeniority: assessment.targetSeniority,
+        resultRole: assessment.resultRole,
+        resultSeniority: assessment.resultSeniority,
         remainingSeconds: this.remainingSeconds(assessment),
         questionCount: questions.length,
       },
@@ -1590,6 +1629,10 @@ export class FreelancerAssessmentsService {
         status: assessment.status,
         score: assessment.score,
         submittedAt: assessment.submittedAt,
+        targetRole: assessment.targetRole,
+        targetSeniority: assessment.targetSeniority,
+        resultRole: assessment.resultRole,
+        resultSeniority: assessment.resultSeniority,
       },
       result: {
         recommendation: feedback.recommendation ?? null,

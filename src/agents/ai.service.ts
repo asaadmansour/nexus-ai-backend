@@ -434,6 +434,8 @@ export class AiService {
         skills: dto.skills,
         yearsExperience: dto.yearsExperience,
         headline: dto.headline,
+        targetRole: dto.targetRole,
+        targetSeniority: dto.targetSeniority,
         questionCount: dto.questionCount,
         durationSeconds: dto.durationSeconds,
       },
@@ -2805,6 +2807,8 @@ export class AiService {
       generatedFrom: {
         cvUrl: dto.cvUrl ?? null,
         headline: dto.headline ?? null,
+        targetRole: dto.targetRole ?? null,
+        targetSeniority: dto.targetSeniority ?? null,
         yearsExperience: dto.yearsExperience ?? null,
         skills: dto.skills,
       },

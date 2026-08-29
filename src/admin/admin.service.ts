@@ -29,6 +29,7 @@ import { AiOperationsMonitorService } from './ai-operations-monitor.service';
 import { FreelancerVerificationEvent } from 'src/freelancers/entities/freelancer-verification-event.entity';
 import { ProjectRoleAssignment } from 'src/projects/entities/project-role-assignment.entity';
 import { ReviewPrincipalReviewerDto } from './dtos/review-principal-reviewer.dto';
+import { UpdateFreelancerClassificationDto } from './dtos/update-freelancer-classification.dto';
 import {
   describeMissingPrerequisites,
   missingMatchingPrerequisites,
@@ -38,6 +39,13 @@ import {
   evaluatePrincipalReviewerQualification,
   PRINCIPAL_REVIEWER_ROLE,
 } from 'src/freelancers/principal-reviewer-qualification';
+import {
+  formatProfessionalTitle,
+  inferProfessionalRole,
+  isProfessionalRole,
+  isSeniorityLevel,
+  seniorityFromAssessmentScore,
+} from 'src/freelancers/professional-classification';
 
 const ACTIVE_PRINCIPAL_REVIEWER_STATUSES = [
   'assigned',
@@ -154,6 +162,30 @@ export class AdminService {
       ...(feedback ?? {}),
       [key]: value,
     };
+  }
+
+  private applyAssessmentClassification(
+    profile: FreelancerProfile,
+    assessment: FreelancerAssessment,
+    classifiedAt = new Date(),
+  ) {
+    const score = Number(assessment.score);
+    if (!Number.isFinite(score)) return;
+
+    assessment.resultRole =
+      assessment.targetRole ??
+      profile.assessmentTargetRole ??
+      inferProfessionalRole({
+        headline: profile.headline,
+        skills: profile.skills,
+      });
+    assessment.resultSeniority = seniorityFromAssessmentScore(score);
+    if (!assessment.resultRole) return;
+
+    profile.professionalRole = assessment.resultRole;
+    profile.seniorityLevel = assessment.resultSeniority;
+    profile.classificationSource = 'assessment';
+    profile.classifiedAt = classifiedAt;
   }
 
   private getAgentHealthStatus(failedToday: number) {
@@ -278,7 +310,17 @@ export class AdminService {
         user.phoneVerifiedAt = null;
       }
     }
-    if (dto.role !== undefined) user.role = dto.role;
+    if (dto.role !== undefined && dto.role !== user.role) {
+      if (user.id === adminUserId && dto.role !== UserRole.ADMIN) {
+        throw new BadRequestException(
+          'You cannot remove your own admin access',
+        );
+      }
+      user.role = dto.role;
+      // Existing access tokens are short-lived, while refresh tokens would keep
+      // minting the old permission set. Force a fresh sign-in after role changes.
+      await this.refreshTokenRepository.delete({ userId: user.id });
+    }
     if (dto.isEmailVerified !== undefined) {
       user.isEmailVerified = dto.isEmailVerified;
     }
@@ -580,6 +622,8 @@ export class AdminService {
     dateFrom?: string,
     dateTo?: string,
     principalReviewerStatus?: string,
+    professionalRole?: string,
+    seniorityLevel?: string,
   ) {
     const query = this.freelancerProfileRepository
       .createQueryBuilder('fp')
@@ -611,6 +655,30 @@ export class AdminService {
         principalReviewerStatus,
       });
     }
+    if (professionalRole === PRINCIPAL_REVIEWER_ROLE) {
+      query.andWhere('fp.principalReviewerStatus = :qualifiedReviewer', {
+        qualifiedReviewer: 'approved',
+      });
+    } else if (professionalRole) {
+      if (!isProfessionalRole(professionalRole)) {
+        throw new BadRequestException('Unknown freelancer professional role');
+      }
+      query.andWhere(
+        'COALESCE(fp.professionalRole, fp.assessmentTargetRole) = :professionalRole',
+        {
+          professionalRole,
+        },
+      );
+    }
+    if (seniorityLevel) {
+      if (!isSeniorityLevel(seniorityLevel)) {
+        throw new BadRequestException('Unknown freelancer seniority level');
+      }
+      query.andWhere(
+        'COALESCE(fp.seniorityLevel, fp.assessmentTargetSeniority) = :seniorityLevel',
+        { seniorityLevel },
+      );
+    }
 
     const [profiles, total] = await query.getManyAndCount();
     const profileIds = profiles.map((profile) => profile.id);
@@ -638,6 +706,20 @@ export class AdminService {
       headline: profile.headline,
       skills: profile.skills,
       yearsExperience: profile.yearsExperience,
+      professionalRole: profile.professionalRole,
+      seniorityLevel: profile.seniorityLevel,
+      assessmentTargetRole: profile.assessmentTargetRole,
+      assessmentTargetSeniority: profile.assessmentTargetSeniority,
+      professionalTitle: formatProfessionalTitle(
+        profile.professionalRole,
+        profile.seniorityLevel,
+      ),
+      assessmentTargetTitle: formatProfessionalTitle(
+        profile.assessmentTargetRole,
+        profile.assessmentTargetSeniority,
+      ),
+      classificationSource: profile.classificationSource,
+      classifiedAt: profile.classifiedAt,
       cvUrl: profile.cvUrl,
       verificationStatus: profile.verificationStatus,
       assessmentScore: profile.assessmentScore,
@@ -708,6 +790,20 @@ export class AdminService {
         bio: profile.bio,
         skills: profile.skills,
         yearsExperience: profile.yearsExperience,
+        professionalRole: profile.professionalRole,
+        seniorityLevel: profile.seniorityLevel,
+        assessmentTargetRole: profile.assessmentTargetRole,
+        assessmentTargetSeniority: profile.assessmentTargetSeniority,
+        professionalTitle: formatProfessionalTitle(
+          profile.professionalRole,
+          profile.seniorityLevel,
+        ),
+        assessmentTargetTitle: formatProfessionalTitle(
+          profile.assessmentTargetRole,
+          profile.assessmentTargetSeniority,
+        ),
+        classificationSource: profile.classificationSource,
+        classifiedAt: profile.classifiedAt,
         hourlyRate: profile.hourlyRate,
         availabilityHoursPerWeek: profile.availabilityHoursPerWeek,
         isAvailable: profile.isAvailable,
@@ -740,6 +836,10 @@ export class AdminService {
             id: assessment.id,
             status: assessment.status,
             score: assessment.score,
+            targetRole: assessment.targetRole,
+            targetSeniority: assessment.targetSeniority,
+            resultRole: assessment.resultRole,
+            resultSeniority: assessment.resultSeniority,
             recommendation: this.getAiRecommendation(assessment.aiFeedback),
             aiFeedback: assessment.aiFeedback,
             warningCount,
@@ -835,6 +935,50 @@ export class AdminService {
     await this.freelancerProfileRepository.save(profile);
 
     return profile;
+  }
+
+  async updateFreelancerClassification(
+    id: string,
+    dto: UpdateFreelancerClassificationDto,
+    adminUserId: string,
+  ) {
+    const profile = await this.freelancerProfileRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
+    if (!profile) throw new NotFoundException('Freelancer profile not found');
+
+    profile.professionalRole = dto.professionalRole;
+    profile.seniorityLevel = dto.seniorityLevel;
+    profile.classificationSource = 'admin';
+    profile.classifiedAt = new Date();
+    await this.freelancerProfileRepository.save(profile);
+
+    await this.verificationEventRepository.save(
+      this.verificationEventRepository.create({
+        freelancerProfileId: profile.id,
+        userId: profile.userId,
+        eventType: 'professional_classification_updated',
+        fromStatus: profile.verificationStatus,
+        toStatus: profile.verificationStatus,
+        actorType: 'admin',
+        actorUserId: adminUserId,
+        metadata: {
+          professionalRole: profile.professionalRole,
+          seniorityLevel: profile.seniorityLevel,
+        },
+      }),
+    );
+
+    await this.notificationsService.createNotification({
+      userId: profile.userId,
+      type: 'freelancer_verification',
+      title: 'Professional classification updated',
+      body: `Your platform position is now ${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel)}.`,
+      actionUrl: '/freelancer/verification',
+    });
+
+    return this.getFreelancerDetail(id);
   }
 
   async reviewPrincipalReviewer(
@@ -1219,6 +1363,12 @@ export class AdminService {
     if (!assessment) throw new NotFoundException('Assessment not found');
 
     assessment.score = dto.score.toFixed(2);
+    if (assessment.freelancerProfile) {
+      this.applyAssessmentClassification(
+        assessment.freelancerProfile,
+        assessment,
+      );
+    }
     assessment.aiFeedback = this.appendAdminFeedback(
       assessment.aiFeedback,
       'lastAdminScoreOverride',
@@ -1323,9 +1473,8 @@ export class AdminService {
       reviewedAt: new Date(),
     };
 
-    await this.assessmentRepository.save(assessment);
-
     const profile = assessment.freelancerProfile;
+    this.applyAssessmentClassification(profile, assessment);
 
     // Update freelancer verification status based on decision. Admin decisions
     // are authoritative and can override an AI pass/fail recommendation.
@@ -1359,6 +1508,7 @@ export class AdminService {
       profile.assessmentScore = assessment.score;
     }
     await this.freelancerProfileRepository.save(profile);
+    await this.assessmentRepository.save(assessment);
 
     await this.notificationsService.createNotification({
       userId: assessment.freelancerProfile.userId,
@@ -1370,9 +1520,9 @@ export class AdminService {
             : 'Assessment needs review',
       body:
         payload.decision === 'pass'
-          ? 'Your assessment was approved. Your profile is now ready for matching.'
+          ? `${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel) ? `You were ranked as ${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel)}. ` : ''}Your assessment was approved. Your profile is now ready for matching.`
           : payload.decision === 'fail'
-            ? payload.notes || 'Your assessment was not approved after review.'
+            ? `${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel) ? `You were ranked as ${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel)}. ` : ''}${payload.notes || 'Your assessment was not approved after review.'}`
             : payload.notes ||
               'Your assessment needs another review before verification can continue.',
     });

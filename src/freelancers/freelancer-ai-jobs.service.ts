@@ -19,6 +19,13 @@ import { FreelancerProfileEmbedding } from './entities/freelancer-profile-embedd
 import { FreelancerProfile } from './entities/freelancer-profile.entity';
 import { FreelancerSkillScore } from './entities/freelancer-skill-score.entity';
 import { FreelancerVerificationEvent } from './entities/freelancer-verification-event.entity';
+import {
+  formatProfessionalTitle,
+  inferAssessmentTargetSeniority,
+  inferProfessionalRole,
+  type ProfessionalRole,
+  type SeniorityLevel,
+} from './professional-classification';
 
 const DEFAULT_QUESTION_COUNT = 40;
 const DEFAULT_DURATION_SECONDS = 2700;
@@ -45,6 +52,8 @@ interface CvExtractionResult {
   skills?: string[] | null;
   yearsExperience?: number | null;
   confidence?: number | null;
+  professionalRole?: ProfessionalRole | null;
+  seniorityLevel?: SeniorityLevel | null;
 }
 
 interface GeneratedQuestion {
@@ -145,6 +154,16 @@ export class FreelancerAiJobsService {
       ) {
         profile.yearsExperience = result.yearsExperience;
       }
+      profile.assessmentTargetRole = inferProfessionalRole({
+        role: result.professionalRole,
+        headline: profile.headline,
+        skills,
+      });
+      profile.assessmentTargetSeniority = inferAssessmentTargetSeniority({
+        seniority: result.seniorityLevel,
+        headline: profile.headline,
+        yearsExperience: profile.yearsExperience,
+      });
       profile.cvExtractionStatus = 'completed';
       profile.cvExtractionError = null;
       profile.cvExtractedAt = new Date();
@@ -273,6 +292,8 @@ export class FreelancerAiJobsService {
         skills: reservation.skills,
         yearsExperience: reservation.profile.yearsExperience ?? undefined,
         headline: reservation.profile.headline ?? undefined,
+        targetRole: reservation.assessment.targetRole ?? undefined,
+        targetSeniority: reservation.assessment.targetSeniority ?? undefined,
         questionCount: data.questionCount,
         durationSeconds: data.durationSeconds,
       })) as GeneratedAssessment;
@@ -497,6 +518,8 @@ export class FreelancerAiJobsService {
           generatedFromCvUrl: data.cvUrl,
           cvVersionId: profile.currentCvVersionId,
           generationJobId: data.agentJobId,
+          targetRole: profile.assessmentTargetRole,
+          targetSeniority: profile.assessmentTargetSeniority,
           attemptNumber:
             (await this.countAssessmentAttempts(manager, data.userId)) + 1,
           generationInput: {
@@ -505,6 +528,8 @@ export class FreelancerAiJobsService {
             skills,
             yearsExperience: profile.yearsExperience,
             headline: profile.headline,
+            targetRole: profile.assessmentTargetRole,
+            targetSeniority: profile.assessmentTargetSeniority,
             questionCount: data.questionCount,
             durationSeconds: data.durationSeconds,
           },
@@ -589,7 +614,7 @@ export class FreelancerAiJobsService {
     await this.notificationsService.createNotification({
       userId: data.userId,
       title: 'Assessment ready',
-      body: 'Your skills assessment is ready to start.',
+      body: `${formatProfessionalTitle(reservation.assessment.targetRole, reservation.assessment.targetSeniority) ?? 'Skills'} assessment is ready to start.`,
     });
   }
 
@@ -746,6 +771,9 @@ export class FreelancerAiJobsService {
     const sections = [
       userName ? `Freelancer: ${userName}` : null,
       profile.headline ? `Headline: ${profile.headline}` : null,
+      formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel)
+        ? `Assessed position: ${formatProfessionalTitle(profile.professionalRole, profile.seniorityLevel)}`
+        : null,
       profile.bio ? `Bio: ${profile.bio}` : null,
       profile.yearsExperience != null
         ? `Years of experience: ${profile.yearsExperience}`

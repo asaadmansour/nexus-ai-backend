@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -194,6 +195,7 @@ export class AuthService {
     try {
       const dbUser = await queryRunner.manager.findOne(User, {
         where: { email: user.email },
+        withDeleted: true,
         select: {
           hashedPassword: true,
           id: true,
@@ -201,6 +203,7 @@ export class AuthService {
           role: true,
           isEmailVerified: true,
           isPhoneVerified: true,
+          deletedAt: true,
         },
       });
       if (!dbUser || !dbUser.hashedPassword)
@@ -212,6 +215,12 @@ export class AuthService {
       );
       if (!passwordMatch)
         throw new UnauthorizedException('Either email or password wrong');
+
+      if (dbUser.deletedAt) {
+        throw new ForbiddenException(
+          'Your account is disabled. Contact support or an administrator.',
+        );
+      }
 
       const { accessToken, refreshToken } = await this.generateTokens(
         dbUser.id,

@@ -9,6 +9,10 @@ import {
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 import { FreelancerProfile } from './freelancer-profile.entity';
+import type {
+  ProfessionalRole,
+  SeniorityLevel,
+} from '../professional-classification';
 
 @Entity('freelancer_assessments')
 export class FreelancerAssessment {
@@ -70,6 +74,28 @@ export class FreelancerAssessment {
 
   @Column({ name: 'generation_error', type: 'text', nullable: true })
   generationError: string | null;
+
+  @Column({ name: 'target_role', type: 'varchar', length: 40, nullable: true })
+  targetRole: ProfessionalRole | null;
+
+  @Column({
+    name: 'target_seniority',
+    type: 'varchar',
+    length: 20,
+    nullable: true,
+  })
+  targetSeniority: SeniorityLevel | null;
+
+  @Column({ name: 'result_role', type: 'varchar', length: 40, nullable: true })
+  resultRole: ProfessionalRole | null;
+
+  @Column({
+    name: 'result_seniority',
+    type: 'varchar',
+    length: 20,
+    nullable: true,
+  })
+  resultSeniority: SeniorityLevel | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;

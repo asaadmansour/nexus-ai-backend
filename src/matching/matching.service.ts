@@ -22,6 +22,7 @@ import { AiService } from 'src/agents/ai.service';
 import type { MatchFreelancersResult } from 'src/agents/ai.service';
 import type { MatchCandidateInputDto } from 'src/agents/dto/MatchFreelancersDto';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
+import { UserRole } from 'src/common/enums/user-role.enum';
 import { NotificationsService } from 'src/notifications/notifications.service';
 import { Brief } from 'src/projects/entities/brief.entity';
 import { Project } from 'src/projects/entities/project.entity';
@@ -4887,6 +4888,10 @@ export class MatchingService {
       .leftJoinAndSelect('p.skillScores', 's')
       .leftJoinAndSelect('p.user', 'u')
       .where('p.verificationStatus = :approved', { approved: 'approved' })
+      .andWhere('u.role = :freelancerUserRole', {
+        freelancerUserRole: UserRole.FREELANCER,
+      })
+      .andWhere('u.deletedAt IS NULL')
       .andWhere('p.deletedAt IS NULL')
       .andWhere('p.isAvailable = true');
 
@@ -5295,6 +5300,8 @@ export class MatchingService {
         freelancerProfileId: profile.id,
         name: this.fullName(profile.user) ?? undefined,
         headline: profile.headline ?? undefined,
+        professionalRole: profile.professionalRole ?? undefined,
+        seniorityLevel: profile.seniorityLevel ?? undefined,
         profileSummary: profile.bio ?? undefined,
         skills: profile.skills ?? [],
         skillScores: scores,
