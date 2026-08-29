@@ -942,7 +942,7 @@ export class FreelancerAssessmentsService {
             : decision === 'rejected'
               ? `${assessedTitle ? `You were ranked as ${assessedTitle}. ` : ''}Your assessment did not meet the approval threshold. The decision and evidence were recorded for review or retry policy.`
               : `${assessedTitle ? `You were ranked as ${assessedTitle}. ` : ''}Your assessment was graded, but confidence, integrity, or provider signals require an admin exception review.`,
-        actionUrl: '/freelancer/verification',
+        actionUrl: '/freelancer/assessment/result',
       });
     }
 
@@ -1133,6 +1133,8 @@ export class FreelancerAssessmentsService {
           userId: assessment.userId,
           title: 'Assessment reviewed',
           body: notificationBody,
+          type: 'freelancer_verification',
+          actionUrl: '/freelancer/assessment/result',
         }),
       );
 
@@ -1530,6 +1532,86 @@ export class FreelancerAssessmentsService {
       targetSeniority: assessment.targetSeniority,
       resultRole: assessment.resultRole,
       resultSeniority: assessment.resultSeniority,
+      result: this.toCandidateAssessmentResult(assessment),
+    };
+  }
+
+  private toCandidateAssessmentResult(assessment: FreelancerAssessment) {
+    const feedback = assessment.aiFeedback ?? {};
+    const gradingComplete =
+      assessment.score != null &&
+      ['graded', 'needs_review', 'passed', 'failed'].includes(
+        assessment.status,
+      );
+    if (!gradingComplete && Object.keys(feedback).length === 0) return null;
+
+    const rawQuestionResults = Array.isArray(feedback.questionResults)
+      ? feedback.questionResults
+      : [];
+    const strengths: string[] = [];
+    const improvements: string[] = [];
+    let strongAnswers = 0;
+    let partialAnswers = 0;
+    let weakAnswers = 0;
+    for (const item of rawQuestionResults) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const result = item as Record<string, unknown>;
+      const score = Number(result.score);
+      const maxScore = Number(result.maxScore ?? 1);
+      if (
+        !Number.isFinite(score) ||
+        !Number.isFinite(maxScore) ||
+        maxScore <= 0
+      )
+        continue;
+      const ratio = score / maxScore;
+      const itemFeedback =
+        typeof result.feedback === 'string' ? result.feedback.trim() : '';
+      if (ratio >= 0.8) {
+        strongAnswers += 1;
+        if (itemFeedback && !strengths.includes(itemFeedback)) {
+          strengths.push(itemFeedback);
+        }
+      } else if (ratio >= 0.5) {
+        partialAnswers += 1;
+        if (itemFeedback && !improvements.includes(itemFeedback)) {
+          improvements.push(itemFeedback);
+        }
+      } else {
+        weakAnswers += 1;
+        if (itemFeedback && !improvements.includes(itemFeedback)) {
+          improvements.push(itemFeedback);
+        }
+      }
+    }
+
+    const text = (value: unknown) =>
+      typeof value === 'string' && value.trim() ? value.trim() : null;
+    const automationDecision = text(feedback.automationDecision);
+    return {
+      gradingComplete,
+      recommendation: text(feedback.recommendation),
+      feedback: text(feedback.feedback),
+      manualReviewRequired:
+        feedback.manualReviewRequired === true ||
+        automationDecision === 'needs_review',
+      automationDecision,
+      graderConfidence: Number.isFinite(Number(feedback.graderConfidence))
+        ? Number(feedback.graderConfidence)
+        : null,
+      integrityWarningCount: Number.isFinite(
+        Number(feedback.integrityWarningCount),
+      )
+        ? Number(feedback.integrityWarningCount)
+        : 0,
+      performance: {
+        questionsEvaluated: strongAnswers + partialAnswers + weakAnswers,
+        strongAnswers,
+        partialAnswers,
+        weakAnswers,
+      },
+      strengths: strengths.slice(0, 4),
+      improvements: improvements.slice(0, 6),
     };
   }
 
