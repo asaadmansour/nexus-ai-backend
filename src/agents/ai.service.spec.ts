@@ -180,3 +180,61 @@ describe('AiService fixed-package project quotes', () => {
     expect(highBudget.amount).toBe(lowBudget.amount);
   });
 });
+
+describe('AiService transient transport recovery', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('retries a transient provider failure with the same idempotency key', async () => {
+    jest.useFakeTimers();
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response('temporarily unavailable', { status: 503 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ embedding: [0.1, 0.2], model: 'test' }), {
+          status: 200,
+        }),
+      );
+    const service = new AiService(
+      new ConfigService({ AI_SERVICE_URL: 'https://ai.example' }),
+    );
+
+    const resultPromise = service.generateEmbedding({
+      text: 'backend engineer',
+      dimensions: 2,
+    });
+    await jest.advanceTimersByTimeAsync(500);
+    await expect(resultPromise).resolves.toMatchObject({ model: 'test' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstHeaders = fetchMock.mock.calls[0][1]?.headers as Record<
+      string,
+      string
+    >;
+    const secondHeaders = fetchMock.mock.calls[1][1]?.headers as Record<
+      string,
+      string
+    >;
+    expect(firstHeaders['Idempotency-Key']).toBeTruthy();
+    expect(secondHeaders['Idempotency-Key']).toBe(
+      firstHeaders['Idempotency-Key'],
+    );
+  });
+
+  it('does not retry a validation response', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response('invalid payload', { status: 422 }));
+    const service = new AiService(
+      new ConfigService({ AI_SERVICE_URL: 'https://ai.example' }),
+    );
+
+    await expect(
+      service.generateEmbedding({ text: 'backend engineer', dimensions: 2 }),
+    ).rejects.toThrow('status 422');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

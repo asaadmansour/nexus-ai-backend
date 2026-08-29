@@ -161,6 +161,26 @@ export class AiJobRecoveryService
     job: AgentJob,
     options: { cutoff?: Date; source: 'automatic' | 'manual' },
   ) {
+    const priorRecoveryCount = this.getRecoveryCount(job.output);
+    if (
+      options.source === 'automatic' &&
+      priorRecoveryCount >= AI_JOB_RECOVERY.AUTOMATIC_RECOVERY_LIMIT
+    ) {
+      if (!job.output?.automaticRecoveryExhaustedAt) {
+        await this.agentJobRepository.update(job.id, {
+          output: {
+            ...(job.output ?? {}),
+            automaticRecoveryExhaustedAt: new Date().toISOString(),
+            automaticRecoveryLimit: AI_JOB_RECOVERY.AUTOMATIC_RECOVERY_LIMIT,
+          },
+        });
+        this.logger.warn(
+          `AI job ${job.id} exhausted ${AI_JOB_RECOVERY.AUTOMATIC_RECOVERY_LIMIT} automatic recoveries; manual retry remains available`,
+        );
+      }
+      return false;
+    }
+
     const payload = this.toQueuePayload(job);
     if (!payload) {
       this.logger.warn(
@@ -174,7 +194,7 @@ export class AiJobRecoveryService
       return false;
     }
 
-    const recoveryCount = this.getRecoveryCount(job.output) + 1;
+    const recoveryCount = priorRecoveryCount + 1;
     const queueJobId = `${job.id}-${options.source}-retry-${recoveryCount}-${Date.now()}`;
     const output = {
       ...(job.output ?? {}),

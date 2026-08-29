@@ -279,6 +279,43 @@ describe('EvaluationsService GitHub update coalescing', () => {
 });
 
 describe('EvaluationsService evaluation dispatch recovery', () => {
+  it('retries only the latest failed run and carries a bounded recovery count', async () => {
+    const run = {
+      id: 'failed-run-id',
+      submissionId: 'submission-id',
+      status: 'failed',
+      trigger: 'automatic_recovery_2_of_older-run-id',
+    } as EvaluationRun;
+    const queueForSubmission = jest.fn().mockResolvedValue({
+      evaluationRunId: 'replacement-run-id',
+      status: 'queued',
+    });
+    const service = Object.create(
+      EvaluationsService.prototype,
+    ) as EvaluationsService;
+    Object.assign(service as unknown as Record<string, unknown>, {
+      runRepo: {
+        find: jest.fn().mockResolvedValue([run]),
+        findOne: jest.fn().mockResolvedValue(run),
+      },
+      queueForSubmission,
+      logger: { error: jest.fn() },
+    });
+
+    await expect(service.recoverFailedRuns()).resolves.toEqual({
+      inspected: 1,
+      recovered: 1,
+    });
+    expect(queueForSubmission).toHaveBeenCalledWith(
+      'submission-id',
+      {
+        mode: 'async',
+        reason: 'automatic_recovery_3_of_failed-run-id',
+      },
+      'system',
+    );
+  });
+
   it('repairs an active run whose BullMQ job is missing instead of returning 409', async () => {
     const run = {
       id: 'run-id',

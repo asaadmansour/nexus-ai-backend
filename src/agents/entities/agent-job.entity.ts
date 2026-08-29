@@ -70,6 +70,14 @@ export class AgentJob {
   })
   queueJobId!: string | null;
 
+  @Column({
+    name: 'idempotency_key',
+    type: 'varchar',
+    length: 160,
+    nullable: true,
+  })
+  idempotencyKey!: string | null;
+
   @Column({ type: 'jsonb', nullable: true })
   input!: Record<string, unknown> | null;
 

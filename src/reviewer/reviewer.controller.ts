@@ -17,6 +17,7 @@ import { VerifiedGuard } from 'src/common/guards/verified.guard';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { ReviewSubmissionDto } from 'src/delivery/dtos/review-submission.dto';
 import { ReviewProjectHandoffDto } from 'src/delivery/dtos/review-project-handoff.dto';
+import { CreateProjectRatingDto } from 'src/delivery/dtos/create-project-rating.dto';
 import { ReviewRunDto } from 'src/matching/dtos/review-run.dto';
 import { ReviewPaymentReleaseRequestDto } from 'src/payments/dtos/review-payment-release-request.dto';
 import { MaterializePlanDto } from 'src/planning/dtos/materialize-plan.dto';
@@ -135,6 +136,29 @@ export class ReviewerController {
     return {
       status: 'success',
       data: await this.reviewer.reviewHandoff(projectId, dto, user.sub),
+    };
+  }
+
+  @Get('projects/:projectId/ratings')
+  async ratings(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.reviewer.getImplementationRatings(projectId, user.sub),
+    };
+  }
+
+  @Post('projects/:projectId/ratings')
+  async rateImplementation(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() dto: CreateProjectRatingDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return {
+      status: 'success',
+      data: await this.reviewer.rateImplementation(projectId, dto, user.sub),
     };
   }
 

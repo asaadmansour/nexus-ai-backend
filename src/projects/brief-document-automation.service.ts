@@ -25,9 +25,9 @@ export class BriefDocumentAutomationService
 
   onModuleInit() {
     if (!this.jobs.enabled()) return;
-    this.timer = setInterval(() => void this.reconcile(), 5 * 60_000);
+    this.timer = setInterval(() => void this.reconcile(), 60_000);
     this.timer.unref();
-    setTimeout(() => void this.reconcile(), 30_000).unref();
+    setTimeout(() => void this.reconcile(), 15_000).unref();
   }
 
   onApplicationShutdown() {
@@ -39,14 +39,21 @@ export class BriefDocumentAutomationService
     this.running = true;
     try {
       const stale = await this.documents.find({
-        where: {
-          status: In(['queued', 'processing']),
-          updatedAt: LessThan(new Date(Date.now() - 10 * 60_000)),
-        },
+        where: [
+          {
+            status: In(['queued', 'processing']),
+            updatedAt: LessThan(new Date(Date.now() - 2 * 60_000)),
+          },
+          {
+            status: 'failed',
+            updatedAt: LessThan(new Date(Date.now() - 2 * 60_000)),
+          },
+        ],
         order: { createdAt: 'ASC' },
         take: 50,
       });
       for (const document of stale) {
+        if (document.processingAttempts >= 12) continue;
         document.status = 'queued';
         await this.documents.save(document);
         await this.jobs.enqueue(document.id);

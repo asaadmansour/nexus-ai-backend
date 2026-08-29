@@ -228,6 +228,25 @@ export function assertDependencyIntegratedForSubmission(
   }
 }
 
+export function isSuccessfulSubmissionIntegration(result: unknown) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return false;
+  }
+  const integration = (result as Record<string, unknown>).integration;
+  if (
+    !integration ||
+    typeof integration !== 'object' ||
+    Array.isArray(integration)
+  ) {
+    return false;
+  }
+  const status = (integration as Record<string, unknown>).status;
+  return (
+    typeof status === 'string' &&
+    ['merged', 'default_branch_verified', 'not_applicable'].includes(status)
+  );
+}
+
 export function hasOnlyEvaluatorVisibilityGaps(
   evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
 ) {
@@ -958,34 +977,8 @@ export class DeliveryService {
       return { submission, review, revisionRequest, integrationRecovery };
     });
 
-    let releaseRequest: unknown = null;
-    let releaseError: string | null = null;
     let integration: unknown = null;
     let integrationError: string | null = null;
-    if (dto.decision === 'approved' && !result.integrationRecovery) {
-      try {
-        const pending =
-          await this.paymentReleaseRequestsService.createForApprovedSubmission(
-            result.submission,
-            requester,
-          );
-        releaseRequest = await this.paymentReleaseRequestsService.review(
-          pending.id,
-          {
-            decision: 'approved',
-            releaseNow: true,
-            reviewNotes:
-              'Automatically released after principal/admin acceptance of verified work.',
-          },
-          requester,
-        );
-      } catch (error) {
-        releaseError =
-          error instanceof Error
-            ? error.message
-            : 'Payment release request could not be created';
-      }
-    }
     if (dto.decision === 'approved') {
       try {
         integration = await this.projectHandoffsService.afterSubmissionApproved(
@@ -997,6 +990,29 @@ export class DeliveryService {
             ? error.message
             : 'Automatic integration failed';
       }
+    }
+
+    let releaseRequest: unknown = null;
+    let releaseError: string | null = null;
+    if (
+      dto.decision === 'approved' &&
+      isSuccessfulSubmissionIntegration(integration)
+    ) {
+      try {
+        releaseRequest =
+          await this.paymentReleaseRequestsService.releaseApprovedSubmission(
+            result.submission,
+            requester.sub,
+          );
+      } catch (error) {
+        releaseError =
+          error instanceof Error
+            ? error.message
+            : 'Payment release request could not be created';
+      }
+    } else if (dto.decision === 'approved') {
+      releaseError =
+        'Payment remains held in escrow until the approved work is integrated into the project main branch.';
     }
 
     await this.notifySubmissionReviewed(result.submission, result.review);

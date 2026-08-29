@@ -256,6 +256,51 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     return { inspected: runs.length, recovered };
   }
 
+  async recoverFailedRuns() {
+    const cutoff = new Date(Date.now() - 2 * 60_000);
+    const runs = await this.runRepo.find({
+      where: {
+        status: 'failed',
+        updatedAt: LessThanOrEqual(cutoff),
+      },
+      order: { updatedAt: 'ASC' },
+      take: 50,
+    });
+    let recovered = 0;
+    for (const run of runs) {
+      if (!run.submissionId) continue;
+      const latest = await this.runRepo.findOne({
+        where: { submissionId: run.submissionId },
+        order: { createdAt: 'DESC' },
+      });
+      if (!latest || latest.id !== run.id) continue;
+      const recoveryCount = this.automaticRecoveryCount(run.trigger);
+      if (recoveryCount >= 5) continue;
+      try {
+        await this.queueForSubmission(
+          run.submissionId,
+          {
+            mode: 'async',
+            reason: `automatic_recovery_${recoveryCount + 1}_of_${run.id}`,
+          },
+          'system',
+        );
+        recovered += 1;
+      } catch (error) {
+        this.logger.error(
+          `Could not automatically retry failed evaluation run ${run.id}: ${this.getErrorMessage(error)}`,
+        );
+      }
+    }
+    return { inspected: runs.length, recovered };
+  }
+
+  private automaticRecoveryCount(trigger: string | null) {
+    const match = trigger?.match(/^automatic_recovery_(\d+)_of_/);
+    const count = match ? Number(match[1]) : 0;
+    return Number.isSafeInteger(count) && count > 0 ? count : 0;
+  }
+
   private async ensureActiveRunDispatch(
     run: EvaluationRun,
     submission: ProjectSubmission,
@@ -350,7 +395,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       };
     }
 
-    if (agentJob) {
+    if (agentJob && agentJob.id !== replacement.id) {
       await this.markJobCancelled(agentJob.id, {
         reason: 'orphaned_evaluation_dispatch_replaced',
         replacementAgentJobId: replacement.id,

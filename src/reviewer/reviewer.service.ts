@@ -10,6 +10,7 @@ import { DeliveryService } from 'src/delivery/delivery.service';
 import { EvaluationsService } from 'src/evaluations/evaluations.service';
 import { ProjectHandoffsService } from 'src/delivery/project-handoffs.service';
 import { ReviewProjectHandoffDto } from 'src/delivery/dtos/review-project-handoff.dto';
+import { CreateProjectRatingDto } from 'src/delivery/dtos/create-project-rating.dto';
 import { ReviewSubmissionDto } from 'src/delivery/dtos/review-submission.dto';
 import { MatchingRun } from 'src/matching/entities/matching-run.entity';
 import { ReviewRunDto } from 'src/matching/dtos/review-run.dto';
@@ -273,6 +274,20 @@ export class ReviewerService {
   ) {
     await this.assertReviewer(projectId, userId);
     return this.handoffs.review(projectId, dto, userId);
+  }
+
+  async getImplementationRatings(projectId: string, userId: string) {
+    await this.assertReviewer(projectId, userId);
+    return this.handoffs.getReviewerRatings(projectId, userId);
+  }
+
+  async rateImplementation(
+    projectId: string,
+    dto: CreateProjectRatingDto,
+    userId: string,
+  ) {
+    await this.assertReviewer(projectId, userId);
+    return this.handoffs.rateImplementationContributor(projectId, dto, userId);
   }
 
   async getPlanningSubmission(id: string, userId: string) {

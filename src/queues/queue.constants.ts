@@ -45,10 +45,11 @@ export const AI_QUEUE_JOB_OPTIONS = {
 };
 
 export const AI_JOB_RECOVERY = {
-  STARTUP_DELAY_MS: 30000,
-  SCAN_INTERVAL_MS: 15 * 60 * 1000,
-  REQUEUE_AFTER_MS: 60 * 60 * 1000,
-  BATCH_SIZE: 20,
+  STARTUP_DELAY_MS: 15_000,
+  SCAN_INTERVAL_MS: 60_000,
+  REQUEUE_AFTER_MS: 2 * 60_000,
+  BATCH_SIZE: 50,
+  AUTOMATIC_RECOVERY_LIMIT: 5,
 } as const;
 
 function boundedConcurrency(name: string, fallback: number, maximum: number) {

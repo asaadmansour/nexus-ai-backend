@@ -41,10 +41,18 @@ export class EvaluationRunRecoveryService
     if (this.scanning) return;
     this.scanning = true;
     try {
-      const result = await this.evaluations.recoverOrphanedRuns();
-      if (result.recovered > 0) {
+      const [orphaned, failed] = await Promise.all([
+        this.evaluations.recoverOrphanedRuns(),
+        this.evaluations.recoverFailedRuns(),
+      ]);
+      if (orphaned.recovered > 0) {
         this.logger.warn(
-          `Recovered ${result.recovered} orphaned evaluation dispatches`,
+          `Recovered ${orphaned.recovered} orphaned evaluation dispatches`,
+        );
+      }
+      if (failed.recovered > 0) {
+        this.logger.warn(
+          `Automatically retried ${failed.recovered} failed submission evaluations`,
         );
       }
     } catch (error) {

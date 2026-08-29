@@ -294,6 +294,30 @@ export class PaymentReleaseRequestsService {
     );
   }
 
+  async releaseApprovedSubmission(
+    submission: ProjectSubmission,
+    approvedByUserId: string,
+  ) {
+    const automationRequester: JwtPayload = {
+      sub: approvedByUserId,
+      role: UserRole.ADMIN,
+    };
+    const request = await this.createForApprovedSubmission(
+      submission,
+      automationRequester,
+    );
+    return this.review(
+      request.id,
+      {
+        decision: 'approved',
+        releaseNow: true,
+        reviewNotes:
+          'Automatically released after verified work was approved and integrated.',
+      },
+      automationRequester,
+    );
+  }
+
   async createForApprovedPlanningSubmission(
     submission: ProjectPlanningSubmission,
     requester: JwtPayload,

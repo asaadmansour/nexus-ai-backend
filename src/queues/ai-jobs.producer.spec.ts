@@ -9,6 +9,42 @@ import {
 } from './queue.types';
 
 describe('AiJobsProducer', () => {
+  it('reuses the durable logical job when the same AI request is emitted twice', async () => {
+    const existing = {
+      id: 'existing-job-id',
+      status: 'completed',
+    } as AgentJob;
+    const createdInputs: Partial<AgentJob>[] = [];
+    const findOneJob = jest.fn().mockResolvedValue(existing);
+    const repository = {
+      create: jest.fn((input: Partial<AgentJob>) => {
+        createdInputs.push(input);
+        return input;
+      }),
+      save: jest.fn().mockRejectedValue({ code: '23505' }),
+      findOne: findOneJob,
+    } as unknown as Repository<AgentJob>;
+    const producer = new AiJobsProducer(
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      repository,
+    );
+
+    await expect(
+      producer.emitCvUploaded({
+        userId: 'user-id',
+        profileId: 'profile-id',
+        cvUrl: 'https://files.example/cv.pdf',
+      }),
+    ).resolves.toBe(existing);
+    expect(findOneJob).toHaveBeenCalledTimes(1);
+    expect(createdInputs[0].idempotencyKey).toMatch(/^cv_extraction:/);
+  });
+
   it('links evaluation jobs to delivery submissions, not planning submissions', async () => {
     const addJob = jest.fn().mockResolvedValue(undefined);
     const queue = {

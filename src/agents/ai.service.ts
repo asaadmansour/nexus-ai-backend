@@ -2245,7 +2245,7 @@ export class AiService {
     }
 
     try {
-      return await this.callFastApiValidateBrief(aiServiceUrl, dto);
+      return await this.callFastApiValidateBrief(dto);
     } catch (error) {
       this.logger.error(
         `AI service validate-brief failed: ${this.getErrorMessage(error)}`,
@@ -2327,38 +2327,75 @@ export class AiService {
     body: Record<string, unknown>,
     operation: string,
   ): Promise<T> {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      this.getAiServiceTimeoutMs(),
-    );
+    const requestBody = JSON.stringify(this.stripUndefined(body));
+    const idempotencyKey = `nexus-${createHash('sha256')
+      .update(`${path}:${requestBody}`)
+      .digest('hex')}`;
+    let lastError: unknown = new Error('AI service request did not run');
 
-    try {
-      const response = await fetch(`${this.getAiServiceUrl()}${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.stripUndefined(body)),
-        signal: controller.signal,
-      });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        this.getAiServiceTimeoutMs(),
+      );
+      try {
+        const response = await fetch(`${this.getAiServiceUrl()}${path}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+          },
+          body: requestBody,
+          signal: controller.signal,
+        });
+        if (response.ok) return (await response.json()) as T;
 
-      if (!response.ok) {
         const errorBody = await response.text();
-        throw new Error(
+        const error = new Error(
           `AI service failed with status ${response.status}: ${errorBody}`,
         );
+        lastError = error;
+        if (!this.isTransientAiStatus(response.status) || attempt === 3) {
+          throw error;
+        }
+      } catch (error) {
+        lastError = error;
+        const status = this.aiHttpStatus(error);
+        if (
+          attempt === 3 ||
+          (status !== null && !this.isTransientAiStatus(status))
+        ) {
+          break;
+        }
+      } finally {
+        clearTimeout(timeout);
       }
-
-      return (await response.json()) as T;
-    } catch (error) {
-      this.logger.error(
-        `AI service ${operation} failed: ${this.getErrorMessage(error)}`,
+      this.logger.warn(
+        `AI service ${operation} transient failure; retrying (${attempt}/3)`,
       );
-      throw new BadGatewayException(
-        `AI service ${operation} failed: ${this.getErrorMessage(error)}`,
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(2_000, 500 * 2 ** (attempt - 1))),
       );
-    } finally {
-      clearTimeout(timeout);
     }
+
+    this.logger.error(
+      `AI service ${operation} failed: ${this.getErrorMessage(lastError)}`,
+    );
+    throw new BadGatewayException(
+      `AI service ${operation} failed: ${this.getErrorMessage(lastError)}`,
+    );
+  }
+
+  private isTransientAiStatus(status: number) {
+    return status === 408 || status === 429 || status >= 500;
+  }
+
+  private aiHttpStatus(error: unknown) {
+    const match = this.getErrorMessage(error).match(
+      /^AI service failed with status (\d+):/,
+    );
+    return match ? Number(match[1]) : null;
   }
 
   private stripUndefined(body: Record<string, unknown>) {
@@ -2368,75 +2405,47 @@ export class AiService {
   }
 
   private async callFastApiValidateBrief(
-    aiServiceUrl: string,
     dto: BriefDto,
   ): Promise<ValidateBriefResult> {
-    const configuredTimeoutMs = Number(
-      this.configService.get<string>('AI_SERVICE_TIMEOUT_MS'),
+    const result = await this.postToFastApi<FastApiValidateBriefResponse>(
+      '/agents/validate-brief',
+      {
+        projectId: dto.projectId,
+        briefId: dto.briefId,
+        latestMessage: dto.briefText,
+        currentBrief: dto.currentBrief,
+        recentMessages: dto.recentMessages ?? [],
+      },
+      'validate-brief',
     );
-    const timeoutMs =
-      Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
-        ? configuredTimeoutMs
-        : 5000;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const missingFields = result.missingFields ?? [];
+    const extractedFields = this.sanitizeExtractedFields(
+      result.extractedFields,
+    );
+    const assistantReply = this.cleanAssistantReply(result.assistantReply);
 
-    try {
-      const response = await fetch(
-        `${aiServiceUrl.replace(/\/+$/, '')}/agents/validate-brief`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            projectId: dto.projectId,
-            briefId: dto.briefId,
-            latestMessage: dto.briefText,
-            currentBrief: dto.currentBrief,
-            recentMessages: dto.recentMessages ?? [],
-          }),
-          signal: controller.signal,
-        },
-      );
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `AI service failed with status ${response.status}: ${errorBody}`,
-        );
-      }
-
-      const result = (await response.json()) as FastApiValidateBriefResponse;
-      const missingFields = result.missingFields ?? [];
-      const extractedFields = this.sanitizeExtractedFields(
-        result.extractedFields,
-      );
-      const assistantReply = this.cleanAssistantReply(result.assistantReply);
-
-      return {
-        projectId: dto.projectId ?? null,
-        briefId: dto.briefId ?? null,
-        isComplete: result.isComplete ?? missingFields.length === 0,
-        completionPercentage:
-          result.completionPercentage ??
-          Math.max(40, 100 - missingFields.length * 20),
-        missingFields,
-        suggestedReply:
-          assistantReply ??
-          result.nextQuestion ??
-          'The brief has enough detail to continue.',
-        assistantReply,
-        extractedFields,
-        nextQuestionField: result.nextQuestionField ?? null,
-        fastPathUsed: result.fastPathUsed ?? false,
-        fastPathReason: result.fastPathReason ?? null,
-        extractionSource: result.extractionSource,
-        messageIntent: result.messageIntent ?? null,
-        replyMode: result.replyMode ?? null,
-        source: 'fastapi',
-      };
-    } finally {
-      clearTimeout(timeout);
-    }
+    return {
+      projectId: dto.projectId ?? null,
+      briefId: dto.briefId ?? null,
+      isComplete: result.isComplete ?? missingFields.length === 0,
+      completionPercentage:
+        result.completionPercentage ??
+        Math.max(40, 100 - missingFields.length * 20),
+      missingFields,
+      suggestedReply:
+        assistantReply ??
+        result.nextQuestion ??
+        'The brief has enough detail to continue.',
+      assistantReply,
+      extractedFields,
+      nextQuestionField: result.nextQuestionField ?? null,
+      fastPathUsed: result.fastPathUsed ?? false,
+      fastPathReason: result.fastPathReason ?? null,
+      extractionSource: result.extractionSource,
+      messageIntent: result.messageIntent ?? null,
+      replyMode: result.replyMode ?? null,
+      source: 'fastapi',
+    };
   }
 
   private getMockValidateBriefResult(dto: BriefDto): ValidateBriefResult {

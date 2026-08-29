@@ -34,6 +34,7 @@ import { ProjectSubmission } from 'src/projects/entities/project-submission.enti
 import { ProjectSpec } from 'src/projects/entities/project-spec.entity';
 import { ProjectTask } from 'src/projects/entities/project-task.entity';
 import { Project } from 'src/projects/entities/project.entity';
+import { ProjectSubmissionReview } from 'src/projects/entities/project-submission-review.entity';
 import { GithubService } from 'src/repositories/github.service';
 import { ClientHandoffDecisionDto } from './dtos/client-handoff-decision.dto';
 import { CreateProjectRatingDto } from './dtos/create-project-rating.dto';
@@ -52,6 +53,17 @@ type Contributor = {
   name: string;
   roleKeys: string[];
   rating: ProjectRating | null;
+};
+
+type ReviewerRatingContributor = Contributor & {
+  recommendedRating: number | null;
+  taskAverageScore: number | null;
+  tasks: Array<{
+    taskId: string;
+    title: string;
+    roleKey: string | null;
+    reviewScore: number | null;
+  }>;
 };
 
 @Injectable()
@@ -109,13 +121,28 @@ export class ProjectHandoffsService
       throw new ConflictException('Only approved work can be integrated');
     }
     const integration = await this.integrateSubmission(submission);
-    const handoff = await this.prepareHandoff(submission.projectId);
+    let handoff: ProjectHandoff | null = null;
+    let handoffError: string | null = null;
+    try {
+      handoff = await this.prepareHandoff(submission.projectId);
+    } catch (error) {
+      handoffError = this.error(error);
+      this.logger.error(
+        `Could not prepare final handoff after integrating submission ${submission.id}: ${handoffError}`,
+      );
+      await this.notifyAdmins(
+        submission.projectId,
+        'Final handoff preparation failed',
+        handoffError,
+      );
+    }
     if (handoff?.status === 'integrating') {
       setTimeout(() => void this.processHandoff(handoff.id), 0).unref();
     }
     return {
       integration,
       handoff: handoff ? this.publicHandoff(handoff) : null,
+      handoffError,
     };
   }
 
@@ -126,7 +153,14 @@ export class ProjectHandoffsService
       where: { projectId },
       relations: { repository: true },
     });
-    const contributors = await this.contributors(projectId, requester.sub);
+    if (handoff) {
+      handoff.project = project;
+      await this.ensureDeliveryContract(handoff);
+    }
+    const contributors = await this.clientRatingContributors(
+      projectId,
+      requester.sub,
+    );
     return {
       handoff: handoff ? this.publicHandoff(handoff) : null,
       contributors,
@@ -144,9 +178,72 @@ export class ProjectHandoffsService
   async getForReviewer(projectId: string) {
     const handoff = await this.handoffs.findOne({
       where: { projectId },
-      relations: { repository: true },
+      relations: { project: true, repository: true },
     });
+    if (handoff) await this.ensureDeliveryContract(handoff);
     return handoff ? this.publicHandoff(handoff) : null;
+  }
+
+  async getReviewerRatings(projectId: string, reviewerUserId: string) {
+    await this.assertPrincipalReviewer(projectId, reviewerUserId);
+    const project = await this.getProject(projectId);
+    const handoff = await this.handoffs.findOne({ where: { projectId } });
+    const contributors = await this.implementationContributors(
+      projectId,
+      reviewerUserId,
+    );
+    return {
+      ratingsOpen:
+        Boolean(
+          handoff &&
+          ['reviewer_review', 'client_review', 'accepted'].includes(
+            handoff.status,
+          ),
+        ) || project.status === ProjectStatus.COMPLETED,
+      contributors,
+    };
+  }
+
+  async rateImplementationContributor(
+    projectId: string,
+    dto: CreateProjectRatingDto,
+    reviewerUserId: string,
+  ) {
+    await this.assertPrincipalReviewer(projectId, reviewerUserId);
+    const project = await this.getProject(projectId);
+    const handoff = await this.handoffs.findOne({ where: { projectId } });
+    if (
+      (!handoff ||
+        !['reviewer_review', 'client_review', 'accepted'].includes(
+          handoff.status,
+        )) &&
+      project.status !== ProjectStatus.COMPLETED
+    ) {
+      throw new ConflictException(
+        'Implementation ratings open after final integrated verification completes',
+      );
+    }
+    const candidates = await this.implementationContributors(
+      projectId,
+      reviewerUserId,
+    );
+    const contributor = candidates.find(
+      (item) => item.userId === dto.ratedUserId,
+    );
+    if (!contributor) {
+      throw new BadRequestException(
+        'The selected freelancer has no approved implementation task in this project',
+      );
+    }
+    return this.saveContributorRating({
+      project,
+      contributor,
+      dto,
+      raterUserId: reviewerUserId,
+      eventType: 'principal_rating_received',
+      notificationTitle: 'Your principal reviewer submitted a project rating',
+      notificationType: 'principal_rating_received',
+    });
   }
 
   async review(
@@ -344,102 +441,27 @@ export class ProjectHandoffsService
     ) {
       throw new ConflictException('Ratings open after final client acceptance');
     }
-    const categories = dto.categoryRatings ?? null;
-    if (categories) {
-      for (const [key, value] of Object.entries(categories)) {
-        if (
-          !CATEGORY_KEYS.includes(key as (typeof CATEGORY_KEYS)[number]) ||
-          !Number.isInteger(value) ||
-          value < 1 ||
-          value > 5
-        ) {
-          throw new BadRequestException(
-            'Category ratings may contain quality, communication, and timeliness values from 1 to 5',
-          );
-        }
-      }
-    }
-    const candidates = await this.contributors(projectId, customerUserId);
+    const candidates = await this.clientRatingContributors(
+      projectId,
+      customerUserId,
+    );
     const contributor = candidates.find(
       (item) => item.userId === dto.ratedUserId,
     );
     if (!contributor) {
       throw new BadRequestException(
-        'The selected user did not contribute to this project',
+        'The selected user is not this project principal reviewer',
       );
     }
-
-    const rating = await this.dataSource.transaction(async (manager) => {
-      const existing = await manager.findOne(ProjectRating, {
-        where: {
-          projectId,
-          raterUserId: customerUserId,
-          ratedUserId: dto.ratedUserId,
-        },
-      });
-      if (existing) {
-        throw new ConflictException('You already rated this contributor');
-      }
-      const saved = await manager.save(
-        ProjectRating,
-        manager.create(ProjectRating, {
-          projectId,
-          raterUserId: customerUserId,
-          ratedUserId: dto.ratedUserId,
-          freelancerProfileId: contributor.freelancerProfileId,
-          roleKeys: contributor.roleKeys,
-          rating: dto.rating,
-          categoryRatings: categories,
-          comment: dto.comment?.trim() || null,
-        }),
-      );
-      const aggregate = await manager
-        .getRepository(ProjectRating)
-        .createQueryBuilder('rating')
-        .select('AVG(rating.rating)', 'average')
-        .addSelect('COUNT(*)', 'count')
-        .where('rating.freelancerProfileId = :profileId', {
-          profileId: contributor.freelancerProfileId,
-        })
-        .getRawOne<{ average: string; count: string }>();
-      const profile = await manager.findOne(FreelancerProfile, {
-        where: { id: contributor.freelancerProfileId },
-      });
-      const scoreDelta = (dto.rating - 3) * 2;
-      await manager.update(FreelancerProfile, contributor.freelancerProfileId, {
-        avgRating: Number(aggregate?.average ?? dto.rating).toFixed(2),
-        ratingsCount: Number(aggregate?.count ?? 1),
-        performanceScore: Math.max(
-          0,
-          Math.min(100, Number(profile?.performanceScore ?? 100) + scoreDelta),
-        ).toFixed(2),
-      });
-      await manager.save(
-        FreelancerPerformanceEvent,
-        manager.create(FreelancerPerformanceEvent, {
-          freelancerProfileId: contributor.freelancerProfileId,
-          projectId,
-          taskId: null,
-          eventType: 'client_rating_received',
-          scoreDelta: scoreDelta.toFixed(2),
-          moneyDelta: '0.00',
-          currency: project.quotedCurrency ?? project.currency,
-          reason: dto.comment?.trim() || `Client rating: ${dto.rating}/5`,
-          metadata: { ratingId: saved.id, categoryRatings: categories },
-        }),
-      );
-      return saved;
+    return this.saveContributorRating({
+      project,
+      contributor,
+      dto,
+      raterUserId: customerUserId,
+      eventType: 'client_rating_received',
+      notificationTitle: 'You received a client rating',
+      notificationType: 'client_rating_received',
     });
-    await this.notifications.createNotification({
-      userId: contributor.userId,
-      projectId,
-      title: 'You received a client rating',
-      body: `${project.title}: ${dto.rating}/5${dto.comment?.trim() ? ` — ${dto.comment.trim()}` : ''}`,
-      type: 'client_rating_received',
-      actionUrl: `/freelancer/projects/${projectId}`,
-      metadata: { ratingId: rating.id, rating: dto.rating },
-    });
-    return rating;
   }
 
   async retry(projectId: string) {
@@ -475,6 +497,7 @@ export class ProjectHandoffsService
   async reconcile() {
     await this.reconcileActivePullRequestUpdates();
     await this.reconcileSubmissionIntegrationFailures();
+    await this.reconcileIntegratedSubmissionPayouts();
     const due = await this.handoffs.find({
       where: {
         status: In(RETRYABLE_HANDOFF_STATUSES),
@@ -494,6 +517,38 @@ export class ProjectHandoffsService
       }
     }
     await this.reconcileClientReviewDeadlines();
+  }
+
+  private async reconcileIntegratedSubmissionPayouts() {
+    const submissions = await this.submissions
+      .createQueryBuilder('submission')
+      .where("submission.status = 'approved'")
+      .andWhere('submission.reviewed_by IS NOT NULL')
+      .andWhere(
+        "submission.metadata -> 'integration' ->> 'status' IN ('merged', 'default_branch_verified', 'not_applicable')",
+      )
+      .andWhere(
+        `NOT EXISTS (
+          SELECT 1 FROM payment_release_requests request
+          WHERE request.submission_id = submission.id
+            AND request.status IN ('released', 'rejected')
+        )`,
+      )
+      .orderBy('submission.updatedAt', 'ASC')
+      .take(20)
+      .getMany();
+    for (const submission of submissions) {
+      try {
+        await this.payments.releaseApprovedSubmission(
+          submission,
+          submission.reviewedBy!,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Could not reconcile payout for integrated submission ${submission.id}: ${this.error(error)}`,
+        );
+      }
+    }
   }
 
   private async reconcileActivePullRequestUpdates() {
@@ -1002,6 +1057,15 @@ export class ProjectHandoffsService
         completedAt: new Date().toISOString(),
       };
       handoff.auditBundle = execution.auditBundle;
+      handoff.metadata = {
+        ...(handoff.metadata ?? {}),
+        deliveryContract: this.buildDeliveryContract(
+          dto,
+          handoff,
+          execution.evaluatedCommitSha ?? head.sha,
+          Array.isArray(execution.result.rubric) ? execution.result.rubric : [],
+        ),
+      };
       handoff.lastError = null;
       handoff.nextAttemptAt = null;
       handoff.status = ['approve', 'manual_review'].includes(recommendation)
@@ -1150,6 +1214,82 @@ export class ProjectHandoffsService
     };
   }
 
+  private async ensureDeliveryContract(handoff: ProjectHandoff) {
+    if (this.record(handoff.metadata?.deliveryContract).verifiedAt) return;
+    if (!handoff.project || !handoff.repository) return;
+    const [taskRows, brief, spec] = await Promise.all([
+      this.tasks.find({ where: { projectId: handoff.projectId } }),
+      this.dataSource.getRepository(Brief).findOne({
+        where: { projectId: handoff.projectId },
+      }),
+      this.dataSource.getRepository(ProjectSpec).findOne({
+        where: { projectId: handoff.projectId },
+      }),
+    ]);
+    const commitSha =
+      handoff.integrationCommitSha ||
+      this.text(handoff.verificationReport?.evaluatedCommitSha);
+    if (!commitSha) return;
+    const dto = this.finalEvaluationDto(
+      handoff,
+      taskRows,
+      commitSha,
+      brief,
+      spec,
+    );
+    const verificationReport = this.record(handoff.verificationReport);
+    const rubric = Array.isArray(verificationReport.rubric)
+      ? verificationReport.rubric.map((item: unknown) => this.record(item))
+      : [];
+    handoff.metadata = {
+      ...(handoff.metadata ?? {}),
+      deliveryContract: this.buildDeliveryContract(
+        dto,
+        handoff,
+        commitSha,
+        rubric,
+      ),
+    };
+    await this.handoffs.save(handoff);
+  }
+
+  private buildDeliveryContract(
+    dto: EvaluateSubmissionDto,
+    handoff: ProjectHandoff,
+    commitSha: string,
+    rubric: Array<Record<string, unknown>>,
+  ) {
+    const evidenceFor = (prefix: string, index: number) => {
+      const item = rubric.find(
+        (candidate) => candidate.key === `${prefix}_${index + 1}`,
+      );
+      return item
+        ? {
+            status: this.text(item.status) || 'manual_review',
+            evidence: this.text(item.evidence) || null,
+          }
+        : { status: 'manual_review', evidence: null };
+    };
+    return {
+      deliverables: (dto.task.deliverables ?? []).map((title, index) => ({
+        title,
+        ...evidenceFor('deliverable', index),
+      })),
+      acceptanceCriteria: (dto.task.acceptanceCriteria ?? []).map(
+        (title, index) => ({ title, ...evidenceFor('acceptance', index) }),
+      ),
+      integrationChecks: (dto.task.integrationChecks ?? []).map(
+        (title, index) => ({ title, ...evidenceFor('integration', index) }),
+      ),
+      repositoryUrl: handoff.repository?.repoUrl ?? null,
+      branch: handoff.integrationBranch,
+      evaluatedCommitSha: commitSha,
+      verifiedAt:
+        this.text(handoff.verificationReport?.completedAt) ||
+        new Date().toISOString(),
+    };
+  }
+
   private async routeRevision(
     handoff: ProjectHandoff,
     taskId: string,
@@ -1230,6 +1370,241 @@ export class ProjectHandoffsService
         actionUrl: `/freelancer/projects/${handoff.projectId}/tasks/${taskId}`,
         metadata: { handoffId: handoff.id },
       });
+    }
+  }
+
+  private async clientRatingContributors(
+    projectId: string,
+    raterUserId: string,
+  ) {
+    const contributors = await this.contributors(projectId, raterUserId);
+    return contributors.filter((contributor) =>
+      contributor.roleKeys.includes('principal_reviewer'),
+    );
+  }
+
+  private async implementationContributors(
+    projectId: string,
+    raterUserId: string,
+  ): Promise<ReviewerRatingContributor[]> {
+    const approved = await this.submissions.find({
+      where: { projectId, status: 'approved' },
+      relations: { freelancerProfile: { user: true }, task: true },
+      order: { createdAt: 'ASC' },
+    });
+    const implementation = approved.filter(
+      (submission) =>
+        submission.taskId &&
+        submission.task &&
+        submission.freelancerProfile?.user,
+    );
+    if (!implementation.length) return [];
+    const submissionIds = implementation.map((submission) => submission.id);
+    const [reviews, existingRatings] = await Promise.all([
+      this.dataSource.getRepository(ProjectSubmissionReview).find({
+        where: {
+          submissionId: In(submissionIds),
+          decision: 'approved',
+        },
+        order: { createdAt: 'DESC' },
+      }),
+      this.ratings.find({ where: { projectId, raterUserId } }),
+    ]);
+    const reviewBySubmission = new Map<string, ProjectSubmissionReview>();
+    for (const review of reviews) {
+      if (!reviewBySubmission.has(review.submissionId)) {
+        reviewBySubmission.set(review.submissionId, review);
+      }
+    }
+    const ratingsByUser = new Map(
+      existingRatings.map((rating) => [rating.ratedUserId, rating]),
+    );
+    const contributors = new Map<
+      string,
+      Omit<ReviewerRatingContributor, 'recommendedRating' | 'taskAverageScore'>
+    >();
+    for (const submission of implementation) {
+      const profile = submission.freelancerProfile!;
+      const user = profile.user;
+      const savedReviewScore = reviewBySubmission.get(submission.id)?.score;
+      const reviewScoreValue =
+        savedReviewScore === null || savedReviewScore === undefined
+          ? Number.NaN
+          : Number(savedReviewScore);
+      const reviewScore = Number.isFinite(reviewScoreValue)
+        ? Math.max(
+            0,
+            Math.min(
+              100,
+              reviewScoreValue <= 5 ? reviewScoreValue * 20 : reviewScoreValue,
+            ),
+          )
+        : null;
+      const current = contributors.get(user.id) ?? {
+        userId: user.id,
+        freelancerProfileId: profile.id,
+        name: `${user.firstName} ${user.lastName}`.trim(),
+        roleKeys: [],
+        rating: ratingsByUser.get(user.id) ?? null,
+        tasks: [],
+      };
+      const roleKey = submission.task?.roleKey ?? 'implementation';
+      if (!current.roleKeys.includes(roleKey)) current.roleKeys.push(roleKey);
+      current.tasks.push({
+        taskId: submission.taskId!,
+        title: submission.task!.title,
+        roleKey: submission.task!.roleKey,
+        reviewScore,
+      });
+      contributors.set(user.id, current);
+    }
+    return [...contributors.values()]
+      .map((contributor) => {
+        const scores = contributor.tasks
+          .map((task) => task.reviewScore)
+          .filter((score): score is number => score !== null);
+        const taskAverageScore = scores.length
+          ? scores.reduce((total, score) => total + score, 0) / scores.length
+          : null;
+        return {
+          ...contributor,
+          roleKeys: contributor.roleKeys.sort(),
+          taskAverageScore,
+          recommendedRating:
+            taskAverageScore === null
+              ? null
+              : Math.max(1, Math.min(5, Math.round(taskAverageScore / 20))),
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  private async saveContributorRating(input: {
+    project: Project;
+    contributor: Contributor;
+    dto: CreateProjectRatingDto;
+    raterUserId: string;
+    eventType: string;
+    notificationTitle: string;
+    notificationType: string;
+  }) {
+    const categories = input.dto.categoryRatings ?? null;
+    if (categories) {
+      for (const [key, value] of Object.entries(categories)) {
+        if (
+          !CATEGORY_KEYS.includes(key as (typeof CATEGORY_KEYS)[number]) ||
+          !Number.isInteger(value) ||
+          value < 1 ||
+          value > 5
+        ) {
+          throw new BadRequestException(
+            'Category ratings may contain quality, communication, and timeliness values from 1 to 5',
+          );
+        }
+      }
+    }
+    const result = await this.dataSource.transaction(async (manager) => {
+      const existing = await manager.findOne(ProjectRating, {
+        where: {
+          projectId: input.project.id,
+          raterUserId: input.raterUserId,
+          ratedUserId: input.dto.ratedUserId,
+        },
+      });
+      if (existing) {
+        return { rating: existing, created: false };
+      }
+      const saved = await manager.save(
+        ProjectRating,
+        manager.create(ProjectRating, {
+          projectId: input.project.id,
+          raterUserId: input.raterUserId,
+          ratedUserId: input.dto.ratedUserId,
+          freelancerProfileId: input.contributor.freelancerProfileId,
+          roleKeys: input.contributor.roleKeys,
+          rating: input.dto.rating,
+          categoryRatings: categories,
+          comment: input.dto.comment?.trim() || null,
+        }),
+      );
+      const aggregate = await manager
+        .getRepository(ProjectRating)
+        .createQueryBuilder('rating')
+        .select('AVG(rating.rating)', 'average')
+        .addSelect('COUNT(*)', 'count')
+        .where('rating.freelancerProfileId = :profileId', {
+          profileId: input.contributor.freelancerProfileId,
+        })
+        .getRawOne<{ average: string; count: string }>();
+      const profile = await manager.findOne(FreelancerProfile, {
+        where: { id: input.contributor.freelancerProfileId },
+      });
+      const scoreDelta = (input.dto.rating - 3) * 2;
+      await manager.update(
+        FreelancerProfile,
+        input.contributor.freelancerProfileId,
+        {
+          avgRating: Number(aggregate?.average ?? input.dto.rating).toFixed(2),
+          ratingsCount: Number(aggregate?.count ?? 1),
+          performanceScore: Math.max(
+            0,
+            Math.min(
+              100,
+              Number(profile?.performanceScore ?? 100) + scoreDelta,
+            ),
+          ).toFixed(2),
+        },
+      );
+      await manager.save(
+        FreelancerPerformanceEvent,
+        manager.create(FreelancerPerformanceEvent, {
+          freelancerProfileId: input.contributor.freelancerProfileId,
+          projectId: input.project.id,
+          taskId: null,
+          eventType: input.eventType,
+          scoreDelta: scoreDelta.toFixed(2),
+          moneyDelta: '0.00',
+          currency: input.project.quotedCurrency ?? input.project.currency,
+          reason:
+            input.dto.comment?.trim() ||
+            `Project rating: ${input.dto.rating}/5`,
+          metadata: { ratingId: saved.id, categoryRatings: categories },
+        }),
+      );
+      return { rating: saved, created: true };
+    });
+    if (!result.created) return result.rating;
+    await this.notifications.createNotification({
+      userId: input.contributor.userId,
+      projectId: input.project.id,
+      title: input.notificationTitle,
+      body: `${input.project.title}: ${input.dto.rating}/5${input.dto.comment?.trim() ? ` — ${input.dto.comment.trim()}` : ''}`,
+      type: input.notificationType,
+      actionUrl: `/freelancer/projects/${input.project.id}`,
+      metadata: { ratingId: result.rating.id, rating: input.dto.rating },
+    });
+    return result.rating;
+  }
+
+  private async assertPrincipalReviewer(
+    projectId: string,
+    reviewerUserId: string,
+  ) {
+    const assignment = await this.dataSource
+      .getRepository(ProjectRoleAssignment)
+      .findOne({
+        where: {
+          projectId,
+          phase: 'governance',
+          roleKey: 'principal_reviewer',
+          status: In(['accepted', 'in_progress', 'completed']),
+        },
+        relations: { freelancerProfile: true },
+      });
+    if (assignment?.freelancerProfile?.userId !== reviewerUserId) {
+      throw new ForbiddenException(
+        'Only the assigned principal reviewer can rate implementation work',
+      );
     }
   }
 

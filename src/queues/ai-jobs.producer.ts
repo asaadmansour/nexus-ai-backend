@@ -3,10 +3,11 @@ import {
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
-import { Repository } from 'typeorm';
+import { DeepPartial, Repository } from 'typeorm';
 import { AgentJob } from 'src/agents/entities/agent-job.entity';
 import {
   AI_JOB_RETRY,
@@ -54,23 +55,27 @@ export class AiJobsProducer {
     projectId: string;
     requestedBy?: string | null;
   }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
-        agentName: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
-        jobType: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
-        projectId: input.projectId,
+    const prepared = await this.saveIdempotentJob({
+      agentName: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
+      jobType: AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
+      idempotencyKey: this.idempotencyKey(
+        AI_JOB_TYPES.PLANNING_SUBMISSION_EVALUATION,
+        input.submissionId,
+      ),
+      projectId: input.projectId,
+      submissionId: input.submissionId,
+      userId: input.requestedBy ?? null,
+      status: 'queued',
+      maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+      queueName: QUEUES.PLANNING_SUBMISSION_EVALUATION,
+      input: {
         submissionId: input.submissionId,
-        userId: input.requestedBy ?? null,
-        status: 'queued',
-        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
-        queueName: QUEUES.PLANNING_SUBMISSION_EVALUATION,
-        input: {
-          submissionId: input.submissionId,
-          projectId: input.projectId,
-          requestedBy: input.requestedBy ?? null,
-        },
-      }),
-    );
+        projectId: input.projectId,
+        requestedBy: input.requestedBy ?? null,
+      },
+    });
+    const agentJob = prepared.job;
+    if (prepared.reused) return agentJob;
 
     try {
       agentJob.queueJobId = agentJob.id;
@@ -104,10 +109,14 @@ export class AiJobsProducer {
     },
     repository: Repository<AgentJob> = this.agentJobRepository,
   ) {
-    return repository.save(
-      repository.create({
+    const prepared = await this.saveIdempotentJob(
+      {
         agentName: AI_JOB_TYPES.SUBMISSION_EVALUATION,
         jobType: AI_JOB_TYPES.SUBMISSION_EVALUATION,
+        idempotencyKey: this.idempotencyKey(
+          AI_JOB_TYPES.SUBMISSION_EVALUATION,
+          input.evaluationRunId,
+        ),
         projectId: input.projectId,
         projectSubmissionId: input.submissionId,
         taskId: input.taskId ?? null,
@@ -120,8 +129,10 @@ export class AiJobsProducer {
           projectId: input.projectId,
           taskId: input.taskId ?? null,
         },
-      }),
+      },
+      repository,
     );
+    return prepared.job;
   }
 
   async dispatchPreparedSubmissionEvaluation(
@@ -215,22 +226,27 @@ export class AiJobsProducer {
     profileId: string;
     cvUrl: string;
   }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
-        agentName: AI_JOB_TYPES.CV_EXTRACTION,
-        jobType: AI_JOB_TYPES.CV_EXTRACTION,
+    const prepared = await this.saveIdempotentJob({
+      agentName: AI_JOB_TYPES.CV_EXTRACTION,
+      jobType: AI_JOB_TYPES.CV_EXTRACTION,
+      idempotencyKey: this.idempotencyKey(
+        AI_JOB_TYPES.CV_EXTRACTION,
+        input.profileId,
+        input.cvUrl,
+      ),
+      userId: input.userId,
+      freelancerProfileId: input.profileId,
+      status: 'queued',
+      maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+      queueName: QUEUES.CV_EXTRACTION,
+      input: {
         userId: input.userId,
-        freelancerProfileId: input.profileId,
-        status: 'queued',
-        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
-        queueName: QUEUES.CV_EXTRACTION,
-        input: {
-          userId: input.userId,
-          profileId: input.profileId,
-          cvUrl: input.cvUrl,
-        },
-      }),
-    );
+        profileId: input.profileId,
+        cvUrl: input.cvUrl,
+      },
+    });
+    const agentJob = prepared.job;
+    if (prepared.reused) return agentJob;
 
     try {
       agentJob.queueJobId = agentJob.id;
@@ -259,24 +275,29 @@ export class AiJobsProducer {
     questionCount: number;
     durationSeconds: number;
   }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
-        agentName: AI_JOB_TYPES.ASSESSMENT_GENERATION,
-        jobType: AI_JOB_TYPES.ASSESSMENT_GENERATION,
+    const prepared = await this.saveIdempotentJob({
+      agentName: AI_JOB_TYPES.ASSESSMENT_GENERATION,
+      jobType: AI_JOB_TYPES.ASSESSMENT_GENERATION,
+      idempotencyKey: this.idempotencyKey(
+        AI_JOB_TYPES.ASSESSMENT_GENERATION,
+        input.profileId,
+        input.cvUrl,
+      ),
+      userId: input.userId,
+      freelancerProfileId: input.profileId,
+      status: 'queued',
+      maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+      queueName: QUEUES.ASSESSMENT_GENERATION,
+      input: {
         userId: input.userId,
-        freelancerProfileId: input.profileId,
-        status: 'queued',
-        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
-        queueName: QUEUES.ASSESSMENT_GENERATION,
-        input: {
-          userId: input.userId,
-          profileId: input.profileId,
-          cvUrl: input.cvUrl,
-          questionCount: input.questionCount,
-          durationSeconds: input.durationSeconds,
-        },
-      }),
-    );
+        profileId: input.profileId,
+        cvUrl: input.cvUrl,
+        questionCount: input.questionCount,
+        durationSeconds: input.durationSeconds,
+      },
+    });
+    const agentJob = prepared.job;
+    if (prepared.reused) return agentJob;
 
     try {
       agentJob.queueJobId = agentJob.id;
@@ -309,24 +330,30 @@ export class AiJobsProducer {
     assessmentId?: string | null;
     reason: string;
   }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
-        agentName: AI_JOB_TYPES.PROFILE_EMBEDDING,
-        jobType: AI_JOB_TYPES.PROFILE_EMBEDDING,
+    const prepared = await this.saveIdempotentJob({
+      agentName: AI_JOB_TYPES.PROFILE_EMBEDDING,
+      jobType: AI_JOB_TYPES.PROFILE_EMBEDDING,
+      idempotencyKey: this.idempotencyKey(
+        AI_JOB_TYPES.PROFILE_EMBEDDING,
+        input.profileId,
+        input.assessmentId ?? 'no-assessment',
+        input.reason,
+      ),
+      userId: input.userId,
+      freelancerProfileId: input.profileId,
+      assessmentId: input.assessmentId ?? null,
+      status: 'queued',
+      maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+      queueName: QUEUES.PROFILE_EMBEDDING,
+      input: {
         userId: input.userId,
-        freelancerProfileId: input.profileId,
+        profileId: input.profileId,
         assessmentId: input.assessmentId ?? null,
-        status: 'queued',
-        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
-        queueName: QUEUES.PROFILE_EMBEDDING,
-        input: {
-          userId: input.userId,
-          profileId: input.profileId,
-          assessmentId: input.assessmentId ?? null,
-          reason: input.reason,
-        },
-      }),
-    );
+        reason: input.reason,
+      },
+    });
+    const agentJob = prepared.job;
+    if (prepared.reused) return agentJob;
 
     try {
       agentJob.queueJobId = agentJob.id;
@@ -359,23 +386,30 @@ export class AiJobsProducer {
     requestedBy?: string | null;
     notes?: string | null;
   }) {
-    const agentJob = await this.agentJobRepository.save(
-      this.agentJobRepository.create({
-        agentName: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
-        jobType: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+    const prepared = await this.saveIdempotentJob({
+      agentName: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+      jobType: AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+      idempotencyKey: this.idempotencyKey(
+        AI_JOB_TYPES.PROJECT_PLAN_GENERATION,
+        input.projectId,
+        input.architectureSubmissionId ?? 'no-architecture',
+        input.uiuxSubmissionId ?? 'no-uiux',
+        input.notes ?? '',
+      ),
+      projectId: input.projectId,
+      status: 'queued',
+      maxAttempts: AI_JOB_RETRY.ATTEMPTS,
+      queueName: QUEUES.PROJECT_PLAN_GENERATION,
+      input: {
         projectId: input.projectId,
-        status: 'queued',
-        maxAttempts: AI_JOB_RETRY.ATTEMPTS,
-        queueName: QUEUES.PROJECT_PLAN_GENERATION,
-        input: {
-          projectId: input.projectId,
-          architectureSubmissionId: input.architectureSubmissionId ?? null,
-          uiuxSubmissionId: input.uiuxSubmissionId ?? null,
-          requestedBy: input.requestedBy ?? null,
-          notes: input.notes ?? null,
-        },
-      }),
-    );
+        architectureSubmissionId: input.architectureSubmissionId ?? null,
+        uiuxSubmissionId: input.uiuxSubmissionId ?? null,
+        requestedBy: input.requestedBy ?? null,
+        notes: input.notes ?? null,
+      },
+    });
+    const agentJob = prepared.job;
+    if (prepared.reused) return agentJob;
 
     try {
       // Link the durable row before publishing. Otherwise a fast worker can
@@ -402,6 +436,43 @@ export class AiJobsProducer {
       await this.markQueueAddFailed(agentJob, error);
       throw error;
     }
+  }
+
+  private async saveIdempotentJob(
+    input: DeepPartial<AgentJob>,
+    repository: Repository<AgentJob> = this.agentJobRepository,
+  ) {
+    const candidate = repository.create(input);
+    try {
+      return { job: await repository.save(candidate), reused: false };
+    } catch (error) {
+      if (this.databaseErrorCode(error) !== '23505' || !input.idempotencyKey) {
+        throw error;
+      }
+      const active = await repository.findOne({
+        where: {
+          idempotencyKey: String(input.idempotencyKey),
+        },
+        order: { createdAt: 'DESC' },
+      });
+      if (!active) throw error;
+      return { job: active, reused: true };
+    }
+  }
+
+  private idempotencyKey(jobType: string, ...parts: string[]) {
+    const digest = createHash('sha256')
+      .update(JSON.stringify(parts))
+      .digest('hex');
+    return `${jobType}:${digest}`;
+  }
+
+  private databaseErrorCode(error: unknown) {
+    if (!error || typeof error !== 'object') return null;
+    const direct = (error as { code?: unknown }).code;
+    if (typeof direct === 'string') return direct;
+    const driver = (error as { driverError?: { code?: unknown } }).driverError;
+    return typeof driver?.code === 'string' ? driver.code : null;
   }
 
   private getQueue<T>(queue: Queue<T> | null, queueName: string): Queue<T> {

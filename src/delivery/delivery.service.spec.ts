@@ -8,11 +8,30 @@ import {
   assertDependencyIntegratedForSubmission,
   assertTaskAcceptsDraft,
   isSubmissionIntegrationRecovery,
+  isSuccessfulSubmissionIntegration,
   resolveSubmissionReviewCriteria,
   validateSubmissionCriterionReviews,
 } from './delivery.service';
 
 describe('DeliveryService task/submission invariants', () => {
+  it('releases task escrow only after successful repository integration', () => {
+    expect(
+      isSuccessfulSubmissionIntegration({
+        integration: { status: 'merged' },
+      }),
+    ).toBe(true);
+    expect(
+      isSuccessfulSubmissionIntegration({
+        integration: { status: 'default_branch_verified' },
+      }),
+    ).toBe(true);
+    expect(
+      isSuccessfulSubmissionIntegration({
+        integration: { status: 'failed' },
+      }),
+    ).toBe(false);
+  });
+
   it('requires blocking dependencies to be approved and integrated into main', () => {
     expect(() =>
       assertDependencyIntegratedForSubmission(
