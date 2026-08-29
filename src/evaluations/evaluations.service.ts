@@ -1080,6 +1080,9 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           coalescedIntoEvaluationRunId: activeForSameCommit?.id ?? null,
         },
       };
+      if (priorCommitSha?.toLowerCase() !== commitSha) {
+        delete metadata.branchSync;
+      }
       if (approvedIntegrationRecovery) {
         metadata.integrationRecovery = {
           status: 'evaluation_pending',

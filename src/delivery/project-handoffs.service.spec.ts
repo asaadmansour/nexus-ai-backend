@@ -45,6 +45,7 @@ describe('ProjectHandoffsService', () => {
     const github = {
       getPullRequest: jest.fn(),
       isCommitAncestor: jest.fn(),
+      syncPullRequestWithBase: jest.fn(),
     };
     const evaluations = {
       requeueForRepositoryUpdate: jest.fn(),
@@ -218,6 +219,61 @@ describe('ProjectHandoffsService', () => {
       commitSha: updatedCommitSha,
       reason: 'evaluation_reconciler_pull_request_update',
     });
+  });
+
+  it('proactively updates a clean feature branch when main advances', async () => {
+    const { service, github, submissions, submissionQuery } = setup();
+    const commitSha = 'a'.repeat(40);
+    const baseSha = 'b'.repeat(40);
+    const submission = {
+      id: 'submission-id',
+      projectId: 'project-id',
+      status: 'under_review',
+      submissionType: 'pull_request',
+      commitSha,
+      pullRequestUrl: 'https://github.com/nexus-ai/project/pull/3',
+      metadata: {} as Record<string, unknown>,
+      repository: {
+        owner: 'nexus-ai',
+        repoName: 'project',
+        defaultBranch: 'main',
+      },
+    };
+    submissionQuery.getMany.mockResolvedValue([submission]);
+    github.getPullRequest.mockResolvedValue({
+      headSha: commitSha,
+      baseSha,
+    });
+    github.syncPullRequestWithBase.mockResolvedValue({
+      status: 'update_requested',
+      message: 'Updating pull request branch',
+      headSha: commitSha,
+      baseSha,
+    });
+    const reconcile = Reflect.get(
+      service,
+      'reconcileActivePullRequestUpdates',
+    ) as () => Promise<void>;
+
+    await reconcile.call(service);
+
+    expect(github.syncPullRequestWithBase).toHaveBeenCalledWith({
+      owner: 'nexus-ai',
+      repoName: 'project',
+      number: 3,
+      expectedHeadSha: commitSha,
+      requiredBaseRef: 'main',
+    });
+    expect(submissions.save).toHaveBeenCalledWith(submission);
+    const branchSync = submission.metadata.branchSync;
+    if (!branchSync || typeof branchSync !== 'object') {
+      throw new Error('Expected branch synchronization metadata');
+    }
+    expect((branchSync as Record<string, unknown>).status).toBe(
+      'update_requested',
+    );
+    expect((branchSync as Record<string, unknown>).headSha).toBe(commitSha);
+    expect((branchSync as Record<string, unknown>).baseSha).toBe(baseSha);
   });
 
   it('does not mark the handoff accepted when escrow finalization fails', async () => {

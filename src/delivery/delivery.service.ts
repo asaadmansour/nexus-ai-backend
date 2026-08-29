@@ -201,6 +201,33 @@ export function isSubmissionIntegrationRecovery(
   );
 }
 
+export function assertDependencyIntegratedForSubmission(
+  task: Pick<ProjectTask, 'status'>,
+  submission: Pick<ProjectSubmission, 'status' | 'metadata'> | null,
+) {
+  if (task.status !== 'done') {
+    throw new ConflictException(
+      'This task has unfinished blocking dependencies',
+    );
+  }
+  const integration = submission?.metadata?.integration;
+  const integrationStatus =
+    integration && typeof integration === 'object'
+      ? (integration as Record<string, unknown>).status
+      : null;
+  if (
+    submission?.status !== 'approved' ||
+    typeof integrationStatus !== 'string' ||
+    !['merged', 'default_branch_verified', 'not_applicable'].includes(
+      integrationStatus,
+    )
+  ) {
+    throw new ConflictException(
+      'A blocking dependency is approved but has not been integrated into the project main branch yet',
+    );
+  }
+}
+
 export function hasOnlyEvaluatorVisibilityGaps(
   evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
 ) {
@@ -1856,21 +1883,28 @@ export class DeliveryService {
       );
     }
 
-    const unfinishedDependencies = await manager
-      .getRepository(ProjectTask)
-      .createQueryBuilder('dependencyTask')
-      .innerJoin(
-        ProjectTaskDependency,
-        'dependency',
-        'dependency.depends_on_task_id = dependencyTask.id AND dependency.task_id = :taskId',
-        { taskId: task.id },
-      )
-      .where('dependencyTask.status != :done', { done: 'done' })
-      .andWhere("dependency.dependency_type IN ('blocks', 'after')")
-      .getCount();
-    if (unfinishedDependencies > 0) {
-      throw new ConflictException(
-        'This task has unfinished blocking dependencies',
+    const dependencies = await manager
+      .getRepository(ProjectTaskDependency)
+      .find({
+        where: {
+          taskId: task.id,
+          dependencyType: In(['blocks', 'after']),
+        },
+        relations: { dependsOnTask: true },
+      });
+    for (const dependency of dependencies) {
+      const latestApproved = await manager
+        .getRepository(ProjectSubmission)
+        .findOne({
+          where: {
+            taskId: dependency.dependsOnTaskId,
+            status: 'approved',
+          },
+          order: { version: 'DESC' },
+        });
+      assertDependencyIntegratedForSubmission(
+        dependency.dependsOnTask,
+        latestApproved,
       );
     }
 

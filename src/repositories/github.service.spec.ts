@@ -25,6 +25,69 @@ describe('GithubService read-only inspection', () => {
     );
   });
 
+  it('requests a safe feature-branch update when main advances cleanly', async () => {
+    const headSha = 'a'.repeat(40);
+    const baseSha = 'b'.repeat(40);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation((input, init) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        if (url.endsWith('/pulls/3') && init?.method === 'GET') {
+          return Promise.resolve(
+            Response.json({
+              number: 3,
+              state: 'open',
+              draft: false,
+              merged: false,
+              mergeable: true,
+              mergeable_state: 'clean',
+              head: { sha: headSha, ref: 'feature' },
+              base: { sha: baseSha, ref: 'main' },
+            }),
+          );
+        }
+        if (url.includes('/compare/')) {
+          return Promise.resolve(Response.json({ status: 'diverged' }));
+        }
+        if (url.endsWith('/pulls/3/update-branch') && init?.method === 'PUT') {
+          expect(
+            typeof init.body === 'string' ? JSON.parse(init.body) : null,
+          ).toEqual({ expected_head_sha: headSha });
+          return Promise.resolve(
+            Response.json(
+              { message: 'Updating pull request branch' },
+              { status: 202 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response('not found', { status: 404 }));
+      });
+
+    try {
+      await expect(
+        service().syncPullRequestWithBase({
+          owner: 'nexus-ai',
+          repoName: 'project',
+          number: 3,
+          expectedHeadSha: headSha,
+          requiredBaseRef: 'main',
+        }),
+      ).resolves.toEqual({
+        status: 'update_requested',
+        message: 'Updating pull request branch',
+        headSha,
+        baseSha,
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('builds complete source and static verification evidence for a tiny PR', async () => {
     const commitSha = 'a'.repeat(40);
     const fetchMock = jest

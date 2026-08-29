@@ -5,6 +5,7 @@ import {
   hasOnlyEvaluatorVisibilityGaps,
   assertSubmissionMatchesCurrentTask,
   assertImplementationWorkFunded,
+  assertDependencyIntegratedForSubmission,
   assertTaskAcceptsDraft,
   isSubmissionIntegrationRecovery,
   resolveSubmissionReviewCriteria,
@@ -12,6 +13,27 @@ import {
 } from './delivery.service';
 
 describe('DeliveryService task/submission invariants', () => {
+  it('requires blocking dependencies to be approved and integrated into main', () => {
+    expect(() =>
+      assertDependencyIntegratedForSubmission(
+        { status: 'done' },
+        {
+          status: 'approved',
+          metadata: { integration: { status: 'failed' } },
+        },
+      ),
+    ).toThrow('has not been integrated');
+    expect(() =>
+      assertDependencyIntegratedForSubmission(
+        { status: 'done' },
+        {
+          status: 'approved',
+          metadata: { integration: { status: 'merged' } },
+        },
+      ),
+    ).not.toThrow();
+  });
+
   it('recognizes a reopened integration without replaying first approval effects', () => {
     expect(
       isSubmissionIntegrationRecovery({

@@ -520,14 +520,59 @@ export class ProjectHandoffsService
           repoName: submission.repository.repoName,
           number,
         });
-        if (pullRequest.headSha === submission.commitSha.toLowerCase()) {
+        if (pullRequest.headSha !== submission.commitSha.toLowerCase()) {
+          await this.evaluations.requeueForRepositoryUpdate({
+            submissionId: submission.id,
+            commitSha: pullRequest.headSha,
+            reason: 'evaluation_reconciler_pull_request_update',
+          });
           continue;
         }
-        await this.evaluations.requeueForRepositoryUpdate({
-          submissionId: submission.id,
-          commitSha: pullRequest.headSha,
-          reason: 'evaluation_reconciler_pull_request_update',
+        const priorSync = this.record(submission.metadata?.branchSync);
+        if (
+          this.text(priorSync.status) === 'conflict' &&
+          this.text(priorSync.headSha) === pullRequest.headSha &&
+          this.text(priorSync.baseSha) === pullRequest.baseSha
+        ) {
+          continue;
+        }
+        const sync = await this.github.syncPullRequestWithBase({
+          owner: submission.repository.owner,
+          repoName: submission.repository.repoName,
+          number,
+          expectedHeadSha: pullRequest.headSha,
+          requiredBaseRef: submission.repository.defaultBranch,
         });
+        if (sync.status === 'current') continue;
+        const now = new Date().toISOString();
+        submission.metadata = {
+          ...(submission.metadata ?? {}),
+          branchSync: {
+            status: sync.status,
+            message: sync.message,
+            headSha: sync.headSha,
+            baseSha: sync.baseSha,
+            checkedAt: now,
+          },
+        };
+        await this.submissions.save(submission);
+        if (sync.status === 'conflict') {
+          await Promise.all([
+            this.notifySubmissionOwnerOfBranchConflict(
+              submission,
+              sync.message,
+            ),
+            this.notifyPrincipal(
+              submission.projectId,
+              'A pull request needs conflict resolution',
+              (submission.title ?? 'Implementation work') +
+                ' conflicts with ' +
+                submission.repository.defaultBranch +
+                '. The freelancer has been asked to update the feature branch.',
+              'submission_branch_conflict',
+            ),
+          ]);
+        }
       } catch (error) {
         this.logger.warn(
           'Could not inspect the active pull request for submission ' +
@@ -1264,6 +1309,38 @@ export class ProjectHandoffsService
       actionUrl: submission.taskId
         ? `/freelancer/projects/${submission.projectId}/tasks/${submission.taskId}`
         : `/freelancer/projects/${submission.projectId}`,
+      metadata: {
+        submissionId: submission.id,
+        pullRequestUrl: submission.pullRequestUrl,
+        branchName: submission.branchName,
+      },
+    });
+  }
+
+  private async notifySubmissionOwnerOfBranchConflict(
+    submission: ProjectSubmission,
+    message: string | null,
+  ) {
+    if (!submission.freelancerProfileId) return;
+    const profile = await this.dataSource
+      .getRepository(FreelancerProfile)
+      .findOneBy({ id: submission.freelancerProfileId });
+    if (!profile) return;
+    await this.notifications.createNotification({
+      userId: profile.userId,
+      projectId: submission.projectId,
+      taskId: submission.taskId,
+      title: 'Update your feature branch from main',
+      body:
+        (message ?? 'Your pull request has merge conflicts') +
+        '. Resolve the conflicts on your feature branch and push it. Nexus will reevaluate the new commit automatically.',
+      type: 'submission_branch_conflict',
+      actionUrl: submission.taskId
+        ? '/freelancer/projects/' +
+          submission.projectId +
+          '/tasks/' +
+          submission.taskId
+        : '/freelancer/projects/' + submission.projectId,
       metadata: {
         submissionId: submission.id,
         pullRequestUrl: submission.pullRequestUrl,

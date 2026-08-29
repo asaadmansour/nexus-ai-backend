@@ -56,6 +56,11 @@ type GithubMergePullRequestResponse = {
   message?: string;
 };
 
+type GithubUpdatePullRequestBranchResponse = {
+  message?: string;
+  url?: string;
+};
+
 type GithubPullFileResponse = {
   filename?: string;
   previous_filename?: string;
@@ -132,6 +137,13 @@ export type GithubPullRequestTarget = {
   headRef: string | null;
   baseSha: string;
   baseRef: string | null;
+};
+
+export type GithubPullRequestBranchSyncResult = {
+  status: 'current' | 'update_requested' | 'conflict';
+  message: string | null;
+  headSha: string;
+  baseSha: string;
 };
 
 export type GithubMergePullRequestResult = {
@@ -408,6 +420,99 @@ export class GithubService {
       `compare commits ${input.owner}/${input.repoName}`,
     );
     return payload.status === 'ahead' || payload.status === 'identical';
+  }
+
+  async syncPullRequestWithBase(input: {
+    owner: string;
+    repoName: string;
+    number: number;
+    expectedHeadSha: string;
+    requiredBaseRef: string;
+  }): Promise<GithubPullRequestBranchSyncResult> {
+    const current = await this.getPullRequest(input);
+    if (current.headSha !== input.expectedHeadSha.toLowerCase()) {
+      throw new ServiceUnavailableException(
+        'GitHub pull-request head changed before its base could be synchronized',
+      );
+    }
+    if (
+      current.state !== 'open' ||
+      current.draft ||
+      current.baseRef !== input.requiredBaseRef
+    ) {
+      return {
+        status: 'current',
+        message: null,
+        headSha: current.headSha,
+        baseSha: current.baseSha,
+      };
+    }
+    if (current.mergeable === false || current.mergeableState === 'dirty') {
+      return {
+        status: 'conflict',
+        message: 'The feature branch conflicts with ' + input.requiredBaseRef,
+        headSha: current.headSha,
+        baseSha: current.baseSha,
+      };
+    }
+    if (
+      await this.isCommitAncestor({
+        owner: input.owner,
+        repoName: input.repoName,
+        ancestorSha: current.baseSha,
+        descendantSha: current.headSha,
+      })
+    ) {
+      return {
+        status: 'current',
+        message: null,
+        headSha: current.headSha,
+        baseSha: current.baseSha,
+      };
+    }
+
+    const response = await this.request(
+      '/repos/' +
+        encodeURIComponent(input.owner) +
+        '/' +
+        encodeURIComponent(input.repoName) +
+        '/pulls/' +
+        input.number +
+        '/update-branch',
+      {
+        method: 'PUT',
+        body: { expected_head_sha: current.headSha },
+      },
+    );
+    if (response.status === 409 || response.status === 422) {
+      const payload = (await response
+        .json()
+        .catch(() => ({}))) as GithubUpdatePullRequestBranchResponse;
+      return {
+        status: 'conflict',
+        message:
+          payload.message ??
+          'GitHub could not update the feature branch from ' +
+            input.requiredBaseRef,
+        headSha: current.headSha,
+        baseSha: current.baseSha,
+      };
+    }
+    const payload = await this.parse<GithubUpdatePullRequestBranchResponse>(
+      response,
+      'update pull request branch ' +
+        input.owner +
+        '/' +
+        input.repoName +
+        '#' +
+        input.number,
+    );
+    return {
+      status: 'update_requested',
+      message: payload.message ?? null,
+      headSha: current.headSha,
+      baseSha: current.baseSha,
+    };
   }
 
   async mergePullRequest(input: {
