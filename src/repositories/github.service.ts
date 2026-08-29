@@ -43,6 +43,8 @@ type GithubPullRequestResponse = {
   state?: string;
   draft?: boolean;
   merged?: boolean;
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
   merge_commit_sha?: string | null;
   head?: { sha?: string; ref?: string };
   base?: { sha?: string; ref?: string };
@@ -123,6 +125,8 @@ export type GithubPullRequestTarget = {
   state: string | null;
   draft: boolean;
   merged: boolean;
+  mergeable: boolean | null;
+  mergeableState: string | null;
   mergeCommitSha: string | null;
   headSha: string;
   headRef: string | null;
@@ -334,6 +338,9 @@ export class GithubService {
       state: payload.state ?? null,
       draft: payload.draft === true,
       merged: payload.merged === true,
+      mergeable:
+        typeof payload.mergeable === 'boolean' ? payload.mergeable : null,
+      mergeableState: payload.mergeable_state ?? null,
       mergeCommitSha:
         typeof payload.merge_commit_sha === 'string' &&
         /^[a-f0-9]{40}$/i.test(payload.merge_commit_sha)
@@ -438,7 +445,10 @@ export class GithubService {
         method: 'PUT',
         body: {
           sha: current.headSha,
-          merge_method: 'squash',
+          // Preserve prerequisite commit ancestry. Squashing an accepted base
+          // task makes its descendants look unrelated and creates avoidable
+          // conflicts in stacked implementation pull requests.
+          merge_method: 'merge',
           commit_title:
             input.commitTitle ?? `Integrate approved work (#${input.number})`,
         },

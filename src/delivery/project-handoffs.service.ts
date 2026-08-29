@@ -17,6 +17,7 @@ import { UserRole } from 'src/common/enums/user-role.enum';
 import { AutomationIncidentsService } from 'src/automation/automation-incidents.service';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
 import { ImplementationEvaluationSandboxService } from 'src/evaluations/implementation-evaluation-sandbox.service';
+import { EvaluationsService } from 'src/evaluations/evaluations.service';
 import { buildImplementationEvaluationRubric } from 'src/evaluations/submission-quality-criteria';
 import { FreelancerProfile } from 'src/freelancers/entities/freelancer-profile.entity';
 import { FreelancerPerformanceEvent } from 'src/freelancers/entities/freelancer-performance-event.entity';
@@ -64,6 +65,7 @@ export class ProjectHandoffsService
     private readonly config: ConfigService,
     private readonly github: GithubService,
     private readonly sandbox: ImplementationEvaluationSandboxService,
+    private readonly evaluations: EvaluationsService,
     private readonly notifications: NotificationsService,
     private readonly payments: PaymentReleaseRequestsService,
     private readonly incidents: AutomationIncidentsService,
@@ -470,6 +472,7 @@ export class ProjectHandoffsService
   }
 
   async reconcile() {
+    await this.reconcileSubmissionIntegrationFailures();
     const due = await this.handoffs.find({
       where: {
         status: In(RETRYABLE_HANDOFF_STATUSES),
@@ -489,6 +492,90 @@ export class ProjectHandoffsService
       }
     }
     await this.reconcileClientReviewDeadlines();
+  }
+
+  private async reconcileSubmissionIntegrationFailures() {
+    const failures = await this.submissions
+      .createQueryBuilder('submission')
+      .leftJoinAndSelect('submission.repository', 'repository')
+      .where("submission.status = 'approved'")
+      .andWhere("submission.metadata -> 'integration' ->> 'status' = 'failed'")
+      .andWhere(
+        "submission.metadata -> 'integration' ->> 'freelancerNotifiedAt' IS NULL",
+      )
+      .orderBy('submission.updatedAt', 'ASC')
+      .take(20)
+      .getMany();
+    for (const submission of failures) {
+      const integration = this.record(submission.metadata?.integration);
+      try {
+        if (await this.recoverApprovedIntegrationUpdate(submission)) continue;
+      } catch (error) {
+        this.logger.warn(
+          'Could not inspect the integration recovery for submission ' +
+            submission.id +
+            ': ' +
+            this.error(error),
+        );
+      }
+      try {
+        await this.notifySubmissionOwnerOfIntegrationFailure(
+          submission,
+          this.text(integration.error) ||
+            'GitHub could not merge the approved pull request',
+        );
+        submission.metadata = {
+          ...(submission.metadata ?? {}),
+          integration: {
+            ...integration,
+            freelancerNotifiedAt: new Date().toISOString(),
+          },
+        };
+        await this.submissions.save(submission);
+      } catch (error) {
+        this.logger.warn(
+          'Could not notify the owner of submission ' +
+            submission.id +
+            ': ' +
+            this.error(error),
+        );
+      }
+    }
+  }
+
+  private async recoverApprovedIntegrationUpdate(
+    submission: ProjectSubmission,
+  ) {
+    if (
+      !submission.repository ||
+      !submission.pullRequestUrl ||
+      !submission.commitSha
+    ) {
+      return false;
+    }
+    const number = this.pullRequestNumber(submission.pullRequestUrl);
+    const pullRequest = await this.github.getPullRequest({
+      owner: submission.repository.owner,
+      repoName: submission.repository.repoName,
+      number,
+    });
+    if (pullRequest.headSha === submission.commitSha.toLowerCase()) {
+      return false;
+    }
+    const preservesApprovedCommit = await this.github.isCommitAncestor({
+      owner: submission.repository.owner,
+      repoName: submission.repository.repoName,
+      ancestorSha: submission.commitSha,
+      descendantSha: pullRequest.headSha,
+    });
+    if (!preservesApprovedCommit) return false;
+    const recovered = await this.evaluations.requeueForRepositoryUpdate({
+      submissionId: submission.id,
+      commitSha: pullRequest.headSha,
+      reason: 'integration_reconciler_pull_request_update',
+      allowApprovedIntegrationRecovery: true,
+    });
+    return Boolean(recovered);
   }
 
   private async reconcileClientReviewDeadlines() {
@@ -601,7 +688,7 @@ export class ProjectHandoffsService
       return integration;
     } catch (error) {
       const message = this.error(error);
-      const integration = {
+      const integration: Record<string, unknown> = {
         status: 'failed',
         failedAt: now,
         retryable: true,
@@ -618,6 +705,22 @@ export class ProjectHandoffsService
           'Approved work needs integration attention',
           message,
           'submission_integration_failed',
+        );
+      }
+      try {
+        await this.notifySubmissionOwnerOfIntegrationFailure(
+          submission,
+          message,
+        );
+        integration.freelancerNotifiedAt = now;
+        submission.metadata = { ...(submission.metadata ?? {}), integration };
+        await this.submissions.save(submission);
+      } catch (notificationError) {
+        this.logger.warn(
+          'Could not notify the owner of submission ' +
+            submission.id +
+            ': ' +
+            this.error(notificationError),
         );
       }
       return integration;
@@ -1097,6 +1200,33 @@ export class ProjectHandoffsService
       actionUrl: `/reviewer/projects/${projectId}`,
     });
     return true;
+  }
+
+  private async notifySubmissionOwnerOfIntegrationFailure(
+    submission: ProjectSubmission,
+    message: string,
+  ) {
+    if (!submission.freelancerProfileId) return;
+    const profile = await this.dataSource
+      .getRepository(FreelancerProfile)
+      .findOneBy({ id: submission.freelancerProfileId });
+    if (!profile) return;
+    await this.notifications.createNotification({
+      userId: profile.userId,
+      projectId: submission.projectId,
+      taskId: submission.taskId,
+      title: 'Resolve your pull request conflicts',
+      body: `${message}. Update your feature branch from main, resolve the conflicts, and push it. Nexus will evaluate the new commit automatically; your approval and payment stay recorded.`,
+      type: 'submission_integration_failed',
+      actionUrl: submission.taskId
+        ? `/freelancer/projects/${submission.projectId}/tasks/${submission.taskId}`
+        : `/freelancer/projects/${submission.projectId}`,
+      metadata: {
+        submissionId: submission.id,
+        pullRequestUrl: submission.pullRequestUrl,
+        branchName: submission.branchName,
+      },
+    });
   }
 
   private async notifyContributors(

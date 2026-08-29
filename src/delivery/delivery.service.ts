@@ -63,6 +63,7 @@ type PullRequestReviewReadiness = {
   targetReady: boolean;
   historyReady: boolean;
   evaluationCurrent: boolean;
+  mergeConflict: boolean;
   canRetarget: boolean;
   blocker: string | null;
   error: string | null;
@@ -186,6 +187,18 @@ export function assertSubmissionCanBeReviewed(
       'Only submitted, under-review, or automatically bounced work can be reviewed',
     );
   }
+}
+
+export function isSubmissionIntegrationRecovery(
+  submission: Pick<ProjectSubmission, 'metadata'>,
+) {
+  const recovery = submission.metadata?.integrationRecovery;
+  if (!recovery || typeof recovery !== 'object') return false;
+  const status = (recovery as Record<string, unknown>).status;
+  return (
+    typeof status === 'string' &&
+    ['evaluation_pending', 'under_review'].includes(status)
+  );
 }
 
 export function hasOnlyEvaluatorVisibilityGaps(
@@ -766,6 +779,7 @@ export class DeliveryService {
         latestEvaluation,
         dto.criteriaReviews,
       );
+      const integrationRecovery = isSubmissionIntegrationRecovery(submission);
 
       const now = new Date();
       const review = await manager.getRepository(ProjectSubmissionReview).save({
@@ -805,6 +819,21 @@ export class DeliveryService {
       submission.reviewedAt = now;
       submission.approvedAt = dto.decision === 'approved' ? now : null;
       submission.rejectedAt = dto.decision === 'rejected' ? now : null;
+      if (integrationRecovery) {
+        const recovery = submission.metadata?.integrationRecovery as Record<
+          string,
+          unknown
+        >;
+        submission.metadata = {
+          ...(submission.metadata ?? {}),
+          integrationRecovery: {
+            ...recovery,
+            status: dto.decision === 'approved' ? 'reapproved' : dto.decision,
+            decidedAt: now.toISOString(),
+            decidedBy: requester.sub,
+          },
+        };
+      }
       await submissionRepo.save(submission);
 
       if (submission.taskId) {
@@ -815,7 +844,7 @@ export class DeliveryService {
         });
       }
 
-      if (submission.freelancerProfileId) {
+      if (submission.freelancerProfileId && !integrationRecovery) {
         const profile = await manager.findOne(FreelancerProfile, {
           where: { id: submission.freelancerProfileId },
         });
@@ -899,14 +928,14 @@ export class DeliveryService {
         await this.updateMilestoneAfterApproval(manager, submission);
       }
 
-      return { submission, review, revisionRequest };
+      return { submission, review, revisionRequest, integrationRecovery };
     });
 
     let releaseRequest: unknown = null;
     let releaseError: string | null = null;
     let integration: unknown = null;
     let integrationError: string | null = null;
-    if (dto.decision === 'approved') {
+    if (dto.decision === 'approved' && !result.integrationRecovery) {
       try {
         const pending =
           await this.paymentReleaseRequestsService.createForApprovedSubmission(
@@ -929,6 +958,8 @@ export class DeliveryService {
             ? error.message
             : 'Payment release request could not be created';
       }
+    }
+    if (dto.decision === 'approved') {
       try {
         integration = await this.projectHandoffsService.afterSubmissionApproved(
           result.submission.id,
@@ -1011,6 +1042,14 @@ export class DeliveryService {
         `Approval is blocked because the pull request must target ${submission.repository.defaultBranch}`,
       );
     }
+    if (
+      pullRequest.mergeable === false ||
+      pullRequest.mergeableState === 'dirty'
+    ) {
+      throw new ConflictException(
+        'Approval is blocked because this pull request has merge conflicts. Update the feature branch from main, resolve the conflicts, push it, and wait for the new evaluation.',
+      );
+    }
     const embeddedPrerequisite = await this.findEmbeddedUnintegratedSubmission(
       submission,
       pullRequest,
@@ -1074,6 +1113,9 @@ export class DeliveryService {
         number,
       });
       const targetReady = pullRequest.baseRef === requiredBaseRef;
+      const mergeConflict =
+        pullRequest.mergeable === false ||
+        pullRequest.mergeableState === 'dirty';
       const embeddedPrerequisite = targetReady
         ? await this.findEmbeddedUnintegratedSubmission(submission, pullRequest)
         : null;
@@ -1093,7 +1135,9 @@ export class DeliveryService {
         prerequisite && this.prerequisiteIsIntegrated(prerequisite),
       );
       let blocker: string | null = null;
-      if (embeddedPrerequisite) {
+      if (mergeConflict) {
+        blocker = `This pull request conflicts with ${requiredBaseRef}. Resolve the conflicts on ${pullRequest.headRef ?? 'the feature branch'} and push it; Nexus will evaluate the new commit automatically.`;
+      } else if (embeddedPrerequisite) {
         blocker = `Approve and integrate ${embeddedPrerequisite.title ?? 'the embedded project submission'} before approving this pull request.`;
       } else if (!targetReady) {
         blocker = canRetarget
@@ -1113,6 +1157,7 @@ export class DeliveryService {
         targetReady,
         historyReady,
         evaluationCurrent,
+        mergeConflict,
         canRetarget,
         blocker,
         error: null,
@@ -1134,6 +1179,7 @@ export class DeliveryService {
         targetReady: false,
         historyReady: false,
         evaluationCurrent: false,
+        mergeConflict: false,
         canRetarget: false,
         blocker: 'Pull-request readiness could not be verified.',
         error: error instanceof Error ? error.message : 'GitHub check failed',

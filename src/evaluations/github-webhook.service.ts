@@ -11,6 +11,7 @@ import { Repository } from 'typeorm';
 import { GithubWebhookEvent } from 'src/projects/entities/github-webhook-event.entity';
 import { ProjectRepository } from 'src/projects/entities/project-repository.entity';
 import { ProjectSubmission } from 'src/projects/entities/project-submission.entity';
+import { GithubService } from 'src/repositories/github.service';
 import { EvaluationsService } from './evaluations.service';
 
 const ACTIVE_SUBMISSION_STATUSES = ['submitted', 'under_review'];
@@ -20,6 +21,7 @@ export class GithubWebhookService {
   constructor(
     private readonly config: ConfigService,
     private readonly evaluations: EvaluationsService,
+    private readonly github: GithubService,
     @InjectRepository(GithubWebhookEvent)
     private readonly eventRepo: Repository<GithubWebhookEvent>,
     @InjectRepository(ProjectRepository)
@@ -206,10 +208,30 @@ export class GithubWebhookService {
     const submissions = await this.findTargetSubmissions(repository, target);
     let queued = 0;
     for (const submission of submissions) {
+      const approvedIntegrationRecovery =
+        submission.status === 'approved' &&
+        this.integrationStatus(submission) === 'failed' &&
+        submission.commitSha?.toLowerCase() !== target.commitSha;
+      if (submission.status === 'approved' && !approvedIntegrationRecovery) {
+        continue;
+      }
+      if (
+        approvedIntegrationRecovery &&
+        submission.commitSha &&
+        !(await this.github.isCommitAncestor({
+          owner: repository.owner,
+          repoName: repository.repoName,
+          ancestorSha: submission.commitSha,
+          descendantSha: target.commitSha,
+        }))
+      ) {
+        continue;
+      }
       const result = await this.evaluations.requeueForRepositoryUpdate({
         submissionId: submission.id,
         commitSha: target.commitSha,
         reason: `github_${eventType}_${target.action}`,
+        allowApprovedIntegrationRecovery: approvedIntegrationRecovery,
       });
       if (result && (!('reused' in result) || result.reused !== true))
         queued += 1;
@@ -324,7 +346,7 @@ export class GithubWebhookService {
         repositoryId: repository.id,
       })
       .andWhere('submission.status IN (:...statuses)', {
-        statuses: ACTIVE_SUBMISSION_STATUSES,
+        statuses: [...ACTIVE_SUBMISSION_STATUSES, 'approved'],
       });
     if (target.pullRequestNumber) {
       qb.andWhere('submission.pullRequestUrl ~ :pullPattern', {
@@ -346,6 +368,13 @@ export class GithubWebhookService {
   private validSha(value: unknown) {
     const sha = this.string(value)?.toLowerCase();
     return sha && /^[a-f0-9]{40}$/.test(sha) ? sha : null;
+  }
+
+  private integrationStatus(submission: ProjectSubmission) {
+    const integration = submission.metadata?.integration;
+    if (!integration || typeof integration !== 'object') return null;
+    const status = (integration as Record<string, unknown>).status;
+    return typeof status === 'string' ? status : null;
   }
 
   private string(value: unknown) {

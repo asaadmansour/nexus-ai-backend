@@ -33,6 +33,7 @@ describe('GithubWebhookService', () => {
     const service = new GithubWebhookService(
       { get: jest.fn().mockReturnValue(secret) } as unknown as ConfigService,
       { requeueForRepositoryUpdate: jest.fn() } as never,
+      { isCommitAncestor: jest.fn().mockResolvedValue(true) } as never,
       events as never,
       {} as never,
       {} as never,

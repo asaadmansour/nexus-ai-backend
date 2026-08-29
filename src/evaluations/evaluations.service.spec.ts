@@ -143,6 +143,7 @@ describe('EvaluationsService GitHub update coalescing', () => {
     const runRepo = {
       find: jest.fn().mockResolvedValue([activeRun]),
       save: jest.fn(),
+      update: jest.fn(),
     };
     const service = Object.create(
       EvaluationsService.prototype,
@@ -174,6 +175,105 @@ describe('EvaluationsService GitHub update coalescing', () => {
     expect(runRepo.save).not.toHaveBeenCalled();
     expect(submissionRepo.save).toHaveBeenCalledWith(
       expect.objectContaining({ commitSha }),
+    );
+  });
+
+  it('reopens only the failed integration at the new descendant commit', async () => {
+    const previousCommitSha = 'a'.repeat(40);
+    const commitSha = 'b'.repeat(40);
+    const submission = {
+      id: 'submission-id',
+      taskId: 'task-id',
+      status: 'approved',
+      commitSha: previousCommitSha,
+      reviewedBy: 'reviewer-id',
+      reviewedAt: new Date('2026-08-28T20:00:00.000Z'),
+      approvedAt: new Date('2026-08-28T20:00:00.000Z'),
+      rejectedAt: null,
+      metadata: {
+        integration: {
+          status: 'failed',
+          error: 'Pull Request has merge conflicts',
+        },
+      },
+    } as unknown as ProjectSubmission;
+    const submissionRepo = {
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(submission),
+      }),
+      save: jest.fn().mockImplementation((value) => Promise.resolve(value)),
+    };
+    const runRepo = {
+      find: jest.fn().mockResolvedValue([]),
+      save: jest.fn(),
+    };
+    const taskRepo = { update: jest.fn().mockResolvedValue(undefined) };
+    const queueForSubmission = jest.fn().mockResolvedValue({
+      evaluationRunId: 'new-run',
+      status: 'queued',
+    });
+    const service = Object.create(
+      EvaluationsService.prototype,
+    ) as EvaluationsService;
+    Object.assign(service as unknown as Record<string, unknown>, {
+      dataSource: {
+        transaction: jest.fn(
+          (callback: (manager: Record<string, unknown>) => unknown) =>
+            callback({
+              getRepository: (entity: unknown) =>
+                entity === ProjectSubmission
+                  ? submissionRepo
+                  : entity === ProjectTask
+                    ? taskRepo
+                    : runRepo,
+            }),
+        ),
+      },
+      queueForSubmission,
+    });
+
+    await expect(
+      service.requeueForRepositoryUpdate({
+        submissionId: submission.id,
+        commitSha,
+        reason: 'github_pull_request_synchronize',
+        allowApprovedIntegrationRecovery: true,
+      }),
+    ).resolves.toEqual({
+      evaluationRunId: 'new-run',
+      status: 'queued',
+    });
+    expect(submissionRepo.save).toHaveBeenCalledWith(submission);
+    expect(submission.status).toBe('under_review');
+    expect(submission.commitSha).toBe(commitSha);
+    expect(submission.reviewedBy).toBeNull();
+    expect(submission.approvedAt).toBeNull();
+    const recovery = submission.metadata?.integrationRecovery;
+    if (!recovery || typeof recovery !== 'object') {
+      throw new Error('Expected integration recovery metadata');
+    }
+    expect((recovery as Record<string, unknown>).status).toBe(
+      'evaluation_pending',
+    );
+    expect((recovery as Record<string, unknown>).priorCommitSha).toBe(
+      previousCommitSha,
+    );
+    expect((recovery as Record<string, unknown>).updatedCommitSha).toBe(
+      commitSha,
+    );
+    expect(taskRepo.update).toHaveBeenCalledWith('task-id', {
+      status: 'review',
+      assignmentStatus: 'in_progress',
+    });
+    expect(queueForSubmission).toHaveBeenCalledWith(
+      submission.id,
+      {
+        mode: 'async',
+        reason: 'github_pull_request_synchronize',
+      },
+      'github-webhook',
     );
   });
 });

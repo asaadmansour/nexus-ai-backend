@@ -100,6 +100,7 @@ export class ReviewerService {
       generatedPlans,
       matchingRuns,
       submissionsAwaitingReview,
+      integrationIssues,
       releaseRequests,
       openTasks,
       finalHandoffsAwaitingReview,
@@ -139,6 +140,15 @@ export class ReviewerService {
       this.dataSource.getRepository(ProjectSubmission).count({
         where: { projectId, status: In(['submitted', 'under_review']) },
       }),
+      this.dataSource
+        .getRepository(ProjectSubmission)
+        .createQueryBuilder('submission')
+        .where('submission.project_id = :projectId', { projectId })
+        .andWhere("submission.status = 'approved'")
+        .andWhere(
+          "submission.metadata -> 'integration' ->> 'status' = 'failed'",
+        )
+        .getCount(),
       this.dataSource.getRepository(PaymentReleaseRequest).count({
         where: { projectId, status: In(['pending', 'approved']) },
       }),
@@ -170,6 +180,7 @@ export class ReviewerService {
       generatedPlans,
       matchingRuns,
       submissionsAwaitingReview,
+      integrationIssues,
       releaseRequests,
       openTasks,
       finalHandoffsAwaitingReview,

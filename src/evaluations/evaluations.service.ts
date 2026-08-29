@@ -1020,6 +1020,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
     submissionId: string;
     commitSha: string;
     reason: string;
+    allowApprovedIntegrationRecovery?: boolean;
   }) {
     const commitSha = input.commitSha.toLowerCase();
     if (!/^[a-f0-9]{40}$/.test(commitSha)) {
@@ -1037,9 +1038,20 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           submissionId: input.submissionId,
         })
         .getOne();
+      const integration = submission?.metadata?.integration;
+      const approvedIntegrationRecovery = Boolean(
+        submission &&
+        submission.status === 'approved' &&
+        input.allowApprovedIntegrationRecovery === true &&
+        integration &&
+        typeof integration === 'object' &&
+        (integration as Record<string, unknown>).status === 'failed' &&
+        submission.commitSha?.toLowerCase() !== commitSha,
+      );
       if (
         !submission ||
-        !['submitted', 'under_review'].includes(submission.status)
+        (!['submitted', 'under_review'].includes(submission.status) &&
+          !approvedIntegrationRecovery)
       ) {
         return { kind: 'ignored' as const };
       }
@@ -1056,6 +1068,7 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           ? activeRuns[0]
           : undefined;
 
+      const priorCommitSha = submission.commitSha;
       submission.commitSha = commitSha;
       submission.status = 'under_review';
       const metadata: Record<string, unknown> = {
@@ -1067,6 +1080,28 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
           coalescedIntoEvaluationRunId: activeForSameCommit?.id ?? null,
         },
       };
+      if (approvedIntegrationRecovery) {
+        metadata.integrationRecovery = {
+          status: 'evaluation_pending',
+          priorApprovedAt: submission.approvedAt?.toISOString() ?? null,
+          priorReviewedAt: submission.reviewedAt?.toISOString() ?? null,
+          priorReviewedBy: submission.reviewedBy,
+          priorCommitSha,
+          updatedCommitSha: commitSha,
+          reopenedAt: new Date().toISOString(),
+          reason: input.reason,
+        };
+        metadata.integration = {
+          ...(integration as Record<string, unknown>),
+          status: 'evaluation_pending',
+          updatedCommitSha: commitSha,
+          reopenedAt: new Date().toISOString(),
+        };
+        submission.reviewedBy = null;
+        submission.reviewedAt = null;
+        submission.approvedAt = null;
+        submission.rejectedAt = null;
+      }
       if (activeForSameCommit) {
         metadata.githubEvaluationPendingTrigger = {
           reason: input.reason,
@@ -1079,6 +1114,12 @@ export class EvaluationsService implements SubmissionEvaluationDispatcher {
       }
       submission.metadata = metadata;
       await submissionRepo.save(submission);
+      if (submission.taskId) {
+        await manager.getRepository(ProjectTask).update(submission.taskId, {
+          status: 'review',
+          assignmentStatus: 'in_progress',
+        });
+      }
 
       // A push can generate several check/status webhooks for the same SHA. Let
       // the in-flight run finish instead of repeatedly cancelling expensive

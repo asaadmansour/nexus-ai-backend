@@ -261,6 +261,14 @@ describe('GithubService read-only inspection', () => {
           );
         }
         if (url.endsWith('/pulls/4/merge') && init?.method === 'PUT') {
+          expect(
+            typeof init.body === 'string' ? JSON.parse(init.body) : null,
+          ).toEqual(
+            expect.objectContaining({
+              sha: headSha,
+              merge_method: 'merge',
+            }),
+          );
           return Promise.resolve(
             Response.json(
               { merged: false, message: 'Base branch was modified' },

@@ -6,11 +6,29 @@ import {
   assertSubmissionMatchesCurrentTask,
   assertImplementationWorkFunded,
   assertTaskAcceptsDraft,
+  isSubmissionIntegrationRecovery,
   resolveSubmissionReviewCriteria,
   validateSubmissionCriterionReviews,
 } from './delivery.service';
 
 describe('DeliveryService task/submission invariants', () => {
+  it('recognizes a reopened integration without replaying first approval effects', () => {
+    expect(
+      isSubmissionIntegrationRecovery({
+        metadata: {
+          integrationRecovery: { status: 'evaluation_pending' },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isSubmissionIntegrationRecovery({
+        metadata: {
+          integrationRecovery: { status: 'reapproved' },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it('keeps reserved implementation work locked until the second escrow stage activates it', () => {
     expect(() =>
       assertImplementationWorkFunded({

@@ -42,11 +42,19 @@ describe('ProjectHandoffsService', () => {
     const notifications = {
       createNotification: jest.fn().mockResolvedValue(undefined),
     };
+    const github = {
+      getPullRequest: jest.fn(),
+      isCommitAncestor: jest.fn(),
+    };
+    const evaluations = {
+      requeueForRepositoryUpdate: jest.fn(),
+    };
     const service = new ProjectHandoffsService(
       dataSource as never,
       { get: jest.fn() } as never,
+      github as never,
       {} as never,
-      {} as never,
+      evaluations as never,
       notifications as never,
       payments as never,
       { record: jest.fn().mockResolvedValue(undefined) } as never,
@@ -64,8 +72,51 @@ describe('ProjectHandoffsService', () => {
       payments,
       projects,
       notifications,
+      github,
+      evaluations,
     };
   }
+
+  it('recovers a conflict-resolution commit without restarting the task flow', async () => {
+    const { service, github, evaluations } = setup();
+    const previousCommitSha = 'a'.repeat(40);
+    const updatedCommitSha = 'b'.repeat(40);
+    github.getPullRequest.mockResolvedValue({
+      headSha: updatedCommitSha,
+    });
+    github.isCommitAncestor.mockResolvedValue(true);
+    evaluations.requeueForRepositoryUpdate.mockResolvedValue({
+      evaluationRunId: 'run-id',
+    });
+    const recover = Reflect.get(
+      service,
+      'recoverApprovedIntegrationUpdate',
+    ) as (submission: Record<string, unknown>) => Promise<boolean>;
+
+    await expect(
+      recover.call(service, {
+        id: 'submission-id',
+        commitSha: previousCommitSha,
+        pullRequestUrl: 'https://github.com/nexus-ai/project/pull/2',
+        repository: {
+          owner: 'nexus-ai',
+          repoName: 'project',
+        },
+      }),
+    ).resolves.toBe(true);
+    expect(github.isCommitAncestor).toHaveBeenCalledWith({
+      owner: 'nexus-ai',
+      repoName: 'project',
+      ancestorSha: previousCommitSha,
+      descendantSha: updatedCommitSha,
+    });
+    expect(evaluations.requeueForRepositoryUpdate).toHaveBeenCalledWith({
+      submissionId: 'submission-id',
+      commitSha: updatedCommitSha,
+      reason: 'integration_reconciler_pull_request_update',
+      allowApprovedIntegrationRecovery: true,
+    });
+  });
 
   it('does not mark the handoff accepted when escrow finalization fails', async () => {
     const { service, handoff, handoffs, payments } = setup();
