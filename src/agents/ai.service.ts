@@ -762,6 +762,7 @@ export class AiService {
       )
       .map((value) => this.quoteScopeText(value).toLowerCase())
       .join(' ');
+    const solutionType = this.quoteScopeText(brief.solutionType).toLowerCase();
     const pageCount = this.quoteScopeCount(scopeText);
     const nativeApp =
       /\b(?:mobile app|native app|ios|android|flutter|react native)\b/i.test(
@@ -793,7 +794,9 @@ export class AiService {
           ? 'medium'
           : 'low';
     const minimalWebsite =
-      /\b(?:landing page|single[ -]?page|static website)\b/i.test(scopeText) &&
+      /\b(?:landing page|single[ -]?page|static website)\b/i.test(
+        solutionType,
+      ) &&
       !nativeApp &&
       !hasAdmin &&
       integrationCount === 0;
@@ -803,10 +806,21 @@ export class AiService {
       integrationCount <= 1 &&
       featureCount <= 6 &&
       (pageCount === 0 || pageCount <= 8) &&
-      /\b(?:website|portfolio|marketing|landing)\b/i.test(scopeText);
+      !/\bweb app(?:lication)?\b/i.test(solutionType) &&
+      /\b(?:website|portfolio|marketing|landing)\b/i.test(solutionType);
+    // Planning complexity controls how detailed the architecture and evaluation
+    // contracts must be. It is not itself a customer price tier. A focused web
+    // app can need detailed planning without becoming a large multi-platform
+    // implementation package.
+    const complexScope =
+      platformCount >= 2 ||
+      (nativeApp && hasAdmin) ||
+      featureCount >= 9 ||
+      integrationCount >= 4 ||
+      pageCount >= 20;
     const scopeTier = minimalWebsite
       ? 'trivial'
-      : planningComplexity === 'complex' || complexity === 'high'
+      : complexScope
         ? 'complex'
         : smallWebsite
           ? 'small'

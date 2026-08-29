@@ -184,6 +184,47 @@ export class ProjectHandoffsService
     return handoff ? this.publicHandoff(handoff) : null;
   }
 
+  async downloadVerifiedSource(projectId: string, requester: JwtPayload) {
+    const project = await this.getProject(projectId);
+    await this.assertProjectAccess(project, requester);
+    const handoff = await this.handoffs.findOne({
+      where: { projectId },
+      relations: { project: true, repository: true },
+    });
+    if (
+      !handoff ||
+      !['client_review', 'accepted'].includes(handoff.status) ||
+      !handoff.repository ||
+      !handoff.integrationCommitSha
+    ) {
+      throw new ConflictException(
+        'Verified source becomes available when the final delivery reaches client review',
+      );
+    }
+    await this.ensureDeliveryContract(handoff);
+    const requirements = this.deliveryEvidenceRequirements(handoff);
+    if (!requirements.sourceArchive) {
+      throw new ForbiddenException(
+        'Source code was not included in this project delivery contract',
+      );
+    }
+    const archive = await this.github.downloadRepositoryArchive({
+      owner: handoff.repository.owner,
+      repoName: handoff.repository.repoName,
+      commitSha: handoff.integrationCommitSha,
+    });
+    const baseName = project.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 80);
+    return {
+      ...archive,
+      fileName: `${baseName || 'project'}-${handoff.integrationCommitSha.slice(0, 12)}.zip`,
+      commitSha: handoff.integrationCommitSha,
+    };
+  }
+
   async getReviewerRatings(projectId: string, reviewerUserId: string) {
     await this.assertPrincipalReviewer(projectId, reviewerUserId);
     const project = await this.getProject(projectId);
@@ -251,13 +292,17 @@ export class ProjectHandoffsService
     dto: ReviewProjectHandoffDto,
     reviewerUserId: string,
   ) {
-    const handoff = await this.handoffs.findOne({ where: { projectId } });
+    const handoff = await this.handoffs.findOne({
+      where: { projectId },
+      relations: { project: true, repository: true },
+    });
     if (!handoff) {
       throw new ConflictException(
         'The integrated project has not completed final verification yet',
       );
     }
     if (dto.decision === 'approved') {
+      await this.ensureDeliveryContract(handoff);
       if (handoff.status !== 'reviewer_review') {
         throw new ConflictException(
           'Only a passing integrated build can be sent to the client',
@@ -288,9 +333,15 @@ export class ProjectHandoffsService
       }
       const liveUrl = dto.liveUrl?.trim() || handoff.liveUrl;
       const artifactUrls = dto.artifactUrls ?? handoff.artifactUrls ?? [];
-      if (!liveUrl && artifactUrls.length === 0) {
+      const evidenceRequirements = this.deliveryEvidenceRequirements(handoff);
+      if (evidenceRequirements.liveUrl && !liveUrl) {
         throw new BadRequestException(
-          'Provide a client-accessible live URL or delivery artifact before handoff',
+          'This delivery contract requires a client-accessible live URL',
+        );
+      }
+      if (evidenceRequirements.artifactUrls && artifactUrls.length === 0) {
+        throw new BadRequestException(
+          'This delivery contract requires at least one client-accessible artifact or documentation URL',
         );
       }
       const now = new Date();
@@ -1064,6 +1115,7 @@ export class ProjectHandoffsService
           handoff,
           execution.evaluatedCommitSha ?? head.sha,
           Array.isArray(execution.result.rubric) ? execution.result.rubric : [],
+          taskRows,
         ),
       };
       handoff.lastError = null;
@@ -1215,7 +1267,13 @@ export class ProjectHandoffsService
   }
 
   private async ensureDeliveryContract(handoff: ProjectHandoff) {
-    if (this.record(handoff.metadata?.deliveryContract).verifiedAt) return;
+    const existingContract = this.record(handoff.metadata?.deliveryContract);
+    if (
+      existingContract.verifiedAt &&
+      existingContract.evidenceRequirements &&
+      existingContract.responsibilityVersion === 1
+    )
+      return;
     if (!handoff.project || !handoff.repository) return;
     const [taskRows, brief, spec] = await Promise.all([
       this.tasks.find({ where: { projectId: handoff.projectId } }),
@@ -1248,6 +1306,7 @@ export class ProjectHandoffsService
         handoff,
         commitSha,
         rubric,
+        taskRows,
       ),
     };
     await this.handoffs.save(handoff);
@@ -1258,6 +1317,7 @@ export class ProjectHandoffsService
     handoff: ProjectHandoff,
     commitSha: string,
     rubric: Array<Record<string, unknown>>,
+    tasks: ProjectTask[],
   ) {
     const evidenceFor = (prefix: string, index: number) => {
       const item = rubric.find(
@@ -1270,11 +1330,70 @@ export class ProjectHandoffsService
           }
         : { status: 'manual_review', evidence: null };
     };
+    const activeTasks = tasks.filter((task) => task.status !== 'cancelled');
+    const responsibilityFor = (deliverable: string) => {
+      const normalized = deliverable.toLowerCase();
+      const tokens = new Set(
+        normalized.split(/[^a-z0-9]+/).filter((token) => token.length >= 3),
+      );
+      const scored = activeTasks.map((task) => {
+        const searchable = [
+          task.title,
+          task.description,
+          task.roleKey,
+          ...this.strings(this.record(task.metadata).deliverables),
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        const score = [...tokens].filter((token) =>
+          searchable.includes(token),
+        ).length;
+        return { task, score };
+      });
+      const bestScore = Math.max(0, ...scored.map((item) => item.score));
+      let owners = scored
+        .filter((item) => item.score === bestScore && bestScore > 0)
+        .map((item) => item.task);
+      if (
+        owners.length === 0 &&
+        /\b(source|code|repository|repo)\b/.test(normalized)
+      ) {
+        owners = activeTasks.filter((task) =>
+          Boolean(task.assignedFreelancerProfileId),
+        );
+      }
+      if (owners.length === 0) owners = activeTasks.slice(0, 1);
+      return owners.map((task) => ({
+        taskId: task.id,
+        taskTitle: task.title,
+        roleKey: task.roleKey,
+      }));
+    };
+    const deliverables = (dto.task.deliverables ?? []).map((title, index) => ({
+      title,
+      ...evidenceFor('deliverable', index),
+      responsibleTasks: responsibilityFor(title),
+    }));
+    const deliveryText = deliverables
+      .map((item) => item.title)
+      .join(' ')
+      .toLowerCase();
+    const evidenceRequirements = {
+      liveUrl:
+        /\b(live|deployed|deployment|hosted|hosting|production)\b/.test(
+          deliveryText,
+        ) || /\bworking (website|web app|application)\b/.test(deliveryText),
+      artifactUrls:
+        /\b(figma|prototype|wireframe|mockup|design file|documentation|docs|manual|report)\b/.test(
+          deliveryText,
+        ),
+      sourceArchive: /\b(source|source code|codebase|repository|repo)\b/.test(
+        deliveryText,
+      ),
+    };
     return {
-      deliverables: (dto.task.deliverables ?? []).map((title, index) => ({
-        title,
-        ...evidenceFor('deliverable', index),
-      })),
+      deliverables,
       acceptanceCriteria: (dto.task.acceptanceCriteria ?? []).map(
         (title, index) => ({ title, ...evidenceFor('acceptance', index) }),
       ),
@@ -1284,9 +1403,42 @@ export class ProjectHandoffsService
       repositoryUrl: handoff.repository?.repoUrl ?? null,
       branch: handoff.integrationBranch,
       evaluatedCommitSha: commitSha,
+      evidenceRequirements,
+      responsibilityVersion: 1,
       verifiedAt:
         this.text(handoff.verificationReport?.completedAt) ||
         new Date().toISOString(),
+    };
+  }
+
+  private deliveryEvidenceRequirements(handoff: ProjectHandoff) {
+    const contract = this.record(handoff.metadata?.deliveryContract);
+    const stored = this.record(contract.evidenceRequirements);
+    if (Object.keys(stored).length > 0) {
+      return {
+        liveUrl: stored.liveUrl === true,
+        artifactUrls: stored.artifactUrls === true,
+        sourceArchive: stored.sourceArchive === true,
+      };
+    }
+    const deliverables = Array.isArray(contract.deliverables)
+      ? contract.deliverables
+          .map((item) => this.text(this.record(item).title))
+          .join(' ')
+          .toLowerCase()
+      : '';
+    return {
+      liveUrl:
+        /\b(live|deployed|deployment|hosted|hosting|production)\b/.test(
+          deliverables,
+        ) || /\bworking (website|web app|application)\b/.test(deliverables),
+      artifactUrls:
+        /\b(figma|prototype|wireframe|mockup|design file|documentation|docs|manual|report)\b/.test(
+          deliverables,
+        ),
+      sourceArchive: /\b(source|source code|codebase|repository|repo)\b/.test(
+        deliverables,
+      ),
     };
   }
 

@@ -167,6 +167,42 @@ describe('AiService fixed-package project quotes', () => {
     expect(application.amount).toBeGreaterThan(landing.amount * 3);
   });
 
+  it('does not turn detailed planning into a complex price package by itself', async () => {
+    const quote = await service.estimateProjectQuote({
+      project: {
+        budgetMin: 500,
+        budgetMax: 100_000,
+        currency: 'EGP',
+        deadline: '2027-10-10T00:00:00.000Z',
+      },
+      brief: {
+        mainGoal: 'Manage appointment booking and a daily clinic queue',
+        targetUsers: ['patients', 'reception staff', 'clinic managers'],
+        coreFeatures: [
+          'patients book appointments',
+          'patients reschedule appointments',
+          'reception staff manage daily queue',
+          'clinic managers review appointment activity',
+        ],
+        platforms: ['website'],
+        solutionType: 'web app',
+        scopeDetails:
+          'One-location booking, reception queue, and manager reporting workflows',
+        integrations: ['none'],
+        adminNeeds: 'no admin dashboard',
+        deliverables: ['working website', 'source code', 'deployment help'],
+        suggestedTeamSize: 2,
+        requirementProfile: { complexity: 'complex' },
+      },
+    });
+
+    expect(quote.amount).toBeGreaterThanOrEqual(35_000);
+    expect(quote.amount).toBeLessThanOrEqual(40_000);
+    expect(quote.pricingSignals).toContain(
+      'Scope package: standard; estimated complexity: medium.',
+    );
+  });
+
   it('does not let the customer budget inflate the same scope', async () => {
     const lowBudget = await service.estimateProjectQuote({
       project: { budgetMin: 500, budgetMax: 10_000, currency: 'EGP' },

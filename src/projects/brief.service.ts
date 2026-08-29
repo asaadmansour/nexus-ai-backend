@@ -1638,7 +1638,7 @@ export class BriefService {
     });
     return {
       schemaVersion: 1,
-      estimatorVersion: 'marketplace-fixed-package-v3',
+      estimatorVersion: 'marketplace-fixed-package-v4',
       generatedAt: generatedAt.toISOString(),
       source: quote.source,
       currency: quote.currency,

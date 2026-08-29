@@ -7,8 +7,10 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { UserRole } from 'src/common/enums/user-role.enum';
@@ -243,6 +245,30 @@ export class ProjectHandoffController {
       status: 'success',
       data: await this.handoffs.clientDecision(projectId, dto, user.sub),
     };
+  }
+
+  @Get('source')
+  @Roles(UserRole.CUSTOMER, UserRole.ADMIN)
+  async source(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+    @Res() response: Response,
+  ) {
+    const archive = await this.handoffs.downloadVerifiedSource(projectId, user);
+    response.setHeader('Content-Type', archive.contentType);
+    response.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${archive.fileName}"`,
+    );
+    response.setHeader('Content-Length', archive.buffer.byteLength);
+    response.setHeader('X-Content-SHA256', archive.sha256);
+    response.setHeader('X-Verified-Commit', archive.commitSha);
+    response.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Disposition, X-Content-SHA256, X-Verified-Commit',
+    );
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.send(archive.buffer);
   }
 
   @Post('ratings')

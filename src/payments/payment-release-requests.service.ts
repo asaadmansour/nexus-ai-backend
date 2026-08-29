@@ -7,7 +7,14 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, In, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  IsNull,
+  Not,
+  Repository,
+} from 'typeorm';
 import { ProjectStatus } from 'src/common/enums/project-status.enum';
 import { UserRole } from 'src/common/enums/user-role.enum';
 import type { JwtPayload } from 'src/common/interfaces/jwt-payload.interface';
@@ -27,6 +34,7 @@ import { EscrowLedgerEntry } from './entities/escrow-ledger-entry.entity';
 import { PaymentReleaseRequest } from './entities/payment-release-request.entity';
 import { ProjectPayment } from './entities/project-payment.entity';
 import { PayoutAutomationService } from './payout-automation.service';
+import { StripeService } from './stripe.service';
 import { calculateTaskCompensation } from './task-compensation';
 
 @Injectable()
@@ -49,6 +57,7 @@ export class PaymentReleaseRequestsService {
     private readonly usersRepository: Repository<User>,
     private readonly notificationsService: NotificationsService,
     private readonly payoutAutomationService: PayoutAutomationService,
+    private readonly stripeService: StripeService,
   ) {}
 
   async create(
@@ -652,16 +661,23 @@ export class PaymentReleaseRequestsService {
         .getOne();
       if (!project) throw new NotFoundException('Project not found');
       if (project.status === ProjectStatus.COMPLETED) {
-        const existing = await manager
-          .getRepository(EscrowLedgerEntry)
-          .findOne({
+        const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
+        const [governanceRelease, customerRefund] = await Promise.all([
+          ledgerRepo.findOne({
             where: {
               projectId,
               entryType: 'governance_release',
               status: 'posted',
             },
-          });
-        return { project, governanceRelease: existing, alreadyCompleted: true };
+          }),
+          this.findCompletionRefund(manager, projectId),
+        ]);
+        return {
+          project,
+          governanceRelease,
+          customerRefund,
+          alreadyCompleted: true,
+        };
       }
       const taskRepo = manager.getRepository(ProjectTask);
       const [totalTasks, unfinishedTasks] = await Promise.all([
@@ -688,6 +704,19 @@ export class PaymentReleaseRequestsService {
           'Project completion requires every implementation task to be accepted',
         );
       }
+      const unsettledReleaseCount = await manager
+        .getRepository(PaymentReleaseRequest)
+        .count({
+          where: {
+            projectId,
+            status: In(['pending', 'approved']),
+          },
+        });
+      if (unsettledReleaseCount > 0) {
+        throw new ConflictException(
+          'Project completion is waiting for approved contributor releases to settle',
+        );
+      }
       const now = new Date();
       const governanceRelease = await this.releasePrincipalReviewerAllocation(
         manager,
@@ -701,6 +730,18 @@ export class PaymentReleaseRequestsService {
             this.toCents(governanceRelease.amount),
         );
       }
+      const customerRefund = await this.refundCompletionSurplus(
+        manager,
+        project,
+        acceptedBy,
+        now,
+      );
+      if (customerRefund) {
+        project.releasedAmount = this.fromCents(
+          this.toCents(project.releasedAmount) +
+            this.toCents(customerRefund.amount),
+        );
+      }
       if (
         this.toCents(project.releasedAmount) < this.toCents(project.heldAmount)
       ) {
@@ -711,7 +752,12 @@ export class PaymentReleaseRequestsService {
       project.status = ProjectStatus.COMPLETED;
       project.automationStatus = 'completed';
       await manager.save(Project, project);
-      return { project, governanceRelease, alreadyCompleted: false };
+      return {
+        project,
+        governanceRelease,
+        customerRefund,
+        alreadyCompleted: false,
+      };
     });
 
     const payout = result.governanceRelease
@@ -742,7 +788,20 @@ export class PaymentReleaseRequestsService {
         );
       }
     }
-    return { ...result, payout };
+    const customerRefundDispatch = result.customerRefund
+      ? await this.dispatchCompletionRefund(result.customerRefund)
+      : null;
+    if (result.customerRefund) {
+      await this.notifyUsers(
+        [result.project.customerId],
+        'Unused project escrow returned',
+        customerRefundDispatch?.mode === 'stripe_refund'
+          ? `${result.customerRefund.amount} ${result.customerRefund.currency} of unused project allocation was refunded to your original payment method.`
+          : `${result.customerRefund.amount} ${result.customerRefund.currency} of unused project allocation was returned when the delivery was accepted.`,
+        projectId,
+      );
+    }
+    return { ...result, payout, customerRefundDispatch };
   }
 
   private async list(
@@ -922,6 +981,157 @@ export class PaymentReleaseRequestsService {
     assignment.completedAt = assignment.completedAt ?? now;
     await manager.getRepository(ProjectRoleAssignment).save(assignment);
     return entry;
+  }
+
+  private async findCompletionRefund(
+    manager: EntityManager,
+    projectId: string,
+  ) {
+    return manager
+      .getRepository(EscrowLedgerEntry)
+      .createQueryBuilder('entry')
+      .where('entry.projectId = :projectId', { projectId })
+      .andWhere('entry.entryType = :entryType', { entryType: 'refund' })
+      .andWhere('entry.status = :status', { status: 'posted' })
+      .andWhere("entry.metadata->>'refundType' = :refundType", {
+        refundType: 'project_completion_surplus',
+      })
+      .getOne();
+  }
+
+  private async refundCompletionSurplus(
+    manager: EntityManager,
+    project: Project,
+    createdBy: string,
+    now: Date,
+  ) {
+    const existing = await this.findCompletionRefund(manager, project.id);
+    if (existing) return null;
+
+    const remainingCents = Math.max(
+      this.toCents(project.heldAmount) - this.toCents(project.releasedAmount),
+      0,
+    );
+    if (remainingCents === 0) return null;
+
+    const ledgerRepo = manager.getRepository(EscrowLedgerEntry);
+    return ledgerRepo.save(
+      ledgerRepo.create({
+        projectId: project.id,
+        paymentId: null,
+        milestoneId: null,
+        approvedSubmissionId: null,
+        releaseRequestId: null,
+        freelancerProfileId: null,
+        entryType: 'refund',
+        amount: this.fromCents(remainingCents),
+        currency: project.quotedCurrency ?? project.currency,
+        status: 'posted',
+        reason: 'Unused project allocation returned after final acceptance',
+        stripeTransferId: null,
+        stripeRefundId: null,
+        createdBy,
+        postedAt: now,
+        metadata: {
+          refundType: 'project_completion_surplus',
+          customerId: project.customerId,
+          externalRefundStatus: 'pending',
+        },
+      }),
+    );
+  }
+
+  private async dispatchCompletionRefund(entry: EscrowLedgerEntry) {
+    const metadata = entry.metadata ?? {};
+    if (metadata.externalRefundStatus === 'succeeded') {
+      return { mode: 'stripe_refund', alreadyDispatched: true };
+    }
+    if (metadata.externalRefundStatus === 'ledger_only') {
+      return { mode: 'ledger_only', alreadyDispatched: true };
+    }
+
+    const payments = await this.dataSource.getRepository(ProjectPayment).find({
+      where: {
+        projectId: entry.projectId,
+        status: 'succeeded',
+        stripePaymentIntentId: Not(IsNull()),
+      },
+      order: { paidAt: 'DESC', createdAt: 'DESC' },
+    });
+    if (payments.length === 0) {
+      entry.metadata = {
+        ...metadata,
+        externalRefundStatus: 'ledger_only',
+        externalRefundCompletedAt: new Date().toISOString(),
+      };
+      await this.ledgerRepository.save(entry);
+      return { mode: 'ledger_only', alreadyDispatched: false };
+    }
+
+    const refundCents = this.toCents(entry.amount);
+    const availableCents = payments.reduce(
+      (sum, payment) => sum + this.toCents(payment.amount),
+      0,
+    );
+    if (availableCents < refundCents) {
+      throw new ConflictException(
+        'Unused escrow refund exceeds the captured Stripe funding available for this project',
+      );
+    }
+
+    let remainingCents = refundCents;
+    const refunds: Array<{
+      paymentId: string;
+      paymentIntentId: string;
+      amount: string;
+      refundId: string;
+      status: string;
+    }> = [];
+    for (const payment of payments) {
+      if (remainingCents === 0) break;
+      const amountCents = Math.min(
+        remainingCents,
+        this.toCents(payment.amount),
+      );
+      const paymentIntentId = payment.stripePaymentIntentId!;
+      const refund = await this.stripeService.createRefund(
+        {
+          payment_intent: paymentIntentId,
+          amount: amountCents,
+          metadata: {
+            projectId: entry.projectId,
+            ledgerEntryId: entry.id,
+            projectPaymentId: payment.id,
+            reason: 'project_completion_surplus',
+          },
+        },
+        {
+          idempotencyKey: `project-completion-refund:${entry.id}:${payment.id}`,
+        },
+      );
+      refunds.push({
+        paymentId: payment.id,
+        paymentIntentId,
+        amount: this.fromCents(amountCents),
+        refundId: refund.id,
+        status: refund.status ?? 'unknown',
+      });
+      remainingCents -= amountCents;
+    }
+
+    entry.stripeRefundId = refunds[0]?.refundId ?? null;
+    entry.metadata = {
+      ...metadata,
+      externalRefundStatus: 'succeeded',
+      externalRefundCompletedAt: new Date().toISOString(),
+      refunds,
+    };
+    await this.ledgerRepository.save(entry);
+    return {
+      mode: 'stripe_refund',
+      alreadyDispatched: false,
+      refunds,
+    };
   }
 
   private transferMode() {

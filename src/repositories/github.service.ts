@@ -124,6 +124,12 @@ export type GithubCommitTarget = {
   url: string | null;
 };
 
+export type GithubRepositoryArchive = {
+  buffer: Buffer;
+  contentType: string;
+  sha256: string;
+};
+
 export type GithubPullRequestTarget = {
   number: number;
   url: string | null;
@@ -826,9 +832,67 @@ export class GithubService {
     };
   }
 
+  async downloadRepositoryArchive(input: {
+    owner: string;
+    repoName: string;
+    commitSha: string;
+  }): Promise<GithubRepositoryArchive> {
+    if (!/^[a-f0-9]{40}$/i.test(input.commitSha)) {
+      throw new ServiceUnavailableException(
+        'The verified repository commit is invalid',
+      );
+    }
+    const response = await this.request(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repoName)}/zipball/${input.commitSha}`,
+      {
+        method: 'GET',
+        timeoutMs: Number(
+          this.config.get<string>('GITHUB_ARCHIVE_TIMEOUT_MS') ?? 120_000,
+        ),
+      },
+    );
+    if (!response.ok) {
+      const detail = await response.text();
+      this.logger.error(
+        `GitHub download repository archive failed (${response.status}): ${detail}`,
+      );
+      throw new ServiceUnavailableException(
+        `GitHub download repository archive failed with status ${response.status}`,
+      );
+    }
+
+    const configuredLimit = Number(
+      this.config.get<string>('SOURCE_ARCHIVE_MAX_BYTES') ?? 100 * 1024 * 1024,
+    );
+    const maxBytes = Number.isFinite(configuredLimit)
+      ? Math.min(500 * 1024 * 1024, Math.max(1024 * 1024, configuredLimit))
+      : 100 * 1024 * 1024;
+    const contentLength = Number(response.headers.get('content-length') ?? 0);
+    if (contentLength > maxBytes) {
+      throw new ServiceUnavailableException(
+        'The verified source archive is too large to download through Nexus',
+      );
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > maxBytes) {
+      throw new ServiceUnavailableException(
+        'The verified source archive is too large to download through Nexus',
+      );
+    }
+    return {
+      buffer,
+      contentType: response.headers.get('content-type') || 'application/zip',
+      sha256: createHash('sha256').update(buffer).digest('hex'),
+    };
+  }
+
   private async request(
     path: string,
-    init: { method: string; body?: Record<string, unknown> },
+    init: {
+      method: string;
+      body?: Record<string, unknown>;
+      timeoutMs?: number;
+    },
   ) {
     const token = this.config.get<string>('GITHUB_TOKEN');
     if (!token) {
@@ -839,7 +903,9 @@ export class GithubService {
     const apiUrl =
       this.config.get<string>('GITHUB_API_URL') ?? 'https://api.github.com';
     const configuredTimeout = Number(
-      this.config.get<string>('GITHUB_API_TIMEOUT_MS') ?? 30_000,
+      init.timeoutMs ??
+        this.config.get<string>('GITHUB_API_TIMEOUT_MS') ??
+        30_000,
     );
     const timeoutMs = Number.isFinite(configuredTimeout)
       ? Math.min(120_000, Math.max(1_000, configuredTimeout))

@@ -25,6 +25,40 @@ describe('GithubService read-only inspection', () => {
     );
   });
 
+  it('downloads and fingerprints the exact verified source commit', async () => {
+    const commitSha = 'a'.repeat(40);
+    const bytes = Buffer.from('verified zip bytes');
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(bytes, {
+        headers: {
+          'content-type': 'application/zip',
+          'content-length': String(bytes.byteLength),
+        },
+      }),
+    );
+
+    try {
+      await expect(
+        service().downloadRepositoryArchive({
+          owner: 'nexus-ai',
+          repoName: 'private-project',
+          commitSha,
+        }),
+      ).resolves.toMatchObject({
+        buffer: bytes,
+        contentType: 'application/zip',
+        sha256:
+          '4c03c0ed56b8579a9e7c317a346d2f08f74088032430234b3bd9d7587832c538',
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        `https://api.github.test/repos/nexus-ai/private-project/zipball/${commitSha}`,
+        expect.objectContaining({ method: 'GET' }),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('requests a safe feature-branch update when main advances cleanly', async () => {
     const headSha = 'a'.repeat(40);
     const baseSha = 'b'.repeat(40);

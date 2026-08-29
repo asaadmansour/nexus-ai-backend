@@ -387,9 +387,20 @@ describe('ProjectHandoffsService', () => {
     expect(handoffs.save).not.toHaveBeenCalled();
   });
 
-  it('requires an explicit summary and accessible delivery before client handoff', async () => {
+  it('requires an explicit summary and only the evidence selected in the delivery contract', async () => {
     const { service, handoff, handoffs } = setup();
     handoff.status = 'reviewer_review';
+    handoff.metadata = {
+      deliveryContract: {
+        verifiedAt: '2026-08-29T18:00:00.000Z',
+        responsibilityVersion: 1,
+        evidenceRequirements: {
+          liveUrl: true,
+          artifactUrls: false,
+          sourceArchive: true,
+        },
+      },
+    };
 
     await expect(
       service.review(project.id, { decision: 'approved' }, 'reviewer-1'),
@@ -407,9 +418,43 @@ describe('ProjectHandoffsService', () => {
         'reviewer-1',
       ),
     ).rejects.toThrow(
-      'Provide a client-accessible live URL or delivery artifact before handoff',
+      'This delivery contract requires a client-accessible live URL',
     );
     expect(handoffs.save).not.toHaveBeenCalled();
+  });
+
+  it('allows a source-only delivery without unrelated live or artifact URLs', async () => {
+    const { service, handoff, handoffs } = setup();
+    handoff.status = 'reviewer_review';
+    handoff.metadata = {
+      deliveryContract: {
+        verifiedAt: '2026-08-29T18:00:00.000Z',
+        responsibilityVersion: 1,
+        evidenceRequirements: {
+          liveUrl: false,
+          artifactUrls: false,
+          sourceArchive: true,
+        },
+      },
+    };
+
+    await expect(
+      service.review(
+        project.id,
+        {
+          decision: 'approved',
+          summary: 'The verified source delivery is ready for client review.',
+        },
+        'reviewer-1',
+      ),
+    ).resolves.toEqual(expect.objectContaining({ status: 'client_review' }));
+    expect(handoffs.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'client_review',
+        liveUrl: null,
+        artifactUrls: [],
+      }),
+    );
   });
 
   it('validates client rating categories before recording a review', async () => {

@@ -45,6 +45,11 @@ import { ProjectPayment } from './project-payment.entity';
   unique: true,
   where: '"entry_type" = \'governance_release\' AND "status" = \'posted\'',
 })
+@Index('escrow_ledger_entries_project_completion_refund_uidx', ['projectId'], {
+  unique: true,
+  where:
+    "\"entry_type\" = 'refund' AND \"status\" = 'posted' AND \"metadata\"->>'refundType' = 'project_completion_surplus'",
+})
 export class EscrowLedgerEntry {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
