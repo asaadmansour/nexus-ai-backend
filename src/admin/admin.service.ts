@@ -245,7 +245,7 @@ export class AdminService {
         `(
           user.firstName ILIKE :search
           OR user.lastName ILIKE :search
-          OR user.email::text ILIKE :search
+          OR user.email ILIKE :search
           OR user.phoneNumber ILIKE :search
         )`,
         { search: `%${filters.search}%` },
