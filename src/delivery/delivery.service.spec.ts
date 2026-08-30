@@ -8,6 +8,7 @@ import {
   assertDependencyIntegratedForSubmission,
   assertTaskAcceptsDraft,
   isSubmissionIntegrationRecovery,
+  isActiveSubmissionVersion,
   isSuccessfulSubmissionIntegration,
   resolveSubmissionReviewCriteria,
   validateSubmissionCriterionReviews,
@@ -30,6 +31,12 @@ describe('DeliveryService task/submission invariants', () => {
         integration: { status: 'failed' },
       }),
     ).toBe(false);
+  });
+
+  it('ignores superseded submission versions in pull-request history checks', () => {
+    expect(isActiveSubmissionVersion({ status: 'superseded' })).toBe(false);
+    expect(isActiveSubmissionVersion({ status: 'under_review' })).toBe(true);
+    expect(isActiveSubmissionVersion({ status: 'approved' })).toBe(true);
   });
 
   it('requires blocking dependencies to be approved and integrated into main', () => {

@@ -247,6 +247,12 @@ export function isSuccessfulSubmissionIntegration(result: unknown) {
   );
 }
 
+export function isActiveSubmissionVersion(
+  submission: Pick<ProjectSubmission, 'status'>,
+) {
+  return submission.status !== 'superseded';
+}
+
 export function hasOnlyEvaluatorVisibilityGaps(
   evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
 ) {
@@ -1268,6 +1274,7 @@ export class DeliveryService {
         (submission.taskId !== null &&
           candidate.taskId === submission.taskId) ||
         !candidate.commitSha ||
+        !isActiveSubmissionVersion(candidate) ||
         this.prerequisiteIsIntegrated(candidate)
       ) {
         continue;
