@@ -22,6 +22,10 @@ export const SUBMISSION_TYPES = [
 export class CreateSubmissionDto {
   @IsOptional()
   @IsUUID('4')
+  idempotencyKey?: string;
+
+  @IsOptional()
+  @IsUUID('4')
   milestoneId?: string;
 
   @IsUUID('4')

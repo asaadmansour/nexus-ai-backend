@@ -53,6 +53,7 @@ type SubmissionWriteResult = {
   project: Project;
   previousSubmissionId: string | null;
   alreadySubmitted?: boolean;
+  reused?: boolean;
 };
 
 type PullRequestReviewReadiness = {
@@ -253,6 +254,20 @@ export function isActiveSubmissionVersion(
   return submission.status !== 'superseded';
 }
 
+export function submissionNeedsEvaluationDispatch(
+  submission: Pick<ProjectSubmission, 'status' | 'metadata'>,
+  reused: boolean,
+) {
+  if (submission.status !== 'submitted') return false;
+  if (!reused) return true;
+  const dispatch = submission.metadata?.evaluationDispatch;
+  const status =
+    dispatch && typeof dispatch === 'object'
+      ? (dispatch as Record<string, unknown>).status
+      : null;
+  return typeof status !== 'string' || status === 'failed';
+}
+
 export function hasOnlyEvaluatorVisibilityGaps(
   evaluation: Partial<Pick<EvaluationRun, 'acceptanceCoverage'>> | null,
 ) {
@@ -412,18 +427,23 @@ export class DeliveryService {
       this.createSubmissionInTransaction(manager, projectId, dto, requester),
     );
 
-    const dispatch =
-      result.submission.status === 'submitted'
-        ? await this.dispatchEvaluation(result.submission, requester.sub)
-        : null;
+    const shouldDispatch = submissionNeedsEvaluationDispatch(
+      result.submission,
+      result.reused ?? false,
+    );
+    const dispatch = shouldDispatch
+      ? await this.dispatchEvaluation(result.submission, requester.sub)
+      : null;
 
-    if (result.submission.status === 'submitted') {
+    if (!result.reused && result.submission.status === 'submitted') {
       await this.notifySubmissionSubmitted(result.project, result.submission);
     }
 
     return {
       ...result.submission,
-      evaluationDispatch: dispatch,
+      evaluationDispatch:
+        dispatch ?? result.submission.metadata?.evaluationDispatch ?? null,
+      reused: result.reused ?? false,
     };
   }
 
@@ -1441,6 +1461,28 @@ export class DeliveryService {
     );
 
     const repo = manager.getRepository(ProjectSubmission);
+    if (dto.idempotencyKey) {
+      const replay = await repo.findOne({
+        where: { idempotencyKey: dto.idempotencyKey },
+      });
+      if (replay) {
+        if (
+          replay.projectId !== projectId ||
+          replay.taskId !== task.id ||
+          replay.freelancerProfileId !== task.assignedFreelancerProfileId
+        ) {
+          throw new ConflictException(
+            'This submission request identifier is already attached to different work. Refresh the task and try again.',
+          );
+        }
+        return {
+          submission: replay,
+          project,
+          previousSubmissionId: null,
+          reused: true,
+        };
+      }
+    }
     const latest = await repo.findOne({
       where: {
         taskId: task.id,
@@ -1465,6 +1507,7 @@ export class DeliveryService {
       freelancerProfileId: task.assignedFreelancerProfileId,
       repositoryId: dto.repositoryId ?? null,
       version: (latest?.version ?? 0) + 1,
+      idempotencyKey: dto.idempotencyKey ?? null,
       status: dto.status ?? 'draft',
       submissionType: dto.submissionType,
       title: dto.title ?? null,

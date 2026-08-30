@@ -16,6 +16,38 @@ interface PostgresDriverError {
   detail?: string;
 }
 
+export function uniqueConstraintMessage(error: PostgresDriverError): string {
+  const constraint = error.constraint?.toLowerCase() ?? '';
+
+  if (['uq_user_email', 'users_email_key'].includes(constraint)) {
+    return 'This email is already registered.';
+  }
+
+  if (['uq_user_phone_number', 'users_phone_number_key'].includes(constraint)) {
+    return 'This phone number is already registered.';
+  }
+
+  if (constraint === 'freelancer_profiles_github_username_uidx') {
+    return 'This GitHub username is already registered.';
+  }
+
+  if (constraint === 'project_role_assignments_planning_freelancer_uidx') {
+    return 'Architecture and UI/UX planning roles must be assigned to different freelancers.';
+  }
+
+  if (
+    [
+      'project_submissions_create_request_uidx',
+      'project_submissions_task_freelancer_version_uidx',
+      'project_submissions_milestone_freelancer_version_uidx',
+    ].includes(constraint)
+  ) {
+    return 'This submission request was already saved. Refresh the task to continue from the existing submission; no work was lost.';
+  }
+
+  return 'This record already exists.';
+}
+
 @Catch(QueryFailedError)
 export class DatabaseExceptionFilter implements ExceptionFilter<QueryFailedError> {
   private readonly logger = new Logger(DatabaseExceptionFilter.name);
@@ -46,35 +78,9 @@ export class DatabaseExceptionFilter implements ExceptionFilter<QueryFailedError
     const driverError = exception.driverError as PostgresDriverError;
 
     if (driverError.code === '23505') {
-      return new ConflictException(
-        this.getUniqueConstraintMessage(driverError),
-      );
+      return new ConflictException(uniqueConstraintMessage(driverError));
     }
 
     return new InternalServerErrorException('Database request failed');
-  }
-
-  private getUniqueConstraintMessage(error: PostgresDriverError): string {
-    const constraint = error.constraint?.toLowerCase() ?? '';
-
-    if (['uq_user_email', 'users_email_key'].includes(constraint)) {
-      return 'This email is already registered.';
-    }
-
-    if (
-      ['uq_user_phone_number', 'users_phone_number_key'].includes(constraint)
-    ) {
-      return 'This phone number is already registered.';
-    }
-
-    if (constraint === 'freelancer_profiles_github_username_uidx') {
-      return 'This GitHub username is already registered.';
-    }
-
-    if (constraint === 'project_role_assignments_planning_freelancer_uidx') {
-      return 'Architecture and UI/UX planning roles must be assigned to different freelancers.';
-    }
-
-    return 'This record already exists.';
   }
 }

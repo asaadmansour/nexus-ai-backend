@@ -11,6 +11,7 @@ import {
   isActiveSubmissionVersion,
   isSuccessfulSubmissionIntegration,
   resolveSubmissionReviewCriteria,
+  submissionNeedsEvaluationDispatch,
   validateSubmissionCriterionReviews,
 } from './delivery.service';
 
@@ -37,6 +38,33 @@ describe('DeliveryService task/submission invariants', () => {
     expect(isActiveSubmissionVersion({ status: 'superseded' })).toBe(false);
     expect(isActiveSubmissionVersion({ status: 'under_review' })).toBe(true);
     expect(isActiveSubmissionVersion({ status: 'approved' })).toBe(true);
+  });
+
+  it('recovers an idempotent submission whose evaluation was not dispatched', () => {
+    expect(
+      submissionNeedsEvaluationDispatch(
+        { status: 'submitted', metadata: null },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      submissionNeedsEvaluationDispatch(
+        {
+          status: 'submitted',
+          metadata: { evaluationDispatch: { status: 'failed' } },
+        },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      submissionNeedsEvaluationDispatch(
+        {
+          status: 'under_review',
+          metadata: { evaluationDispatch: { status: 'queued' } },
+        },
+        true,
+      ),
+    ).toBe(false);
   });
 
   it('requires blocking dependencies to be approved and integrated into main', () => {

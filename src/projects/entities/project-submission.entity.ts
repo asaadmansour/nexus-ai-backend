@@ -49,6 +49,10 @@ import { Project } from './project.entity';
       '"task_id" IS NULL AND "milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
   },
 )
+@Index('project_submissions_create_request_uidx', ['idempotencyKey'], {
+  unique: true,
+  where: '"idempotency_key" IS NOT NULL',
+})
 export class ProjectSubmission {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -102,6 +106,9 @@ export class ProjectSubmission {
 
   @Column({ type: 'int', default: 1 })
   version!: number;
+
+  @Column({ name: 'idempotency_key', type: 'uuid', nullable: true })
+  idempotencyKey!: string | null;
 
   @Column({ name: 'submission_type', type: 'varchar', length: 40 })
   submissionType!: string;
