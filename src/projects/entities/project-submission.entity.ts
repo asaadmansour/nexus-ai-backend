@@ -45,7 +45,8 @@ import { Project } from './project.entity';
   ['milestoneId', 'freelancerProfileId', 'version'],
   {
     unique: true,
-    where: '"milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
+    where:
+      '"task_id" IS NULL AND "milestone_id" IS NOT NULL AND "freelancer_profile_id" IS NOT NULL',
   },
 )
 export class ProjectSubmission {
