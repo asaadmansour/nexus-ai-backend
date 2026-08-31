@@ -1,4 +1,4 @@
-# QuickClinic demo project
+x# QuickClinic demo project
 
 This kit exercises the customer intake, planning, Scrum-plan, matching, and
 submission flow with a small-to-medium project designed for at most four
