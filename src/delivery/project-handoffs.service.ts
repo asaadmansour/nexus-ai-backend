@@ -303,26 +303,30 @@ export class ProjectHandoffsService
     }
     if (dto.decision === 'approved') {
       await this.ensureDeliveryContract(handoff);
-      if (handoff.status !== 'reviewer_review') {
+      if (!['reviewer_review', 'verification_failed'].includes(handoff.status)) {
         throw new ConflictException(
-          'Only a passing integrated build can be sent to the client',
+          'Only an integrated build awaiting review can be sent to the client',
         );
       }
       const recommendation = this.text(
         handoff.verificationReport?.recommendation,
       );
-      if (!['approve', 'manual_review'].includes(recommendation)) {
+      const originalHandoffStatus = handoff.status;
+      const verificationOverride =
+        handoff.status === 'verification_failed' ||
+        !['approve', 'manual_review'].includes(recommendation);
+      if (verificationOverride && !handoff.integrationCommitSha) {
         throw new ConflictException(
-          'Final verification must approve the integrated build first',
+          'Manual approval requires an exact integrated commit',
         );
       }
       if (
-        recommendation === 'manual_review' &&
+        (recommendation === 'manual_review' || verificationOverride) &&
         (dto.manualReviewAcknowledged !== true ||
           (dto.feedback?.trim().length ?? 0) < 20)
       ) {
         throw new ConflictException(
-          'Manual review requires acknowledgement and at least 20 characters of evidence',
+          'Manual approval requires acknowledgement and at least 20 characters of review evidence',
         );
       }
       const summary = dto.summary?.trim() || '';
@@ -357,6 +361,17 @@ export class ProjectHandoffsService
       );
       const metadata = { ...(handoff.metadata ?? {}) };
       delete metadata.clientReviewOverdueNotifiedAt;
+      if (verificationOverride) {
+        metadata.finalVerificationOverride = {
+          status: 'approved_by_principal_reviewer',
+          originalRecommendation: recommendation || null,
+          originalHandoffStatus,
+          reviewedCommitSha: handoff.integrationCommitSha,
+          evidence: dto.feedback!.trim(),
+          approvedBy: reviewerUserId,
+          approvedAt: now.toISOString(),
+        };
+      }
       handoff.metadata = metadata;
       handoff.lastError = null;
       handoff.nextAttemptAt = null;
@@ -370,7 +385,9 @@ export class ProjectHandoffsService
         userId: project.customerId,
         projectId,
         title: 'Your project is ready for review',
-        body: `The complete integrated build for ${project.title} passed verification and is ready for your acceptance.`,
+        body: verificationOverride
+          ? `The principal reviewer manually verified and approved the integrated build for ${project.title}; it is ready for your acceptance.`
+          : `The complete integrated build for ${project.title} passed verification and is ready for your acceptance.`,
         type: 'project_handoff_ready',
         actionUrl: `/projects/${projectId}/work`,
         metadata: {

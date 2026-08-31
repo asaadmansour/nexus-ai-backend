@@ -373,7 +373,7 @@ describe('ProjectHandoffsService', () => {
     expect(handoff.clientAcceptedAt).toBeInstanceOf(Date);
   });
 
-  it('blocks a principal handoff when final verification did not approve it', async () => {
+  it('requires documented manual evidence when overriding final verification', async () => {
     const { service, handoff, handoffs } = setup();
     handoff.status = 'reviewer_review';
     handoff.verificationReport = {
@@ -383,8 +383,48 @@ describe('ProjectHandoffsService', () => {
 
     await expect(
       service.review(project.id, { decision: 'approved' }, 'reviewer-1'),
-    ).rejects.toBeInstanceOf(ConflictException);
+    ).rejects.toThrow('Manual approval requires acknowledgement');
     expect(handoffs.save).not.toHaveBeenCalled();
+  });
+
+  it('lets the principal reviewer approve a verification failure', async () => {
+    const { service, handoff, handoffs, notifications } = setup();
+    handoff.status = 'verification_failed';
+    handoff.verificationReport = {
+      recommendation: 'changes_requested',
+      score: 69,
+    };
+
+    await service.review(
+      project.id,
+      {
+        decision: 'approved',
+        summary: 'The integrated project is ready for the client to review.',
+        feedback:
+          'I inspected the integrated commit and manually verified the completed behavior.',
+        manualReviewAcknowledged: true,
+      },
+      'reviewer-1',
+    );
+
+    expect(handoffs.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'client_review',
+        metadata: expect.objectContaining({
+          finalVerificationOverride: expect.objectContaining({
+            status: 'approved_by_principal_reviewer',
+            originalRecommendation: 'changes_requested',
+            reviewedCommitSha: 'a'.repeat(40),
+            approvedBy: 'reviewer-1',
+          }),
+        }),
+      }),
+    );
+    expect(notifications.createNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining('manually verified and approved'),
+      }),
+    );
   });
 
   it('requires an explicit summary and only the evidence selected in the delivery contract', async () => {
