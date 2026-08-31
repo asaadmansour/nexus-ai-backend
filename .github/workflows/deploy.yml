@@ -38,10 +38,23 @@ jobs:
 
       - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image
+      - name: Ensure image repository exists
         run: |
-          docker build -t "$ECR_REGISTRY/$IMAGE_NAME:$GITHUB_SHA" .
-          docker push "$ECR_REGISTRY/$IMAGE_NAME:$GITHUB_SHA"
+          if aws ecr describe-repositories --repository-names "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "ECR repository $IMAGE_NAME is ready."
+          else
+            echo "ECR repository $IMAGE_NAME is missing; creating it."
+            aws ecr create-repository \
+              --repository-name "$IMAGE_NAME" \
+              --image-tag-mutability IMMUTABLE \
+              --image-scanning-configuration scanOnPush=true
+          fi
+
+      - name: Build image
+        run: docker build -t "$ECR_REGISTRY/$IMAGE_NAME:$GITHUB_SHA" .
+
+      - name: Push image
+        run: docker push "$ECR_REGISTRY/$IMAGE_NAME:$GITHUB_SHA"
 
       # Pins the new tag, runs migrations to completion, then rolls the backend.
       - name: Deploy to the host
